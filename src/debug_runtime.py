@@ -647,12 +647,32 @@ def ingest_collect_request(
     if not sid or not request_url.strip():
         return 0
 
+    fallback_output_path = Path(f"data/debug_stream/{sid}.jsonl")
+    fallback_db_path = Path("data/test_logs/qa_runs.db")
     with _LOCK:
         session = _SESSIONS.get(sid)
-        if not session:
-            return 0
-        output_path = session.output_file
-        db_path = session.db_path
+        output_path = session.output_file if session else fallback_output_path
+        db_path = session.db_path if session else fallback_db_path
+
+    if session is None:
+        try:
+            init_test_log_db(db_path)
+            upsert_session(
+                db_path,
+                {
+                    "session_id": sid,
+                    "target_url": "",
+                    "status": "running",
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "ended_at": "",
+                    "captured_events": 0,
+                    "last_error": "",
+                    "tester_name": "",
+                    "tester_note": "recovered_by_collect_ingest",
+                },
+            )
+        except Exception:
+            pass
 
     hits = _extract_ga_hit_payloads(
         url=request_url.strip(),
