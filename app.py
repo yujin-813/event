@@ -1808,29 +1808,21 @@ with st.sidebar:
 
         active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
         debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
-        has_session_context = bool(active_debug_session_id or st.session_state.get("qa_debug_output_file", "").strip())
-        if debug_snapshot or has_session_context:
-            sid_for_view = str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
-            status_for_view = str(debug_snapshot.get("status", "-")).strip() if debug_snapshot else "recovered(file)"
-            captured_for_view = (
-                int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else "-"
-            )
+        if debug_snapshot:
             st.caption(
-                f"세션: {sid_for_view} | "
-                f"상태: {status_for_view} | "
-                f"캡처: {captured_for_view}건"
+                f"세션: {debug_snapshot.get('session_id', '')} | "
+                f"상태: {debug_snapshot.get('status', '-')} | "
+                f"캡처: {int(debug_snapshot.get('captured_events', 0))}건"
             )
-            if not debug_snapshot:
-                st.caption("세션 객체가 복구되지 않아 파일 기준으로 표시 중입니다. 새로고침 시 최신 로그를 읽습니다.")
-            tester_name_view = str(debug_snapshot.get("tester_name", "")).strip() if debug_snapshot else ""
+            tester_name_view = str(debug_snapshot.get("tester_name", "")).strip()
             if tester_name_view:
                 st.caption(f"테스터: {tester_name_view}")
-            if debug_snapshot and debug_snapshot.get("last_error", "").strip():
+            if debug_snapshot.get("last_error", "").strip():
                 st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
             debug_popup_url = build_test_url(
                 st.session_state.get("qa_debug_target_url", "").strip(),
                 debug_case_param_name,
-                sid_for_view,
+                str(debug_snapshot.get("session_id", "")).strip(),
             )
             if debug_popup_url:
                 st.caption("디버그 팝업 URL")
@@ -1939,10 +1931,6 @@ realtime_tab, report_tab = st.tabs(["1단: 실시간 테스트 화면", "2단: Q
 with realtime_tab:
     active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
     debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
-    debug_output_file = str(
-        debug_snapshot.get("output_file", "") if debug_snapshot else st.session_state.get("qa_debug_output_file", "")
-    ).strip()
-    recovered_from_file = bool((not debug_snapshot) and debug_output_file and Path(debug_output_file).exists())
     st.session_state["realtime_last_refresh_at"] = pd.Timestamp.now(tz=LOCAL_TZ).strftime("%H:%M:%S")
 
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.3, 1, 1.2, 2.2])
@@ -1969,23 +1957,16 @@ with realtime_tab:
         else:
             st.dataframe(recent_df, use_container_width=True, height=200)
 
-    if not debug_snapshot and not recovered_from_file:
+    if not debug_snapshot:
         st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
     else:
-        if recovered_from_file:
-            st.warning("활성 세션 객체가 없어 파일 기준 복구 모드로 표시합니다. 새로고침 시 최신 로그를 다시 읽습니다.")
-        debug_output_file = debug_output_file or str(debug_snapshot.get("output_file", "")).strip()
-        timeline_df_raw = load_debug_events(Path(debug_output_file), limit=3000) if debug_output_file else pd.DataFrame()
-        captured_events_count = (
-            int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else int(len(timeline_df_raw))
-        )
-        status_text = str(debug_snapshot.get("status", "-")).strip() if debug_snapshot else "recovered(file)"
-        sid_text = str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
         st.caption(
-            f"세션: {sid_text} | "
-            f"상태: {status_text} | "
-            f"캡처: {captured_events_count}건"
+            f"세션: {debug_snapshot.get('session_id', '')} | "
+            f"상태: {debug_snapshot.get('status', '-')} | "
+            f"캡처: {int(debug_snapshot.get('captured_events', 0))}건"
         )
+        debug_output_file = debug_snapshot.get("output_file", "") or st.session_state.get("qa_debug_output_file", "")
+        timeline_df_raw = load_debug_events(Path(debug_output_file), limit=3000) if debug_output_file else pd.DataFrame()
         timeline_df = filter_debug_events_by_view(timeline_df_raw, "히트(collect)")
         allowed_events_rt = parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
 
