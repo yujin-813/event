@@ -1376,62 +1376,26 @@ def inject_case_from_page_location(df: pd.DataFrame, case_param: str) -> pd.Data
     return out
 
 
-def open_popup_window(url: str, key: str, label: str = "테스트 사이트 열기") -> bool:
+def auto_open_popup_window(url: str) -> None:
     if not url.strip():
-        return False
-    # components.html(window.open)은 브라우저 팝업 정책/iframe sandbox로 차단될 수 있어
-    # 링크 버튼 방식(새 탭/창 열기)으로 제공한다.
-    st.link_button(label, url, type="primary")
-    st.caption("팝업 차단 브라우저에서는 새 탭으로 열릴 수 있습니다.")
-    return True
-
-
-def build_case_tagging_snippet(case_param: str) -> str:
-    key = (case_param or "").strip() or "qa_debug_session_id"
-    return (
-        "(function () {\n"
-        f"  var KEY = '{key}';\n"
-        "  var qs = new URLSearchParams(window.location.search);\n"
-        "  var fromUrl = qs.get(KEY);\n"
-        "  if (fromUrl) {\n"
-        "    sessionStorage.setItem(KEY, fromUrl);\n"
-        "  }\n"
-        "  var caseId = sessionStorage.getItem(KEY);\n"
-        "  if (!caseId) {\n"
-        "    return;\n"
-        "  }\n"
-        "  window.__qaCaseId = caseId;\n"
-        "\n"
-        "  if (typeof window.gtag === 'function') {\n"
-        "    var originalGtag = window.gtag;\n"
-        "    window.gtag = function () {\n"
-        "      var args = Array.prototype.slice.call(arguments);\n"
-        "      if (args[0] === 'event') {\n"
-        "        var params = (args[2] && typeof args[2] === 'object') ? args[2] : {};\n"
-        "        if (!params[KEY]) {\n"
-        "          params[KEY] = caseId;\n"
-        "        }\n"
-        "        args[2] = params;\n"
-        "      }\n"
-        "      return originalGtag.apply(window, args);\n"
-        "    };\n"
-        "  }\n"
-        "\n"
-        "  window.dataLayer = window.dataLayer || [];\n"
-        "  if (typeof window.dataLayer.push === 'function') {\n"
-        "    var originalPush = window.dataLayer.push;\n"
-        "    window.dataLayer.push = function (obj) {\n"
-        "      if (obj && typeof obj === 'object' && !Array.isArray(obj) && obj.event) {\n"
-        "        if (!obj[KEY]) {\n"
-        "          obj[KEY] = caseId;\n"
-        "        }\n"
-        "      }\n"
-        "      return originalPush.call(window.dataLayer, obj);\n"
-        "    };\n"
-        "  }\n"
-        "})();\n"
+        return
+    js_url = json.dumps(url)
+    components.html(
+        f"""
+        <script>
+          const targetName = "qa_live_window";
+          const features = "popup=yes,width=1280,height=900,scrollbars=yes,resizable=yes";
+          let popup = window.open({js_url}, targetName, features);
+          if (!popup && window.parent && window.parent !== window) {{
+            try {{
+              popup = window.parent.open({js_url}, targetName, features);
+            }} catch (e) {{}}
+          }}
+        </script>
+        """,
+        height=0,
+        width=0,
     )
-
 
 def _safe_params_dict(value: object) -> Dict[str, object]:
     if isinstance(value, dict):
@@ -1602,27 +1566,8 @@ scenario_key_modes = {
 }
 risk_level_ko = {"Low": "낮음", "Medium": "중간", "High": "높음"}
 scenario_mode_ko = {"key": "키 기반", "user": "사용자 기반", "aggregate": "집계형", "empty": "데이터 없음"}
+debug_case_param_name = "qa_debug_session_id"
 
-if "live_mode_active" not in st.session_state:
-    st.session_state["live_mode_active"] = False
-if "live_site_url" not in st.session_state:
-    st.session_state["live_site_url"] = ""
-if "live_case_param_name" not in st.session_state:
-    st.session_state["live_case_param_name"] = "qa_debug_session_id"
-if "live_case_id" not in st.session_state:
-    st.session_state["live_case_id"] = ""
-if "live_started_at" not in st.session_state:
-    st.session_state["live_started_at"] = ""
-if "live_ended_at" not in st.session_state:
-    st.session_state["live_ended_at"] = ""
-if "live_auto_validate" not in st.session_state:
-    st.session_state["live_auto_validate"] = True
-if "live_last_event_count" not in st.session_state:
-    st.session_state["live_last_event_count"] = 0
-if "live_monitor_auto_refresh" not in st.session_state:
-    st.session_state["live_monitor_auto_refresh"] = False
-if "live_monitor_interval_sec" not in st.session_state:
-    st.session_state["live_monitor_interval_sec"] = 15
 if "qa_debug_session_id" not in st.session_state:
     st.session_state["qa_debug_session_id"] = ""
 if "qa_debug_output_file" not in st.session_state:
@@ -1656,19 +1601,11 @@ if "qa_oauth_notice" not in st.session_state:
 if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
 
-live_mode_start_clicked = False
-live_mode_end_clicked = False
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
 scenario_key_mode_label = "transaction_id 기준"
 scenario_key_field = "transaction_id"
 scenario_key_value = ""
-live_site_url_input = ""
-live_case_param_name_input = "qa_debug_session_id"
-live_auto_validate_input = True
-live_monitor_refresh_clicked = False
-live_monitor_auto_refresh = False
-live_monitor_interval_sec = 15
 realtime_debug_start_clicked = False
 realtime_debug_stop_clicked = False
 
@@ -1680,10 +1617,7 @@ with st.sidebar:
         st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 불러올 수 있습니다.")
 
     with st.expander("2) 실시간 디버깅 스트림", expanded=True):
-        default_debug_url = (
-            st.session_state.get("qa_debug_target_url", "").strip()
-            or st.session_state.get("live_site_url", "").strip()
-        )
+        default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()
         if default_debug_url and not st.session_state.get("qa_debug_target_url", "").strip():
             st.session_state["qa_debug_target_url"] = default_debug_url
 
@@ -1726,87 +1660,17 @@ with st.sidebar:
                 st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
             debug_popup_url = build_test_url(
                 st.session_state.get("qa_debug_target_url", "").strip(),
-                "qa_debug_session_id",
+                debug_case_param_name,
                 str(debug_snapshot.get("session_id", "")).strip(),
             )
             if debug_popup_url:
                 st.caption("디버그 팝업 URL")
                 st.code(debug_popup_url, language="text")
-                open_popup_window(debug_popup_url, key="side_debug_popup_open", label="디버그 팝업 열기")
             st.caption("실시간 QA 리스트는 메인 영역의 `실시간 테스트 QA 리스트` 탭에서 확인하세요.")
         else:
             st.caption("디버깅 시작 후 타임라인이 표시됩니다.")
 
-    with st.expander("3) 실사용 모드(사이트 테스트 연동)", expanded=False):
-        live_site_url_input = st.text_input(
-            "테스트 사이트 URL",
-            value=st.session_state.get("live_site_url", ""),
-            placeholder="예: https://example.com/product/123",
-        )
-        live_case_param_name_input = st.text_input(
-            "테스트 식별 파라미터명",
-            value=st.session_state.get("live_case_param_name", "qa_debug_session_id"),
-            placeholder="예: qa_debug_session_id",
-        )
-        live_auto_validate_input = st.checkbox(
-            "QA 생성 시 현재 테스트 케이스 자동 시나리오 검증",
-            value=bool(st.session_state.get("live_auto_validate", True)),
-        )
-
-        col_live1, col_live2 = st.columns(2)
-        with col_live1:
-            live_mode_start_clicked = st.button("실사용 모드 시작")
-        with col_live2:
-            live_mode_end_clicked = st.button("실사용 모드 종료")
-
-        current_case = st.session_state.get("live_case_id", "").strip()
-        current_case_param = st.session_state.get("live_case_param_name", "").strip()
-        current_test_url = build_test_url(
-            live_site_url_input or st.session_state.get("live_site_url", ""),
-            current_case_param,
-            current_case,
-        )
-        if current_case:
-            st.caption(f"현재 테스트 케이스: {current_case_param}={current_case}")
-            if current_test_url:
-                st.code(current_test_url, language="text")
-                open_popup_window(current_test_url, key="side_live_popup_open", label="테스트 사이트 열기")
-            st.caption(
-                "사이트 테스트 시 모든 이벤트에 해당 파라미터를 함께 보내면, "
-                "실사용 시나리오가 정확히 연결됩니다."
-            )
-            st.code(
-                (
-                    f"const qaCase = new URLSearchParams(location.search).get('{current_case_param}');\n"
-                    f"if (qaCase) {{ gtag('event', 'view_item', {{ {current_case_param}: qaCase }}); }}"
-                ),
-                language="javascript",
-            )
-            with st.expander("사이트 태깅 도우미 (qa_debug_session 자동 전파 코드)"):
-                st.caption(
-                    "사이트 공통 스크립트(또는 GTM Custom HTML)에 1회 삽입하면, "
-                    "URL의 케이스 값을 sessionStorage에 저장하고 이후 이벤트에 자동 부착합니다."
-                )
-                st.code(
-                    build_case_tagging_snippet(current_case_param),
-                    language="javascript",
-                )
-            live_monitor_refresh_clicked = st.button("실사용 수집 현황 새로고침")
-            live_monitor_auto_refresh = st.checkbox(
-                "준실시간 자동 새로고침",
-                key="live_monitor_auto_refresh",
-            )
-            live_monitor_interval_sec = st.slider(
-                "자동 새로고침 간격(초)",
-                min_value=10,
-                max_value=60,
-                key="live_monitor_interval_sec",
-                step=5,
-            )
-        else:
-            st.caption("연결 확인 후 실사용 모드를 시작하면 테스트 URL이 자동 생성됩니다.")
-
-    with st.expander("4) QA 설정", expanded=True):
+    with st.expander("3) QA 설정", expanded=True):
         today = date.today()
         start_date = st.date_input("시작일", value=today - timedelta(days=1))
         end_date = st.date_input("종료일", value=today)
@@ -1836,7 +1700,7 @@ with st.sidebar:
         null_threshold = st.slider("null 경고 임계치", min_value=0.05, max_value=0.9, value=0.2, step=0.05)
         max_rows = st.number_input("최대 조회 행", min_value=1000, max_value=500000, value=50000, step=1000)
 
-    with st.expander("5) 실사용 1회 검증", expanded=True):
+    with st.expander("4) 시나리오 1회 검증", expanded=True):
         scenario_enabled = st.checkbox("시나리오 검증 활성화", value=True)
         scenario_key_mode_label = st.selectbox(
             "식별 방식",
@@ -1853,31 +1717,6 @@ with st.sidebar:
 
 st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서 실행합니다.")
 
-if live_mode_start_clicked:
-    case_param = live_case_param_name_input.strip() or "qa_debug_session_id"
-    new_case_id = f"qa_debug_session_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:4]}"
-    st.session_state["live_mode_active"] = True
-    st.session_state["live_site_url"] = live_site_url_input.strip()
-    st.session_state["live_case_param_name"] = case_param
-    st.session_state["live_case_id"] = new_case_id
-    st.session_state["live_started_at"] = pd.Timestamp.now().isoformat()
-    st.session_state["live_ended_at"] = ""
-    st.session_state["live_auto_validate"] = bool(live_auto_validate_input)
-    st.success(f"실사용 모드 시작: {case_param}={new_case_id}")
-    st.rerun()
-
-if live_mode_end_clicked:
-    st.session_state["live_mode_active"] = False
-    if st.session_state.get("live_case_id", ""):
-        st.session_state["live_ended_at"] = pd.Timestamp.now().isoformat()
-    st.session_state["live_auto_validate"] = bool(live_auto_validate_input)
-    st.success("실사용 모드를 종료했습니다.")
-    st.rerun()
-
-st.session_state["live_site_url"] = live_site_url_input.strip()
-st.session_state["live_case_param_name"] = (live_case_param_name_input.strip() or "qa_debug_session_id")
-st.session_state["live_auto_validate"] = bool(live_auto_validate_input)
-
 if realtime_debug_start_clicked:
     try:
         debug_session_id = f"dbg_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:4]}"
@@ -1892,18 +1731,17 @@ if realtime_debug_start_clicked:
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
-        st.session_state["live_case_param_name"] = "qa_debug_session_id"
-        st.session_state["live_case_id"] = debug_session_id
-        st.session_state["live_mode_active"] = True
-        st.session_state["live_started_at"] = pd.Timestamp.now().isoformat()
-        st.session_state["live_monitor_auto_refresh"] = False
-        live_monitor_auto_refresh = False
-        live_monitor_refresh_clicked = False
+        debug_popup_url = build_test_url(
+            st.session_state.get("qa_debug_target_url", "").strip(),
+            debug_case_param_name,
+            debug_session_id,
+        )
+        if debug_popup_url:
+            auto_open_popup_window(debug_popup_url)
         st.success(
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
             f"(상태: {snapshot.get('status', '-')})"
         )
-        st.rerun()
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
 
@@ -2310,7 +2148,7 @@ with report_tab:
         required_events = selected_events if selected_events else parse_csv_list(required_event_text)
         required_param_map = parse_required_params(required_param_text)
         funnel_steps = parse_csv_list(funnel_text)
-        live_case_field = st.session_state.get("live_case_param_name", "").strip()
+        live_case_field = debug_case_param_name
 
         if live_case_field and live_case_field not in requested_params:
             requested_params.append(live_case_field)
