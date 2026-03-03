@@ -795,12 +795,29 @@ def load_debug_events(output_file: Path, limit: int = 200):
     path = Path(output_file)
     if not path.exists():
         return pd.DataFrame()
+
+    # 실시간 append 중에는 마지막 줄이 부분적으로 쓰여 JSON parse가 깨질 수 있어
+    # 라인 단위로 안전 파싱(깨진 라인은 건너뜀)한다.
+    records: List[Dict[str, object]] = []
     try:
-        df = pd.read_json(path, lines=True)
+        with path.open("r", encoding="utf-8") as fp:
+            for raw_line in fp:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict):
+                    records.append(row)
     except Exception:
         return pd.DataFrame()
-    if df.empty:
-        return df
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
     if "captured_at" in df.columns:
         df["captured_at"] = pd.to_datetime(df["captured_at"], errors="coerce")
         df = df.sort_values("captured_at", ascending=False)

@@ -1098,6 +1098,7 @@ def build_realtime_event_rows(
         "값없음 그룹",
         "의심 그룹",
         "시스템 그룹",
+        "전체 파라미터",
         "captured_at",
     ]
     if debug_df.empty:
@@ -1197,6 +1198,7 @@ def build_realtime_event_rows(
                 "값없음 그룹": missing_group,
                 "의심 그룹": suspicious_group,
                 "시스템 그룹": system_group,
+                "전체 파라미터": all_params,
                 "captured_at": row.get("captured_at"),
             }
         )
@@ -1345,6 +1347,30 @@ def build_test_url(base_url: str, param_name: str, param_value: str) -> str:
             parsed.fragment,
         )
     )
+
+
+def resolve_debug_output_file(
+    session_id: str,
+    snapshot: Dict[str, object],
+    state_output_file: str,
+) -> Path | None:
+    candidates: List[Path] = []
+    snap_path_text = str(snapshot.get("output_file", "")).strip() if snapshot else ""
+    if snap_path_text:
+        candidates.append(Path(snap_path_text))
+
+    state_path_text = str(state_output_file or "").strip()
+    if state_path_text:
+        candidates.append(Path(state_path_text))
+
+    sid = str(session_id or "").strip()
+    if sid:
+        candidates.append(Path(f"data/debug_stream/{sid}.jsonl"))
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[0] if candidates else None
 
 
 def inject_case_from_page_location(df: pd.DataFrame, case_param: str) -> pd.DataFrame:
@@ -1667,21 +1693,32 @@ with st.sidebar:
 
         active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
         debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
-        if debug_snapshot:
-            st.caption(
-                f"세션: {debug_snapshot.get('session_id', '')} | "
-                f"상태: {debug_snapshot.get('status', '-')} | "
-                f"캡처: {int(debug_snapshot.get('captured_events', 0))}건"
+        resolved_output_path = resolve_debug_output_file(
+            session_id=active_debug_session_id,
+            snapshot=debug_snapshot,
+            state_output_file=st.session_state.get("qa_debug_output_file", ""),
+        )
+        recovered_from_file = bool((not debug_snapshot) and resolved_output_path and resolved_output_path.exists())
+        if debug_snapshot or recovered_from_file:
+            sid_for_view = (
+                str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
             )
-            tester_name_view = str(debug_snapshot.get("tester_name", "")).strip()
+            status_for_view = str(debug_snapshot.get("status", "")).strip() if debug_snapshot else "recovered(file)"
+            captured_count_for_view = int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else "-"
+            st.caption(
+                f"세션: {sid_for_view} | "
+                f"상태: {status_for_view or '-'} | "
+                f"캡처: {captured_count_for_view}건"
+            )
+            tester_name_view = str(debug_snapshot.get("tester_name", "")).strip() if debug_snapshot else ""
             if tester_name_view:
                 st.caption(f"테스터: {tester_name_view}")
-            if debug_snapshot.get("last_error", "").strip():
+            if debug_snapshot and debug_snapshot.get("last_error", "").strip():
                 st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
             debug_popup_url = build_test_url(
                 st.session_state.get("qa_debug_target_url", "").strip(),
                 debug_case_param_name,
-                str(debug_snapshot.get("session_id", "")).strip(),
+                sid_for_view,
             )
             if debug_popup_url:
                 st.caption("디버그 팝업 URL")
@@ -1778,6 +1815,12 @@ realtime_tab, report_tab = st.tabs(["1단: 실시간 테스트 화면", "2단: Q
 with realtime_tab:
     active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
     debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
+    resolved_output_path = resolve_debug_output_file(
+        session_id=active_debug_session_id,
+        snapshot=debug_snapshot,
+        state_output_file=st.session_state.get("qa_debug_output_file", ""),
+    )
+    recovered_from_file = bool((not debug_snapshot) and resolved_output_path and resolved_output_path.exists())
     st.session_state["realtime_last_refresh_at"] = pd.Timestamp.now(tz=LOCAL_TZ).strftime("%H:%M:%S")
 
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.3, 1, 1.2, 2.2])
@@ -1797,17 +1840,28 @@ with realtime_tab:
     if realtime_manual_refresh_clicked:
         st.rerun()
 
-    if not debug_snapshot:
+    if not debug_snapshot and not recovered_from_file:
         st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
     else:
-        st.caption(
-            f"세션: {debug_snapshot.get('session_id', '')} | "
-            f"상태: {debug_snapshot.get('status', '-')} | "
-            f"캡처: {int(debug_snapshot.get('captured_events', 0))}건"
-        )
-        debug_output_file = debug_snapshot.get("output_file", "") or st.session_state.get("qa_debug_output_file", "")
+        if recovered_from_file:
+            st.warning("세션 객체가 없어 파일 기준으로 복구 표시합니다. (상태: recovered(file))")
+        debug_output_file = str(resolved_output_path) if resolved_output_path else ""
         timeline_df_raw = load_debug_events(Path(debug_output_file), limit=3000) if debug_output_file else pd.DataFrame()
         timeline_df = filter_debug_events_by_view(timeline_df_raw, "히트(collect)")
+        sid_for_view = (
+            str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
+        ) or "-"
+        status_for_view = (
+            str(debug_snapshot.get("status", "")).strip() if debug_snapshot else "recovered(file)"
+        ) or "-"
+        captured_from_snapshot = int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else 0
+        captured_from_file = int(len(timeline_df))
+        captured_for_view = max(captured_from_snapshot, captured_from_file)
+        st.caption(
+            f"세션: {sid_for_view} | "
+            f"상태: {status_for_view} | "
+            f"캡처: {captured_for_view}건"
+        )
         allowed_events_rt = parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
 
         st.subheader("실시간 이벤트 리스트")
@@ -1872,13 +1926,20 @@ with realtime_tab:
                             )
                         )
                         status_text = str(row_ev.get("상태", "OK"))
+                        status_view = {"OK": "정상", "WARN": "주의", "ERROR": "오류", "INFO": "참고"}.get(status_text, status_text)
                         c1, c2, c3, c4 = st.columns([1.2, 1.6, 4.0, 1.0])
                         c1.markdown(f"`{row_ev.get('시간', '-')}`")
                         c2.markdown(f"**{row_ev.get('이벤트', '-') or '-'}**")
                         primary_key = str(row_ev.get("대표 파라미터", "-"))
                         primary_val = str(row_ev.get("대표 값", "-"))
                         c3.markdown(f"`{primary_key}` = `{primary_val}`")
-                        c4.markdown(f"`{status_text}`")
+                        c4.markdown(f"`{status_view}`")
+
+                        all_params = row_ev.get("전체 파라미터", {})
+                        if isinstance(all_params, dict) and all_params:
+                            with st.expander(f"전체 파라미터 ({len(all_params)}개)", expanded=False):
+                                all_rows = [{"파라미터": str(k), "값": _to_text_value(v)} for k, v in all_params.items()]
+                                st.table(pd.DataFrame(all_rows))
 
                         normal_group = row_ev.get("정상 그룹", {})
                         if isinstance(normal_group, dict) and normal_group:
@@ -1984,7 +2045,7 @@ with realtime_tab:
 
         if (
             st.session_state.get("realtime_panel_auto_refresh", False)
-            and debug_snapshot.get("status") == "running"
+            and status_for_view in {"running", "stopping", "recovered(file)"}
         ):
             interval_sec = int(st.session_state.get("realtime_panel_refresh_interval", 2))
             components.html(
