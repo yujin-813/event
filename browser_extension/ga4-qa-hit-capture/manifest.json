@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "GA4 QA Hit Capture",
+  "version": "0.1.0",
+  "description": "Capture GA4 collect hits and forward them to QA reporter without site snippets.",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>", "https://asknuggetdata.com/*"],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "GA4 QA Hit Capture",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

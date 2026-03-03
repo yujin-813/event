@@ -31,6 +31,7 @@ from src.issue_store import (
     resolve_issue,
     upsert_auto_issues,
 )
+from src.qa_ingest_server import ensure_ingest_server
 from src.reporting import (
     build_report_filename,
     events_to_csv_bytes,
@@ -40,7 +41,6 @@ from src.reporting import (
 from src.scenario_validation import validate_single_scenario
 from src.rules import run_qa_rules
 from src.scoring import compute_integrity_score
-from src.test_log_db import list_recent_sessions
 
 
 st.set_page_config(page_title="GA4 QA Reporter", layout="wide")
@@ -1567,6 +1567,7 @@ scenario_key_modes = {
 risk_level_ko = {"Low": "낮음", "Medium": "중간", "High": "높음"}
 scenario_mode_ko = {"key": "키 기반", "user": "사용자 기반", "aggregate": "집계형", "empty": "데이터 없음"}
 debug_case_param_name = "qa_debug_session_id"
+default_ingest_public_url = get_config_value("QA_INGEST_PUBLIC_URL", "https://asknuggetdata.com/qa/collect")
 
 if "qa_debug_session_id" not in st.session_state:
     st.session_state["qa_debug_session_id"] = ""
@@ -1600,6 +1601,14 @@ if "qa_oauth_notice" not in st.session_state:
     st.session_state["qa_oauth_notice"] = ""
 if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
+if "qa_ingest_public_url" not in st.session_state:
+    st.session_state["qa_ingest_public_url"] = default_ingest_public_url
+
+try:
+    ensure_ingest_server(host="127.0.0.1", port=8600)
+    st.session_state["qa_ingest_server_ok"] = True
+except Exception:
+    st.session_state["qa_ingest_server_ok"] = False
 
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
@@ -1612,9 +1621,19 @@ realtime_debug_stop_clicked = False
 with st.sidebar:
     st.header("설정")
     with st.expander("1) 데이터 소스/연결", expanded=True):
-        st.markdown("**브라우저 레벨 이벤트 가로채기 + QA 리포트 API 참조 모드**")
-        st.caption("실시간/룰 판정은 실제 수집 히트(collect) 기준으로 동작합니다.")
+        st.markdown("**브라우저 확장프로그램 히트 캡처 + QA 리포트 API 참조 모드**")
+        st.caption("스니펫 없이 Chrome 확장프로그램이 collect 히트를 가로채어 전송합니다.")
         st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 불러올 수 있습니다.")
+        st.text_input(
+            "확장 수집 엔드포인트",
+            value=st.session_state.get("qa_ingest_public_url", default_ingest_public_url),
+            key="qa_ingest_public_url",
+            disabled=True,
+        )
+        if st.session_state.get("qa_ingest_server_ok", False):
+            st.caption("서버 수집기 상태: OK (127.0.0.1:8600)")
+        else:
+            st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
 
     with st.expander("2) 실시간 디버깅 스트림", expanded=True):
         default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()
@@ -1627,6 +1646,7 @@ with st.sidebar:
             key="qa_debug_target_url",
             placeholder="예: https://datanugget.io/",
         )
+        st.caption("확장프로그램이 활성화된 Chrome에서 디버그 팝업 URL을 열어 테스트하세요.")
         st.text_input(
             "테스터 이름",
             value=st.session_state.get("qa_tester_name", ""),
@@ -1728,6 +1748,7 @@ if realtime_debug_start_clicked:
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
             db_path=Path("data/test_logs/qa_runs.db"),
+            launch_browser=False,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
@@ -1740,7 +1761,7 @@ if realtime_debug_start_clicked:
             auto_open_popup_window(debug_popup_url)
         st.success(
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
-            f"(상태: {snapshot.get('status', '-')})"
+            f"(상태: {snapshot.get('status', '-')}, 모드: extension hit capture)"
         )
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
@@ -1775,13 +1796,6 @@ with realtime_tab:
 
     if realtime_manual_refresh_clicked:
         st.rerun()
-
-    with st.expander("테스트 기록 DB (최근 세션)", expanded=False):
-        recent_df = list_recent_sessions(Path("data/test_logs/qa_runs.db"), limit=30)
-        if recent_df.empty:
-            st.caption("저장된 테스트 세션이 없습니다.")
-        else:
-            st.dataframe(recent_df, use_container_width=True, height=200)
 
     if not debug_snapshot:
         st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
