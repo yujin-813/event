@@ -31,7 +31,6 @@ from src.issue_store import (
     resolve_issue,
     upsert_auto_issues,
 )
-from src.qa_ingest_server import ensure_ingest_server
 from src.reporting import (
     build_report_filename,
     events_to_csv_bytes,
@@ -1398,147 +1397,6 @@ def auto_open_popup_window(url: str) -> None:
         width=0,
     )
 
-
-def build_browser_collect_snippet(ingest_url: str, session_param_name: str = "qa_debug_session_id") -> str:
-    ingest = ingest_url.strip()
-    sid_key = (session_param_name or "").strip() or "qa_debug_session_id"
-    return (
-        "(function () {\n"
-        f"  var INGEST_URL = {json.dumps(ingest)};\n"
-        f"  var SID_KEY = {json.dumps(sid_key)};\n"
-        "  if (!INGEST_URL) return;\n"
-        "  var qs = new URLSearchParams(location.search);\n"
-        "  var sidFromUrl = qs.get(SID_KEY);\n"
-        "  if (sidFromUrl) sessionStorage.setItem(SID_KEY, sidFromUrl);\n"
-        "  var sid = sessionStorage.getItem(SID_KEY) || '';\n"
-        "  if (!sid) return;\n"
-        "\n"
-        "  var isCollectUrl = function (rawUrl) {\n"
-        "    try {\n"
-        "      var u = new URL(String(rawUrl || ''), location.href);\n"
-        "      var path = (u.pathname || '').toLowerCase();\n"
-        "      var q = u.searchParams;\n"
-        "      if (path.indexOf('/g/collect') >= 0 || path.indexOf('/mp/collect') >= 0) return true;\n"
-        "      if (path.endsWith('/collect')) {\n"
-        "        return q.get('v') === '2' || q.has('en') || q.has('tid') || q.has('measurement_id');\n"
-        "      }\n"
-        "      return false;\n"
-        "    } catch (e) {\n"
-        "      return false;\n"
-        "    }\n"
-        "  };\n"
-        "\n"
-        "  var toBodyText = function (body) {\n"
-        "    try {\n"
-        "      if (!body) return '';\n"
-        "      if (typeof body === 'string') return body;\n"
-        "      if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString();\n"
-        "      if (typeof FormData !== 'undefined' && body instanceof FormData) {\n"
-        "        var p = new URLSearchParams();\n"
-        "        body.forEach(function (v, k) { p.append(k, String(v)); });\n"
-        "        return p.toString();\n"
-        "      }\n"
-        "      return '';\n"
-        "    } catch (e) {\n"
-        "      return '';\n"
-        "    }\n"
-        "  };\n"
-        "\n"
-        "  var markHit = function () {\n"
-        "    var el = document.getElementById('__qaHitIndicator');\n"
-        "    if (!el) {\n"
-        "      el = document.createElement('div');\n"
-        "      el.id = '__qaHitIndicator';\n"
-        "      el.textContent = 'QA HIT 0';\n"
-        "      el.style.position = 'fixed';\n"
-        "      el.style.top = '14px';\n"
-        "      el.style.right = '14px';\n"
-        "      el.style.zIndex = '2147483647';\n"
-        "      el.style.padding = '8px 10px';\n"
-        "      el.style.borderRadius = '10px';\n"
-        "      el.style.background = '#111827';\n"
-        "      el.style.color = '#fff';\n"
-        "      el.style.font = '600 12px/1.2 -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';\n"
-        "      el.style.border = '2px solid transparent';\n"
-        "      document.documentElement.appendChild(el);\n"
-        "    }\n"
-        "    var n = Number(el.getAttribute('data-hit-count') || '0') + 1;\n"
-        "    el.setAttribute('data-hit-count', String(n));\n"
-        "    el.textContent = 'QA HIT ' + n;\n"
-        "    el.style.background = '#16a34a';\n"
-        "    el.style.borderColor = 'rgba(255,255,255,.85)';\n"
-        "    clearTimeout(window.__qaHitBadgeTimer);\n"
-        "    window.__qaHitBadgeTimer = setTimeout(function () {\n"
-        "      el.style.background = '#111827';\n"
-        "      el.style.borderColor = 'transparent';\n"
-        "    }, 320);\n"
-        "  };\n"
-        "\n"
-        "  var sendCollect = function (requestUrl, method, requestBody) {\n"
-        "    if (!isCollectUrl(requestUrl)) return;\n"
-        "    markHit();\n"
-        "    var payload = {\n"
-        "      session_id: sid,\n"
-        "      request_url: String(requestUrl || ''),\n"
-        "      request_method: String(method || 'GET').toUpperCase(),\n"
-        "      request_body: toBodyText(requestBody)\n"
-        "    };\n"
-        "    try {\n"
-        "      var blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });\n"
-        "      if (navigator.sendBeacon && navigator.sendBeacon(INGEST_URL, blob)) return;\n"
-        "    } catch (e) {}\n"
-        "    try {\n"
-        "      fetch(INGEST_URL, {\n"
-        "        method: 'POST',\n"
-        "        mode: 'no-cors',\n"
-        "        keepalive: true,\n"
-        "        headers: { 'Content-Type': 'application/json' },\n"
-        "        body: JSON.stringify(payload)\n"
-        "      });\n"
-        "    } catch (e) {}\n"
-        "  };\n"
-        "\n"
-        "  if (!window.__qaFetchWrapped && typeof window.fetch === 'function') {\n"
-        "    var _fetch = window.fetch.bind(window);\n"
-        "    window.fetch = function (input, init) {\n"
-        "      var reqUrl = typeof input === 'string' ? input : (input && input.url ? input.url : '');\n"
-        "      var method = (init && init.method) || 'GET';\n"
-        "      var body = init && init.body;\n"
-        "      sendCollect(reqUrl, method, body);\n"
-        "      return _fetch(input, init);\n"
-        "    };\n"
-        "    window.__qaFetchWrapped = true;\n"
-        "  }\n"
-        "\n"
-        "  if (!window.__qaXHRWrapped && typeof XMLHttpRequest !== 'undefined') {\n"
-        "    var open_ = XMLHttpRequest.prototype.open;\n"
-        "    var send_ = XMLHttpRequest.prototype.send;\n"
-        "    XMLHttpRequest.prototype.open = function (method, url) {\n"
-        "      this.__qaMethod = method;\n"
-        "      this.__qaUrl = url;\n"
-        "      return open_.apply(this, arguments);\n"
-        "    };\n"
-        "    XMLHttpRequest.prototype.send = function (body) {\n"
-        "      sendCollect(this.__qaUrl, this.__qaMethod || 'GET', body);\n"
-        "      return send_.apply(this, arguments);\n"
-        "    };\n"
-        "    window.__qaXHRWrapped = true;\n"
-        "  }\n"
-        "\n"
-        "  if (!window.__qaBeaconWrapped && navigator && typeof navigator.sendBeacon === 'function') {\n"
-        "    var beacon_ = navigator.sendBeacon.bind(navigator);\n"
-        "    navigator.sendBeacon = function (url, data) {\n"
-        "      if (String(url || '').indexOf(INGEST_URL) !== 0) {\n"
-        "        sendCollect(url, 'POST', data);\n"
-        "      }\n"
-        "      return beacon_(url, data);\n"
-        "    };\n"
-        "    window.__qaBeaconWrapped = true;\n"
-        "  }\n"
-        "})();\n"
-    )
-
-
 def _safe_params_dict(value: object) -> Dict[str, object]:
     if isinstance(value, dict):
         return value
@@ -1709,7 +1567,6 @@ scenario_key_modes = {
 risk_level_ko = {"Low": "낮음", "Medium": "중간", "High": "높음"}
 scenario_mode_ko = {"key": "키 기반", "user": "사용자 기반", "aggregate": "집계형", "empty": "데이터 없음"}
 debug_case_param_name = "qa_debug_session_id"
-default_ingest_public_url = get_config_value("QA_INGEST_PUBLIC_URL", "https://asknuggetdata.com/qa/collect")
 
 if "qa_debug_session_id" not in st.session_state:
     st.session_state["qa_debug_session_id"] = ""
@@ -1743,14 +1600,6 @@ if "qa_oauth_notice" not in st.session_state:
     st.session_state["qa_oauth_notice"] = ""
 if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
-if "qa_ingest_public_url" not in st.session_state:
-    st.session_state["qa_ingest_public_url"] = default_ingest_public_url
-
-try:
-    ensure_ingest_server(host="127.0.0.1", port=8600)
-    st.session_state["qa_ingest_server_ok"] = True
-except Exception:
-    st.session_state["qa_ingest_server_ok"] = False
 
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
@@ -1778,16 +1627,6 @@ with st.sidebar:
             key="qa_debug_target_url",
             placeholder="예: https://datanugget.io/",
         )
-        st.text_input(
-            "브라우저 수집 엔드포인트 URL",
-            value=st.session_state.get("qa_ingest_public_url", default_ingest_public_url),
-            key="qa_ingest_public_url",
-            placeholder="예: https://asknuggetdata.com/qa/collect",
-        )
-        if st.session_state.get("qa_ingest_server_ok", False):
-            st.caption("수집 서버 상태: OK (127.0.0.1:8600)")
-        else:
-            st.error("수집 서버 시작 실패: 서비스 로그를 확인하세요.")
         st.text_input(
             "테스터 이름",
             value=st.session_state.get("qa_tester_name", ""),
@@ -1827,18 +1666,6 @@ with st.sidebar:
             if debug_popup_url:
                 st.caption("디버그 팝업 URL")
                 st.code(debug_popup_url, language="text")
-            with st.expander("사이트 삽입 스니펫 (GTM Custom HTML 권장)", expanded=False):
-                st.caption(
-                    "팝업 브라우저 액션을 서버로 수집하려면 타겟 사이트에 아래 스니펫을 1회 삽입하세요. "
-                    "조건: URL/sessionStorage에 qa_debug_session_id가 있을 때만 동작합니다."
-                )
-                st.code(
-                    build_browser_collect_snippet(
-                        st.session_state.get("qa_ingest_public_url", default_ingest_public_url),
-                        session_param_name=debug_case_param_name,
-                    ),
-                    language="javascript",
-                )
             st.caption("실시간 QA 리스트는 메인 영역의 `실시간 테스트 QA 리스트` 탭에서 확인하세요.")
         else:
             st.caption("디버깅 시작 후 타임라인이 표시됩니다.")
@@ -1901,7 +1728,6 @@ if realtime_debug_start_clicked:
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
             db_path=Path("data/test_logs/qa_runs.db"),
-            launch_browser=False,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
@@ -1914,7 +1740,7 @@ if realtime_debug_start_clicked:
             auto_open_popup_window(debug_popup_url)
         st.success(
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
-            f"(상태: {snapshot.get('status', '-')}, 모드: 브라우저 수집)"
+            f"(상태: {snapshot.get('status', '-')})"
         )
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
@@ -1978,9 +1804,6 @@ with realtime_tab:
         )
         if rt_events.empty:
             st.info("아직 캡처된 이벤트가 없습니다.")
-            st.caption(
-                "팝업 액션이 적재되지 않으면 사이드바의 `사이트 삽입 스니펫`을 GTM Custom HTML에 적용했는지 확인하세요."
-            )
         else:
             st.subheader("실시간 결과 요약")
             rt_summary = summarize_realtime_quality(rt_events)
@@ -2359,7 +2182,6 @@ with report_tab:
                         "실제 수집 히트(collect)가 없습니다. 디버깅 모드 시작 후 이벤트를 발생시키고, "
                         "기존 세션이라면 새 세션으로 다시 시작하세요."
                     )
-                    st.caption("참고: 팝업 액션 수집은 사이드바 `사이트 삽입 스니펫` 적용이 필요합니다.")
                     st.stop()
 
                 qa_df = debug_events_to_qa_df(raw_df, requested_params)

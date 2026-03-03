@@ -26,7 +26,6 @@ class DebugSession:
     tester_name: str
     tester_note: str
     db_path: Path
-    launch_browser: bool
     stop_event: threading.Event
     thread: threading.Thread | None
 
@@ -637,47 +636,6 @@ def _run_debug_session(session_id: str) -> None:
         _sync_session_db(session_id)
 
 
-def ingest_collect_request(
-    session_id: str,
-    request_url: str,
-    request_method: str = "GET",
-    request_body: str = "",
-) -> int:
-    sid = session_id.strip()
-    if not sid or not request_url.strip():
-        return 0
-
-    with _LOCK:
-        session = _SESSIONS.get(sid)
-        if not session:
-            return 0
-        output_path = session.output_file
-        db_path = session.db_path
-
-    hits = _extract_ga_hit_payloads(
-        url=request_url.strip(),
-        method=(request_method or "GET").strip().upper(),
-        post_data=request_body or "",
-        session_id=sid,
-    )
-    if not hits:
-        return 0
-
-    for payload in hits:
-        _append_event_with_db(output_path, payload, db_path)
-
-    with _LOCK:
-        current = _SESSIONS.get(sid)
-        if current:
-            current.captured_events += len(hits)
-            should_sync = (current.captured_events % 10 == 0)
-        else:
-            should_sync = False
-    if should_sync:
-        _sync_session_db(sid)
-    return len(hits)
-
-
 def start_debug_session(
     session_id: str,
     target_url: str,
@@ -685,7 +643,6 @@ def start_debug_session(
     tester_name: str = "",
     tester_note: str = "",
     db_path: Path | None = None,
-    launch_browser: bool = True,
 ) -> Dict[str, object]:
     sid = session_id.strip()
     url = target_url.strip()
@@ -713,7 +670,6 @@ def start_debug_session(
             tester_name=tester_name.strip(),
             tester_note=tester_note.strip(),
             db_path=effective_db_path,
-            launch_browser=bool(launch_browser),
             stop_event=stop_event,
             thread=None,
         )
@@ -721,10 +677,9 @@ def start_debug_session(
 
     _sync_session_db(sid)
 
-    if bool(launch_browser):
-        th = threading.Thread(target=_run_debug_session, args=(sid,), daemon=True)
-        session.thread = th
-        th.start()
+    th = threading.Thread(target=_run_debug_session, args=(sid,), daemon=True)
+    session.thread = th
+    th.start()
     return get_debug_session_snapshot(sid)
 
 
@@ -738,9 +693,7 @@ def stop_debug_session(session_id: str) -> Dict[str, object]:
             return {}
         session.stop_event.set()
         if session.status == "running":
-            session.status = "stopping" if session.launch_browser else "stopped"
-            if not session.launch_browser:
-                session.ended_at = datetime.now(timezone.utc).isoformat()
+            session.status = "stopping"
     _sync_session_db(sid)
     return get_debug_session_snapshot(sid)
 
@@ -765,7 +718,6 @@ def get_debug_session_snapshot(session_id: str) -> Dict[str, object]:
             "tester_name": session.tester_name,
             "tester_note": session.tester_note,
             "db_path": str(session.db_path),
-            "launch_browser": bool(session.launch_browser),
         }
 
 
