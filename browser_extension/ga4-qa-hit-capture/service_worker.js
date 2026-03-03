@@ -81,7 +81,18 @@ function extractSidFromCollectUrl(rawUrl) {
   if (direct) return direct;
   const ep = String(u.searchParams.get("ep." + SID_KEY) || "").trim();
   if (ep) return ep;
+  const pageUrl = String(u.searchParams.get("dl") || u.searchParams.get("ep.page_location") || "").trim();
+  if (pageUrl) {
+    const fromPage = extractSidFromPageUrl(pageUrl);
+    if (fromPage) return fromPage;
+  }
   return "";
+}
+
+function extractSidFromPageUrl(rawUrl) {
+  const u = safeParseUrl(rawUrl);
+  if (!u) return "";
+  return String(u.searchParams.get(SID_KEY) || "").trim();
 }
 
 function decodeRawBody(raw) {
@@ -110,6 +121,24 @@ function requestBodyToText(body) {
   return "";
 }
 
+function extractSidFromBodyText(bodyText) {
+  const text = String(bodyText || "").trim();
+  if (!text) return "";
+  try {
+    const p = new URLSearchParams(text);
+    const direct = String(p.get(SID_KEY) || "").trim();
+    if (direct) return direct;
+    const ep = String(p.get("ep." + SID_KEY) || "").trim();
+    if (ep) return ep;
+    const pageUrl = String(p.get("dl") || p.get("ep.page_location") || "").trim();
+    if (pageUrl) {
+      const fromPage = extractSidFromPageUrl(pageUrl);
+      if (fromPage) return fromPage;
+    }
+  } catch (e) {}
+  return "";
+}
+
 function notifyTabHit(tabId) {
   if (typeof tabId !== "number" || tabId < 0) return;
   try {
@@ -117,9 +146,11 @@ function notifyTabHit(tabId) {
   } catch (e) {}
 }
 
-function resolveSessionId(details, cfg) {
+function resolveSessionId(details, cfg, bodyText) {
   const fromUrl = extractSidFromCollectUrl(details.url);
   if (fromUrl) return fromUrl;
+  const fromBody = extractSidFromBodyText(bodyText);
+  if (fromBody) return fromBody;
   if (typeof details.tabId === "number" && details.tabId >= 0) {
     const mapped = String(tabSessionMap.get(details.tabId) || "").trim();
     if (mapped) return mapped;
@@ -131,9 +162,8 @@ function postCollectHit(details) {
   if (!isCollectUrl(details.url)) return;
   withConfig((cfg) => {
     const ingestUrl = cfg.qa_ingest_url || DEFAULT_INGEST_URL;
-    const sessionId = resolveSessionId(details, cfg);
-    if (!sessionId) return;
     const bodyText = requestBodyToText(details.requestBody);
+    const sessionId = resolveSessionId(details, cfg, bodyText);
     fetch(ingestUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

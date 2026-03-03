@@ -93,6 +93,28 @@ def get_config_value(key: str, default: str = "") -> str:
     return default
 
 
+def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
+    target = str(url or "").strip()
+    if not target:
+        return False
+    try:
+        req = urllib_request.Request(target, method="GET")
+        with urllib_request.urlopen(req, timeout=float(timeout_sec)) as resp:
+            body = resp.read().decode("utf-8", errors="ignore").strip()
+            if resp.status != 200:
+                return False
+            try:
+                parsed = json.loads(body) if body else {}
+                if isinstance(parsed, dict):
+                    return bool(parsed.get("ok", False))
+            except Exception:
+                pass
+            normalized = body.lower().replace(" ", "")
+            return '"ok":true' in normalized
+    except Exception:
+        return False
+
+
 def get_google_access_token(token_path: Path) -> str:
     if not token_path.is_absolute():
         token_path = (BASE_DIR / token_path).resolve()
@@ -1629,12 +1651,17 @@ if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
 if "qa_ingest_public_url" not in st.session_state:
     st.session_state["qa_ingest_public_url"] = default_ingest_public_url
+if "qa_ingest_server_error" not in st.session_state:
+    st.session_state["qa_ingest_server_error"] = ""
 
 try:
     ensure_ingest_server(host="127.0.0.1", port=8600)
     st.session_state["qa_ingest_server_ok"] = True
-except Exception:
-    st.session_state["qa_ingest_server_ok"] = False
+    st.session_state["qa_ingest_server_error"] = ""
+except Exception as exc:
+    local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
+    st.session_state["qa_ingest_server_ok"] = bool(local_health_ok)
+    st.session_state["qa_ingest_server_error"] = "" if local_health_ok else str(exc)
 
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
@@ -1660,6 +1687,9 @@ with st.sidebar:
             st.caption("서버 수집기 상태: OK (127.0.0.1:8600)")
         else:
             st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
+            last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
+            if last_ingest_err:
+                st.caption(f"원인: {last_ingest_err}")
 
     with st.expander("2) 실시간 디버깅 스트림", expanded=True):
         default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()
