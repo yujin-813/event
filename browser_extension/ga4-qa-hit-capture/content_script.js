@@ -13,36 +13,13 @@
     }
   }
 
-  function normalizeBody(body) {
+  function syncSidToBackground() {
+    const sidFromQuery = getSidFromQuery();
+    if (!sidFromQuery) return;
     try {
-      if (!body) return "";
-      if (typeof body === "string") return body;
-      if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return body.toString();
-      if (typeof FormData !== "undefined" && body instanceof FormData) {
-        const p = new URLSearchParams();
-        body.forEach((v, k) => p.append(k, String(v)));
-        return p.toString();
-      }
-      return "";
-    } catch (e) {
-      return "";
-    }
-  }
-
-  function isCollectUrl(rawUrl) {
-    try {
-      const u = new URL(String(rawUrl || ""), location.href);
-      const path = (u.pathname || "").toLowerCase();
-      const q = u.searchParams;
-      if (path.includes("/qa/collect")) return false;
-      if (path.includes("/g/collect") || path.includes("/mp/collect")) return true;
-      if (path.endsWith("/collect")) {
-        return q.get("v") === "2" || q.has("en") || q.has("tid") || q.has("measurement_id");
-      }
-      return false;
-    } catch (e) {
-      return false;
-    }
+      sessionStorage.setItem(SID_KEY, sidFromQuery);
+    } catch (e) {}
+    chrome.runtime.sendMessage({ type: "qa_set_tab_session", session_id: sidFromQuery }, () => {});
   }
 
   function hitVisualCue() {
@@ -74,60 +51,15 @@
     }, 300);
   }
 
-  function sendCollect(rawUrl, method, body) {
-    if (!isCollectUrl(rawUrl)) return;
-    const sidFromQuery = getSidFromQuery();
-    if (sidFromQuery) {
-      try {
-        sessionStorage.setItem(SID_KEY, sidFromQuery);
-      } catch (e) {}
-      chrome.runtime.sendMessage({ type: "qa_set_config", qa_session_id: sidFromQuery }, () => {});
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "qa_collect_hit_seen") {
+      hitVisualCue();
     }
-    const sid = String(sidFromQuery || sessionStorage.getItem(SID_KEY) || "").trim();
-    if (!sid) return;
-    hitVisualCue();
-    chrome.runtime.sendMessage(
-      {
-        type: "qa_collect_hit",
-        payload: {
-          session_id: sid,
-          request_url: String(rawUrl || ""),
-          request_method: String(method || "GET").toUpperCase(),
-          request_body: normalizeBody(body)
-        }
-      },
-      () => {}
-    );
-  }
+  });
 
-  if (typeof window.fetch === "function") {
-    const originalFetch = window.fetch.bind(window);
-    window.fetch = function (input, init) {
-      const url = typeof input === "string" ? input : (input && input.url ? input.url : "");
-      sendCollect(url, (init && init.method) || "GET", init && init.body);
-      return originalFetch(input, init);
-    };
-  }
-
-  if (typeof window.XMLHttpRequest !== "undefined") {
-    const open = window.XMLHttpRequest.prototype.open;
-    const send = window.XMLHttpRequest.prototype.send;
-    window.XMLHttpRequest.prototype.open = function (method, url) {
-      this.__qaUrl = url;
-      this.__qaMethod = method;
-      return open.apply(this, arguments);
-    };
-    window.XMLHttpRequest.prototype.send = function (body) {
-      sendCollect(this.__qaUrl, this.__qaMethod || "GET", body);
-      return send.apply(this, arguments);
-    };
-  }
-
-  if (navigator && typeof navigator.sendBeacon === "function") {
-    const beacon = navigator.sendBeacon.bind(navigator);
-    navigator.sendBeacon = function (url, data) {
-      sendCollect(url, "POST", data);
-      return beacon(url, data);
-    };
-  }
+  syncSidToBackground();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") syncSidToBackground();
+  });
 })();
