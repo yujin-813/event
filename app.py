@@ -1596,6 +1596,10 @@ with st.sidebar:
         st.markdown("**브라우저 런타임 캡처(Playwright) + QA 리포트 API 참조 모드**")
         st.caption("확장프로그램/스니펫 없이, 디버깅 모드가 띄운 팝업 브라우저의 collect 히트를 즉시 수집합니다.")
         st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 조회할 수 있습니다.")
+        st.info(
+            "실사용 QA는 GA4 API 집계 기반(지연 반영)입니다. "
+            "일반 사용자 트래픽을 1~2초 실시간으로 보려면 사이트/GTM 연동이 필요합니다."
+        )
 
     with st.expander("2) 실시간 디버깅 스트림", expanded=True):
         default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()
@@ -2120,12 +2124,22 @@ with report_tab:
         options=selected_param_options,
         key="qa_report_selected_params",
     )
+    report_mode_options = [
+        "실사용 QA (GA4 API 집계, 지연 반영)",
+        "테스트 QA (팝업 세션 실시간 히트)",
+    ]
+    if st.session_state.get("qa_report_source_mode") not in report_mode_options:
+        st.session_state["qa_report_source_mode"] = report_mode_options[0]
     report_source_mode = st.radio(
         "리포트 판정 데이터 소스",
-        options=["GA4 API 집계(최근 30일)", "브라우저 히트(디버깅 세션)"],
+        options=report_mode_options,
         horizontal=True,
         key="qa_report_source_mode",
     )
+    if report_source_mode == "실사용 QA (GA4 API 집계, 지연 반영)":
+        st.caption("참고: API 집계 데이터는 실시간 스트림이 아닌 지연 반영 데이터입니다.")
+    else:
+        st.caption("참고: 현재 디버깅 팝업 세션 파일 기준으로 즉시 판정합니다.")
 
     st.divider()
     run_clicked = st.button("QA 리포트 생성", type="primary")
@@ -2165,7 +2179,7 @@ with report_tab:
             config_notes.append("퍼널 시퀀스 미설정: 퍼널 기반 체크는 제한됩니다.")
 
         try:
-            if report_source_mode == "브라우저 히트(디버깅 세션)":
+            if report_source_mode == "테스트 QA (팝업 세션 실시간 히트)":
                 debug_file = Path(st.session_state.get("qa_debug_output_file", "").strip())
                 if not debug_file.exists():
                     st.error("디버깅 스트림 데이터가 없습니다. 사이드바에서 '디버깅 모드 시작' 후 테스트를 진행하세요.")
@@ -2228,7 +2242,7 @@ with report_tab:
                     required_params_by_event=required_param_map,
                     selected_params=selected_params,
                 )
-                config_notes.append("현재 리포트는 GA4 API 30일 집계 데이터 기준으로 생성되었습니다.")
+                config_notes.append("현재 리포트는 실사용 QA용 GA4 API 집계(최근 30일, 지연 반영) 기준입니다.")
 
             results_view = build_qa_results_view(results_df)
             issue_property = st.session_state.get("qa_report_property_id", "").strip() or "browser_intercept_stream"
