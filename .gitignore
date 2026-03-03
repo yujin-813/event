@@ -11,3 +11,5 @@ issues/qa_issues.json
 reports/
 data/debug_stream/*.jsonl
 data/test_logs/*.db
+data/test_logs/*.db-shm
+data/test_logs/*.db-wal
