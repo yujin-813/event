@@ -1379,23 +1379,11 @@ def inject_case_from_page_location(df: pd.DataFrame, case_param: str) -> pd.Data
 def open_popup_window(url: str, key: str, label: str = "테스트 사이트 열기") -> bool:
     if not url.strip():
         return False
-    clicked = st.button(label, key=key, type="primary")
-    if clicked:
-        js_url = json.dumps(url)
-        components.html(
-            f"""
-            <script>
-              window.open(
-                {js_url},
-                "qa_live_window",
-                "popup=yes,width=1280,height=900,scrollbars=yes,resizable=yes"
-              );
-            </script>
-            """,
-            height=0,
-            width=0,
-        )
-    return clicked
+    # components.html(window.open)은 브라우저 팝업 정책/iframe sandbox로 차단될 수 있어
+    # 링크 버튼 방식(새 탭/창 열기)으로 제공한다.
+    st.link_button(label, url, type="primary")
+    st.caption("팝업 차단 브라우저에서는 새 탭으로 열릴 수 있습니다.")
+    return True
 
 
 def build_case_tagging_snippet(case_param: str) -> str:
@@ -1587,6 +1575,13 @@ def to_user_error_message(exc: Exception) -> str:
 
     if "playwright" in low and ("not found" in low or "install" in low):
         return "브라우저 디버깅 의존성 오류: `pip install playwright && playwright install chromium` 실행 후 다시 시도하세요."
+    if "디버깅 브라우저 실행에 실패했습니다" in msg:
+        return (
+            "디버깅 브라우저 실행 실패: EC2에서 아래 순서로 복구하세요.\n"
+            "1) `cd /opt/ga4-qa-mvp && source .venv/bin/activate`\n"
+            "2) `playwright install --with-deps chromium`\n"
+            "3) `sudo systemctl restart ga4-qa-mvp`"
+        )
     return msg if msg else "알 수 없는 오류가 발생했습니다."
 
 
@@ -1729,6 +1724,15 @@ with st.sidebar:
                 st.caption(f"테스터: {tester_name_view}")
             if debug_snapshot.get("last_error", "").strip():
                 st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
+            debug_popup_url = build_test_url(
+                st.session_state.get("qa_debug_target_url", "").strip(),
+                "qa_debug_session_id",
+                str(debug_snapshot.get("session_id", "")).strip(),
+            )
+            if debug_popup_url:
+                st.caption("디버그 팝업 URL")
+                st.code(debug_popup_url, language="text")
+                open_popup_window(debug_popup_url, key="side_debug_popup_open", label="디버그 팝업 열기")
             st.caption("실시간 QA 리스트는 메인 영역의 `실시간 테스트 QA 리스트` 탭에서 확인하세요.")
         else:
             st.caption("디버깅 시작 후 타임라인이 표시됩니다.")
@@ -1899,6 +1903,7 @@ if realtime_debug_start_clicked:
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
             f"(상태: {snapshot.get('status', '-')})"
         )
+        st.rerun()
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
 

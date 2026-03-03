@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import platform
 from pathlib import Path
 import threading
 from typing import Dict, List, Optional
@@ -174,14 +175,30 @@ def _append_query(url: str, extra: Dict[str, str]) -> str:
 
 def _launch_browser(playwright):
     last_err: Exception | None = None
-    for launch_kwargs in ({"headless": False, "channel": "chrome"}, {"headless": False}):
+    attempt_errors: List[str] = []
+    # EC2(무GUI) 환경에서도 동작하도록 headed -> headless 순으로 폴백한다.
+    for launch_kwargs in (
+        {"headless": False, "channel": "chrome"},
+        {"headless": False},
+        {"headless": True, "channel": "chrome"},
+        {"headless": True},
+        # 일부 EC2/컨테이너 환경에서 sandbox 관련 실패를 우회하기 위한 최후 폴백
+        {"headless": True, "channel": "chrome", "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
+        {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
+    ):
+        if platform.system().lower() != "linux" and "args" in launch_kwargs:
+            continue
         try:
             return playwright.chromium.launch(**launch_kwargs)
         except Exception as exc:  # pragma: no cover - runtime environment dependent
             last_err = exc
+            attempt_errors.append(f"{launch_kwargs}: {exc}")
+    detail = attempt_errors[-1] if attempt_errors else str(last_err or "")
     raise RuntimeError(
         "디버깅 브라우저 실행에 실패했습니다. "
-        "Chrome 설치 여부와 playwright 브라우저 설치 상태를 확인하세요."
+        "Chrome/Chromium 설치 여부와 playwright 브라우저 설치 상태를 확인하세요. "
+        "EC2에서는 `/opt/ga4-qa-mvp/.venv/bin/playwright install --with-deps chromium` 실행 후 서비스 재시작이 필요할 수 있습니다. "
+        f"(last_error: {detail})"
     ) from last_err
 
 

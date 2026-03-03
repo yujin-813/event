@@ -21,6 +21,9 @@ apt install -y python3 python3-venv nginx certbot python3-certbot-nginx
 chown -R ubuntu:ubuntu "${APP_DIR}"
 
 su - ubuntu -c "cd ${APP_DIR} && ./scripts/bootstrap.sh"
+# Playwright 런타임 라이브러리는 root로 설치하고, 브라우저 바이너리는 서비스 사용자(ubuntu)로 설치한다.
+"${APP_DIR}/.venv/bin/playwright" install-deps chromium
+su - ubuntu -c "cd ${APP_DIR} && ./.venv/bin/playwright install chromium"
 
 cp "${APP_DIR}/deploy/ec2/systemd/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service"
 systemctl daemon-reload
