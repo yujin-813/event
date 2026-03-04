@@ -12,6 +12,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -46,8 +47,36 @@ from src.scoring import compute_integrity_score
 st.set_page_config(page_title="GA4 QA Reporter", layout="wide")
 st.title("GA4 QA 리포터 (룰 기반)")
 st.caption("실시간 DebugView 대체가 아닌, 로그 수집 + 자동 정리 + 룰 기반 판정을 위한 내부 QA 도구")
-LOCAL_TZ = datetime.now().astimezone().tzinfo
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _bootstrap_dotenv_value(key: str) -> str:
+    dotenv_path = BASE_DIR / ".env"
+    if not dotenv_path.exists():
+        return ""
+    try:
+        for raw in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                return v.strip().strip("'").strip('"')
+    except Exception:
+        return ""
+    return ""
+
+
+DISPLAY_TZ_NAME = str(os.getenv("QA_DISPLAY_TZ", "")).strip() or _bootstrap_dotenv_value("QA_DISPLAY_TZ")
+if DISPLAY_TZ_NAME:
+    try:
+        LOCAL_TZ = ZoneInfo(DISPLAY_TZ_NAME)
+    except Exception:
+        LOCAL_TZ = datetime.now().astimezone().tzinfo
+        DISPLAY_TZ_NAME = str(LOCAL_TZ)
+else:
+    LOCAL_TZ = datetime.now().astimezone().tzinfo
+    DISPLAY_TZ_NAME = str(LOCAL_TZ)
 
 
 def parse_csv_list(text: str) -> List[str]:
@@ -597,6 +626,33 @@ def format_local_time(value: object) -> str:
     return ts.tz_convert(LOCAL_TZ).strftime("%H:%M:%S")
 
 
+def filter_events_for_active_session(
+    debug_df: pd.DataFrame,
+    session_id: str,
+    session_started_at: str = "",
+) -> pd.DataFrame:
+    if debug_df.empty:
+        return debug_df
+    sid = str(session_id or "").strip()
+    out = debug_df.copy()
+    if sid:
+        row_sid = out.get("session_id", pd.Series(index=out.index, dtype="object")).astype(str).str.strip()
+        param_sid = out.get("params", pd.Series(index=out.index, dtype="object")).apply(
+            lambda p: str(p.get("qa_debug_session_id", "")).strip() if isinstance(p, dict) else ""
+        )
+        # session_id 컬럼이 있으면 우선 신뢰하고, 없을 때만 param sid를 보조로 사용한다.
+        sid_mask = row_sid.eq(sid) | (row_sid.eq("") & param_sid.eq(sid))
+        out = out[sid_mask].copy()
+
+    started_text = str(session_started_at or "").strip()
+    if started_text and not out.empty:
+        started_ts = pd.to_datetime(started_text, errors="coerce", utc=True)
+        if pd.notna(started_ts):
+            cap_ts = pd.to_datetime(out.get("captured_at"), errors="coerce", utc=True)
+            out = out[cap_ts >= started_ts].copy()
+    return out
+
+
 def normalize_uploaded_df(df: pd.DataFrame, requested_params: List[str]) -> pd.DataFrame:
     if any(col in df.columns for col in ["eventName", "dateHourMinute", "userPseudoId"]):
         return flatten_events(df, requested_params)
@@ -648,7 +704,7 @@ def debug_events_to_qa_df(debug_df: pd.DataFrame, requested_params: List[str]) -
             "event_count": 1,
             "page_location": row.get("page_url", ""),
             "qa_debug_session_id": str(
-                params.get("qa_debug_session_id", row.get("session_id", ""))
+                row.get("session_id", params.get("qa_debug_session_id", ""))
             ).strip(),
         }
         for key, value in params.items():
@@ -1231,7 +1287,7 @@ def build_realtime_event_rows(
         if primary_key in missing_group:
             missing_group = {k: v for k, v in missing_group.items() if k != primary_key}
 
-        group_session_id = _to_text_value(params.get("qa_debug_session_id", "")) or _to_text_value(row.get("session_id", "")) or "-"
+        group_session_id = _to_text_value(row.get("session_id", "")) or _to_text_value(params.get("qa_debug_session_id", "")) or "-"
         status = evaluate_event_status(
             event_name=event_name,
             params=all_params,
@@ -1607,6 +1663,8 @@ if "qa_debug_session_id" not in st.session_state:
     st.session_state["qa_debug_session_id"] = ""
 if "qa_debug_output_file" not in st.session_state:
     st.session_state["qa_debug_output_file"] = ""
+if "qa_debug_started_at" not in st.session_state:
+    st.session_state["qa_debug_started_at"] = ""
 if "qa_debug_target_url" not in st.session_state:
     st.session_state["qa_debug_target_url"] = ""
 if "qa_tester_name" not in st.session_state:
@@ -1735,6 +1793,7 @@ with st.sidebar:
                 f"상태: {status_for_view or '-'} | "
                 f"캡처: {captured_count_for_view}건"
             )
+            st.caption(f"표시 시간대: {DISPLAY_TZ_NAME}")
             tester_name_view = str(debug_snapshot.get("tester_name", "")).strip() if debug_snapshot else ""
             if tester_name_view:
                 st.caption(f"테스터: {tester_name_view}")
@@ -1793,7 +1852,10 @@ st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서
 
 if realtime_debug_start_clicked:
     try:
-        debug_session_id = f"dbg_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:4]}"
+        previous_sid = st.session_state.get("qa_debug_session_id", "").strip()
+        if previous_sid:
+            stop_debug_session(previous_sid)
+        debug_session_id = f"dbg_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
         debug_file = Path(f"data/debug_stream/{debug_session_id}.jsonl")
         snapshot = start_debug_session(
             session_id=debug_session_id,
@@ -1806,6 +1868,7 @@ if realtime_debug_start_clicked:
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
+        st.session_state["qa_debug_started_at"] = str(snapshot.get("started_at", "")).strip()
         st.success(
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
             f"(상태: {snapshot.get('status', '-')}, 모드: playwright intercept capture)"
@@ -1860,7 +1923,17 @@ with realtime_tab:
             st.warning("세션 객체가 없어 파일 기준으로 복구 표시합니다. (상태: recovered(file))")
         debug_output_file = str(resolved_output_path) if resolved_output_path else ""
         timeline_df_raw = load_debug_events(Path(debug_output_file), limit=3000) if debug_output_file else pd.DataFrame()
-        timeline_df = filter_debug_events_by_view(timeline_df_raw, "히트(collect)")
+        session_started_at = (
+            str(debug_snapshot.get("started_at", "")).strip()
+            if debug_snapshot
+            else str(st.session_state.get("qa_debug_started_at", "")).strip()
+        )
+        timeline_df_active = filter_events_for_active_session(
+            timeline_df_raw,
+            session_id=active_debug_session_id,
+            session_started_at=session_started_at,
+        )
+        timeline_df = filter_debug_events_by_view(timeline_df_active, "히트(collect)")
         sid_for_view = (
             str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
         ) or "-"
@@ -2264,7 +2337,12 @@ with report_tab:
                     st.stop()
 
                 raw_df_all = load_debug_events(debug_file, limit=int(max_rows))
-                raw_df = filter_debug_events_by_view(raw_df_all, "히트(collect)")
+                raw_df_active = filter_events_for_active_session(
+                    raw_df_all,
+                    session_id=st.session_state.get("qa_debug_session_id", "").strip(),
+                    session_started_at=st.session_state.get("qa_debug_started_at", "").strip(),
+                )
+                raw_df = filter_debug_events_by_view(raw_df_active, "히트(collect)")
                 if raw_df.empty:
                     st.error(
                         "실제 수집 히트(collect)가 없습니다. 디버깅 모드 시작 후 이벤트를 발생시키고, "
