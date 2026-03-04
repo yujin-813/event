@@ -117,6 +117,12 @@ def get_config_value(key: str, default: str = "") -> str:
     env_val = os.getenv(key, "").strip()
     if env_val:
         return env_val
+    try:
+        secret_val = str(st.secrets.get(key, "")).strip()
+        if secret_val:
+            return secret_val
+    except Exception:
+        pass
     dotenv_val = load_dotenv_values().get(key, "").strip()
     if dotenv_val:
         return dotenv_val
