@@ -164,6 +164,21 @@ def auto_open_popup_window(url: str, popup_name: str = "qa_debug_popup") -> None
     )
 
 
+def normalize_debug_target_url(raw_url: str) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return text
+    if (not parsed.scheme) and parsed.path and ("." in parsed.path):
+        guess = f"https://{parsed.path}"
+        g = urlparse(guess)
+        if g.scheme and g.netloc:
+            return guess
+    return ""
+
+
 def _get_request_headers() -> Dict[str, str]:
     try:
         raw_headers = st.context.headers
@@ -2066,9 +2081,15 @@ st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서
 
 if realtime_debug_start_clicked:
     try:
+        normalized_target_url = normalize_debug_target_url(st.session_state.get("qa_debug_target_url", ""))
+        if not normalized_target_url:
+            st.error("디버깅 대상 URL 형식이 올바르지 않습니다. 예: https://datanugget.io/")
+            log_ui_action("debug_start_error", {"error": "invalid_target_url"})
+            st.stop()
+        st.session_state["qa_debug_target_url"] = normalized_target_url
         log_ui_action(
             "debug_start_click",
-            {"target_url": st.session_state.get("qa_debug_target_url", "").strip()},
+            {"target_url": normalized_target_url},
         )
         previous_sid = st.session_state.get("qa_debug_session_id", "").strip()
         if previous_sid:
@@ -2077,7 +2098,7 @@ if realtime_debug_start_clicked:
         debug_file = Path(f"data/debug_stream/{debug_session_id}.jsonl")
         snapshot = start_debug_session(
             session_id=debug_session_id,
-            target_url=st.session_state.get("qa_debug_target_url", "").strip(),
+            target_url=normalized_target_url,
             output_file=debug_file,
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
