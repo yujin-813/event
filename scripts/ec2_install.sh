@@ -20,6 +20,7 @@ apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb x11
 
 chown -R ubuntu:ubuntu "${APP_DIR}"
 chmod +x "${APP_DIR}/scripts/run.sh" \
+  "${APP_DIR}/scripts/run_ingest.sh" \
   "${APP_DIR}/scripts/run_xvfb.sh" \
   "${APP_DIR}/scripts/run_x11vnc.sh" \
   "${APP_DIR}/scripts/run_novnc.sh"
@@ -30,12 +31,13 @@ su - ubuntu -c "cd ${APP_DIR} && ./scripts/bootstrap.sh"
 su - ubuntu -c "cd ${APP_DIR} && ./.venv/bin/playwright install chromium"
 
 cp "${APP_DIR}/deploy/ec2/systemd/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}.service"
+cp "${APP_DIR}/deploy/ec2/systemd/ga4-qa-ingest.service" "/etc/systemd/system/ga4-qa-ingest.service"
 cp "${APP_DIR}/deploy/ec2/systemd/ga4-qa-xvfb.service" "/etc/systemd/system/ga4-qa-xvfb.service"
 cp "${APP_DIR}/deploy/ec2/systemd/ga4-qa-x11vnc.service" "/etc/systemd/system/ga4-qa-x11vnc.service"
 cp "${APP_DIR}/deploy/ec2/systemd/ga4-qa-novnc.service" "/etc/systemd/system/ga4-qa-novnc.service"
 systemctl daemon-reload
-systemctl enable ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
-systemctl restart ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
+systemctl enable ga4-qa-ingest ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
+systemctl restart ga4-qa-ingest ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
 

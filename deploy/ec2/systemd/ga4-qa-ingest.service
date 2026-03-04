@@ -1,0 +1,18 @@
+[Unit]
+Description=GA4 QA Ingest Collector Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ga4-qa-mvp
+Environment=PYTHONUNBUFFERED=1
+Environment=QA_INGEST_HOST=127.0.0.1
+Environment=QA_INGEST_PORT=8600
+ExecStart=/opt/ga4-qa-mvp/scripts/run_ingest.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

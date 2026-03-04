@@ -355,3 +355,21 @@ def ensure_ingest_server(host: str = "127.0.0.1", port: int = 8600) -> Dict[str,
             }
         )
         return dict(_SERVER_STATE)
+
+
+def run_ingest_server_forever(host: str = "127.0.0.1", port: int = 8600) -> None:
+    httpd = _ReusableThreadingHTTPServer((host, int(port)), _CollectHandler)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    host = str(os.getenv("QA_INGEST_HOST", "127.0.0.1")).strip() or "127.0.0.1"
+    port_raw = str(os.getenv("QA_INGEST_PORT", "8600")).strip() or "8600"
+    try:
+        port = int(port_raw)
+    except Exception:
+        port = 8600
+    run_ingest_server_forever(host=host, port=port)

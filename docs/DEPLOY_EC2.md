@@ -39,10 +39,13 @@ cd /opt/ga4-qa-mvp
 ## 6) systemd 서비스 등록
 ```bash
 sudo cp deploy/ec2/systemd/ga4-qa-mvp.service /etc/systemd/system/
+sudo cp deploy/ec2/systemd/ga4-qa-ingest.service /etc/systemd/system/
 sudo cp deploy/ec2/systemd/ga4-qa-xvfb.service /etc/systemd/system/
 sudo cp deploy/ec2/systemd/ga4-qa-x11vnc.service /etc/systemd/system/
 sudo cp deploy/ec2/systemd/ga4-qa-novnc.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable ga4-qa-ingest
+sudo systemctl start ga4-qa-ingest
 sudo systemctl enable ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
 sudo systemctl start ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
 sudo systemctl enable ga4-qa-mvp
@@ -113,6 +116,8 @@ sudo systemctl restart ga4-qa-mvp
 sudo systemctl status ga4-qa-xvfb --no-pager
 sudo systemctl status ga4-qa-x11vnc --no-pager
 sudo systemctl status ga4-qa-novnc --no-pager
+sudo systemctl status ga4-qa-ingest --no-pager
+curl -sS http://127.0.0.1:8600/qa/health
 curl -I http://127.0.0.1:6080/vnc.html
 ```
 

@@ -31,6 +31,8 @@
 ```bash
 cd /Users/havalovely/ga4-qa-mvp
 ./scripts/bootstrap.sh
+# (옵션) 수집기 단독 실행
+./scripts/run_ingest.sh &
 ./scripts/run.sh
 ```
 
