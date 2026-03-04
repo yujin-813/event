@@ -109,6 +109,7 @@ sudo ./scripts/ec2_install.sh
 - `QA_OPEN_NOVNC_ON_START=1`: 디버깅 시작 시 noVNC 팝업 자동 오픈
 - `QA_NOVNC_PUBLIC_URL`: noVNC URL 오버라이드
 - `QA_APP_ACCESS_ENABLED=1`: 앱 진입 코드 인증 활성화
+- `QA_APP_ACCESS_BYPASS=1`: 진입 제한 임시 우회(긴급 복구용)
 - `QA_TESTER_ACCESS_CODE` / `QA_ADMIN_ACCESS_CODE`: 테스터/관리자 접속 코드
 - `QA_COLLECT_REQUIRE_ACTIVE_SESSION=1`: 활성 세션 없는 `/qa/collect` 요청 차단
 - `QA_COLLECT_RATE_LIMIT_*`: 수집 요청 rate limit

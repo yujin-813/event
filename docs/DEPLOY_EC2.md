@@ -148,3 +148,12 @@ QA_ACTION_LOG_SALT=change-me-salt
 EOF
 sudo systemctl restart ga4-qa-mvp
 ```
+
+임시로 진입 제한을 즉시 해제하려면:
+```bash
+cd /opt/ga4-qa-mvp
+grep -q '^QA_APP_ACCESS_BYPASS=' .env && \
+  sed -i 's|^QA_APP_ACCESS_BYPASS=.*|QA_APP_ACCESS_BYPASS=1|' .env || \
+  echo 'QA_APP_ACCESS_BYPASS=1' >> .env
+sudo systemctl restart ga4-qa-mvp
+```
