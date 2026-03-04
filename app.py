@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pandas as pd
@@ -112,19 +112,6 @@ def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
             return '"ok":true' in body.lower().replace(" ", "")
     except Exception:
         return False
-
-
-def build_ingest_health_url(collect_url: str) -> str:
-    target = str(collect_url or "").strip()
-    if not target:
-        return ""
-    try:
-        parsed = urlparse(target)
-        if not parsed.scheme or not parsed.netloc:
-            return ""
-        return urlunparse((parsed.scheme, parsed.netloc, "/qa/health", "", "", ""))
-    except Exception:
-        return ""
 
 
 def get_google_access_token(token_path: Path) -> str:
@@ -1360,29 +1347,6 @@ def build_event_preview(df: pd.DataFrame, requested_params: List[str]) -> pd.Dat
     return df[ordered_cols]
 
 
-def build_test_url(base_url: str, param_name: str, param_value: str) -> str:
-    url = base_url.strip()
-    if not url:
-        return ""
-    if not param_name.strip() or not param_value.strip():
-        return url
-
-    parsed = urlparse(url)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query[param_name.strip()] = param_value.strip()
-    new_query = urlencode(query)
-    return urlunparse(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            new_query,
-            parsed.fragment,
-        )
-    )
-
-
 def resolve_debug_output_file(
     session_id: str,
     snapshot: Dict[str, object],
@@ -1435,27 +1399,6 @@ def inject_case_from_page_location(df: pd.DataFrame, case_param: str) -> pd.Data
     out.loc[missing_mask, param] = out.loc[missing_mask, "page_location"].apply(extract_value)
     return out
 
-
-def auto_open_popup_window(url: str) -> None:
-    if not url.strip():
-        return
-    js_url = json.dumps(url)
-    components.html(
-        f"""
-        <script>
-          const targetName = "qa_live_window";
-          const features = "popup=yes,width=1280,height=900,scrollbars=yes,resizable=yes";
-          let popup = window.open({js_url}, targetName, features);
-          if (!popup && window.parent && window.parent !== window) {{
-            try {{
-              popup = window.parent.open({js_url}, targetName, features);
-            }} catch (e) {{}}
-          }}
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
 
 def _safe_params_dict(value: object) -> Dict[str, object]:
     if isinstance(value, dict):
@@ -1627,7 +1570,6 @@ scenario_key_modes = {
 risk_level_ko = {"Low": "낮음", "Medium": "중간", "High": "높음"}
 scenario_mode_ko = {"key": "키 기반", "user": "사용자 기반", "aggregate": "집계형", "empty": "데이터 없음"}
 debug_case_param_name = "qa_debug_session_id"
-default_ingest_public_url = get_config_value("QA_INGEST_PUBLIC_URL", "https://asknuggetdata.com/qa/collect")
 
 if "qa_debug_session_id" not in st.session_state:
     st.session_state["qa_debug_session_id"] = ""
@@ -1661,14 +1603,10 @@ if "qa_oauth_notice" not in st.session_state:
     st.session_state["qa_oauth_notice"] = ""
 if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
-if "qa_ingest_public_url" not in st.session_state:
-    st.session_state["qa_ingest_public_url"] = default_ingest_public_url
 if "qa_ingest_server_error" not in st.session_state:
     st.session_state["qa_ingest_server_error"] = ""
 if "qa_ingest_local_ok" not in st.session_state:
     st.session_state["qa_ingest_local_ok"] = False
-if "qa_ingest_public_ok" not in st.session_state:
-    st.session_state["qa_ingest_public_ok"] = False
 
 ensure_err = ""
 try:
@@ -1677,12 +1615,9 @@ except Exception as exc:
     ensure_err = str(exc)
 
 local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
-public_health_url = build_ingest_health_url(st.session_state.get("qa_ingest_public_url", default_ingest_public_url))
-public_health_ok = probe_ingest_health(public_health_url) if public_health_url else False
 
 st.session_state["qa_ingest_local_ok"] = bool(local_health_ok)
-st.session_state["qa_ingest_public_ok"] = bool(public_health_ok)
-st.session_state["qa_ingest_server_ok"] = bool(local_health_ok or public_health_ok)
+st.session_state["qa_ingest_server_ok"] = bool(local_health_ok)
 if st.session_state["qa_ingest_server_ok"]:
     st.session_state["qa_ingest_server_error"] = ""
 else:
@@ -1690,8 +1625,6 @@ else:
     if ensure_err:
         detail_bits.append(f"ensure: {ensure_err}")
     detail_bits.append(f"local_health({'ok' if local_health_ok else 'fail'}): http://127.0.0.1:8600/qa/health")
-    if public_health_url:
-        detail_bits.append(f"public_health({'ok' if public_health_ok else 'fail'}): {public_health_url}")
     st.session_state["qa_ingest_server_error"] = " | ".join(detail_bits)
 
 scenario_enabled = True
@@ -1705,22 +1638,11 @@ realtime_debug_stop_clicked = False
 with st.sidebar:
     st.header("설정")
     with st.expander("1) 데이터 소스/연결", expanded=True):
-        st.markdown("**브라우저 확장프로그램 히트 캡처 + QA 리포트 API 참조 모드**")
-        st.caption("스니펫 없이 Chrome 확장프로그램이 collect 히트를 가로채어 전송합니다.")
+        st.markdown("**Playwright 네트워크 인터셉트 + QA 리포트 API 참조 모드**")
+        st.caption("확장/스니펫 없이 Playwright request hook으로 collect 히트를 수집합니다.")
         st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 불러올 수 있습니다.")
-        st.text_input(
-            "확장 수집 엔드포인트",
-            key="qa_ingest_public_url",
-            disabled=True,
-        )
         if st.session_state.get("qa_ingest_server_ok", False):
-            ok_parts: List[str] = []
-            if st.session_state.get("qa_ingest_local_ok", False):
-                ok_parts.append("local:127.0.0.1:8600")
-            if st.session_state.get("qa_ingest_public_ok", False):
-                ok_parts.append("public:/qa/health")
-            ok_text = ", ".join(ok_parts) if ok_parts else "health check"
-            st.caption(f"서버 수집기 상태: OK ({ok_text})")
+            st.caption("서버 수집기 상태: OK (local:127.0.0.1:8600)")
         else:
             st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
             last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
@@ -1740,7 +1662,7 @@ with st.sidebar:
             key="qa_debug_target_url",
             placeholder="예: https://datanugget.io/",
         )
-        st.caption("확장프로그램이 활성화된 Chrome에서 디버그 팝업 URL을 열어 테스트하세요.")
+        st.caption("디버깅 모드 시작 시 Playwright 테스트 브라우저가 열리고 collect 히트를 감시합니다.")
         st.text_input(
             "테스터 이름",
             value=st.session_state.get("qa_tester_name", ""),
@@ -1783,14 +1705,6 @@ with st.sidebar:
                 st.caption(f"테스터: {tester_name_view}")
             if debug_snapshot and debug_snapshot.get("last_error", "").strip():
                 st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
-            debug_popup_url = build_test_url(
-                st.session_state.get("qa_debug_target_url", "").strip(),
-                debug_case_param_name,
-                sid_for_view,
-            )
-            if debug_popup_url:
-                st.caption("디버그 팝업 URL")
-                st.code(debug_popup_url, language="text")
             st.caption("실시간 QA 리스트는 메인 영역의 `실시간 테스트 QA 리스트` 탭에서 확인하세요.")
         else:
             st.caption("디버깅 시작 후 타임라인이 표시됩니다.")
@@ -1853,20 +1767,13 @@ if realtime_debug_start_clicked:
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
             db_path=Path("data/test_logs/qa_runs.db"),
-            launch_browser=False,
+            launch_browser=True,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
-        debug_popup_url = build_test_url(
-            st.session_state.get("qa_debug_target_url", "").strip(),
-            debug_case_param_name,
-            debug_session_id,
-        )
-        if debug_popup_url:
-            auto_open_popup_window(debug_popup_url)
         st.success(
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
-            f"(상태: {snapshot.get('status', '-')}, 모드: extension hit capture)"
+            f"(상태: {snapshot.get('status', '-')}, 모드: playwright intercept capture)"
         )
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")

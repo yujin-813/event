@@ -99,7 +99,7 @@ USE_XVFB=1 ./scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --serv
 - Analytics Proxy를 켜면 업스트림 재전송이 추가되어 중복 전송 가능성이 있습니다.
 
 ## 환경변수 (선택)
-- `QA_INGEST_PUBLIC_URL`: 기본 확장 수집 엔드포인트
+- 기본 수집 경로는 로컬 Event Collector(`http://127.0.0.1:8600/qa/collect`)입니다.
 - `QA_ANALYTICS_PROXY_ENABLED=1`: `/qa/collect` 수집 후 업스트림 재전송 활성화
 - `QA_ANALYTICS_PROXY_ALLOW_ANY=1`: 업스트림 도메인 제한 해제 (기본 0 권장)
 - `QA_ANALYTICS_PROXY_TIMEOUT_SEC=2.5`: 업스트림 전송 timeout
