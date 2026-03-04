@@ -110,3 +110,7 @@ sudo ./scripts/ec2_install.sh
 ## 배포
 - EC2 + 도메인(asknuggetdata.com) 배포 가이드:
   - `docs/DEPLOY_EC2.md`
+
+## 현재 버전 정리
+- 2026-03-04 기준 상태/적용 내역:
+  - `docs/CURRENT_VERSION_2026-03-04.md`
