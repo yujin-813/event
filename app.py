@@ -2094,7 +2094,6 @@ if realtime_debug_start_clicked:
             st.error("디버깅 대상 URL 형식이 올바르지 않습니다. 예: https://datanugget.io/")
             log_ui_action("debug_start_error", {"error": "invalid_target_url"})
             st.stop()
-        st.session_state["qa_debug_target_url"] = normalized_target_url
         log_ui_action(
             "debug_start_click",
             {"target_url": normalized_target_url},
