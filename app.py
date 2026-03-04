@@ -280,9 +280,59 @@ def _resolve_project_path(path_text: str) -> Path:
 
 
 def _load_google_client_config(client_secrets_file: str) -> Dict[str, str]:
+    # 1) Streamlit secrets.toml ([auth], [auth.google]) 우선 지원
+    #    예:
+    #    [auth]
+    #    redirect_uri = "https://asknuggetdata.com/oauth2callback"
+    #    [auth.google]
+    #    client_id = "..."
+    #    client_secret = "..."
+    try:
+        auth_conf = st.secrets.get("auth", {})
+        google_conf = auth_conf.get("google", {}) if hasattr(auth_conf, "get") else {}
+        sec_client_id = str(google_conf.get("client_id", "")).strip() if hasattr(google_conf, "get") else ""
+        sec_client_secret = str(google_conf.get("client_secret", "")).strip() if hasattr(google_conf, "get") else ""
+        sec_metadata_url = str(google_conf.get("server_metadata_url", "")).strip() if hasattr(google_conf, "get") else ""
+
+        if sec_client_id and sec_client_secret:
+            redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", "").strip()
+            sec_redirect_uri = str(auth_conf.get("redirect_uri", "")).strip() if hasattr(auth_conf, "get") else ""
+            redirect_uri = (
+                redirect_uri_override
+                or sec_redirect_uri
+                or DEFAULT_OAUTH_REDIRECT_URI
+            )
+            auth_uri = "https://accounts.google.com/o/oauth2/v2/auth"
+            token_uri = "https://oauth2.googleapis.com/token"
+
+            if sec_metadata_url:
+                try:
+                    req = urllib_request.Request(sec_metadata_url, method="GET")
+                    with urllib_request.urlopen(req, timeout=10) as resp:
+                        meta = json.loads(resp.read().decode("utf-8"))
+                    auth_uri = str(meta.get("authorization_endpoint", auth_uri)).strip() or auth_uri
+                    token_uri = str(meta.get("token_endpoint", token_uri)).strip() or token_uri
+                except Exception:
+                    # metadata 조회 실패 시 기본 엔드포인트 사용
+                    pass
+
+            return {
+                "client_id": sec_client_id,
+                "client_secret": sec_client_secret,
+                "auth_uri": auth_uri,
+                "token_uri": token_uri,
+                "redirect_uri": redirect_uri,
+            }
+    except Exception:
+        pass
+
+    # 2) 기존 client_secret.json 방식 fallback
     cfg_path = _resolve_project_path(client_secrets_file)
     if not cfg_path.exists():
-        raise RuntimeError(f"OAuth client secret 파일이 없습니다: {cfg_path}")
+        raise RuntimeError(
+            f"OAuth client secret 파일이 없습니다: {cfg_path} "
+            "(또는 .streamlit/secrets.toml의 [auth.google] client_id/client_secret를 설정하세요.)"
+        )
     raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     base = raw.get("web") or raw.get("installed")
     if not isinstance(base, dict):
