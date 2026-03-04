@@ -501,7 +501,6 @@ def process_google_oauth_callback_if_present() -> None:
         st.session_state["qa_oauth_notice"] = ""
     finally:
         st.query_params.clear()
-        st.session_state["_qa_oauth_redirect_home"] = True
         st.rerun()
 
 
@@ -1720,32 +1719,6 @@ def to_user_error_message(exc: Exception) -> str:
 
 
 process_google_oauth_callback_if_present()
-if st.session_state.pop("_qa_oauth_redirect_home", False):
-    components.html(
-        """
-        <script>
-          (() => {
-            const target = (window.parent?.location?.origin || window.location.origin) + "/";
-            try {
-              if (window.top && window.top.location) {
-                window.top.location.replace(target);
-                return;
-              }
-            } catch (e) {}
-            try {
-              if (window.parent && window.parent.location) {
-                window.parent.location.replace(target);
-                return;
-              }
-            } catch (e) {}
-            window.location.replace(target);
-          })();
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
-    st.stop()
 
 
 source = "실시간 디버깅 스트림"
@@ -2286,15 +2259,49 @@ with report_tab:
             )
             st.session_state["qa_oauth_state"] = oauth_state
             st.session_state["qa_oauth_auth_url"] = auth_url
+            st.session_state["qa_oauth_go_now_url"] = auth_url
             st.session_state["qa_oauth_notice"] = ""
             st.session_state["qa_oauth_error"] = ""
+            st.rerun()
         except Exception as exc:
             st.session_state["qa_oauth_error"] = to_user_error_message(exc)
             st.session_state["qa_oauth_auth_url"] = ""
+            st.session_state["qa_oauth_go_now_url"] = ""
+
+    go_now_url = str(st.session_state.pop("qa_oauth_go_now_url", "")).strip()
+    if go_now_url:
+        safe_url = json.dumps(go_now_url)
+        st.info("Google 로그인 페이지로 이동합니다...")
+        components.html(
+            f"""
+            <script>
+              (() => {{
+                const url = {safe_url};
+                try {{
+                  if (window.top && window.top.location) {{
+                    window.top.location.assign(url);
+                    return;
+                  }}
+                }} catch (e) {{}}
+                try {{
+                  if (window.parent && window.parent.location) {{
+                    window.parent.location.assign(url);
+                    return;
+                  }}
+                }} catch (e) {{}}
+                window.location.assign(url);
+              }})();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+        st.markdown(f"[자동 이동이 안 되면 Google 로그인 페이지를 직접 열기]({go_now_url})")
+        st.stop()
 
     pending_auth_url = str(st.session_state.get("qa_oauth_auth_url", "")).strip()
     if pending_auth_url:
-        st.link_button("Google 로그인 페이지 열기", pending_auth_url, type="primary")
+        st.markdown(f"[Google 로그인 페이지 열기]({pending_auth_url})")
         st.caption("로그인 완료 후 앱으로 돌아오면 토큰이 저장되고 속성 리스트를 불러올 수 있습니다.")
 
     if property_refresh_clicked:
