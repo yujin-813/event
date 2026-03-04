@@ -1724,10 +1724,22 @@ if st.session_state.pop("_qa_oauth_redirect_home", False):
     components.html(
         """
         <script>
-          const target = window.location.origin + "/";
-          if (window.location.href !== target) {
+          (() => {
+            const target = (window.parent?.location?.origin || window.location.origin) + "/";
+            try {
+              if (window.top && window.top.location) {
+                window.top.location.replace(target);
+                return;
+              }
+            } catch (e) {}
+            try {
+              if (window.parent && window.parent.location) {
+                window.parent.location.replace(target);
+                return;
+              }
+            } catch (e) {}
             window.location.replace(target);
-          }
+          })();
         </script>
         """,
         height=0,
