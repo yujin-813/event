@@ -1728,7 +1728,6 @@ with st.sidebar:
             st.caption("배포 환경에서 테스터 브라우저 히트를 즉시 수집합니다.")
             st.text_input(
                 "확장 수집 엔드포인트",
-                value=st.session_state.get("qa_ingest_public_url", default_ingest_public_url),
                 key="qa_ingest_public_url",
                 disabled=True,
             )
