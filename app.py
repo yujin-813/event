@@ -501,6 +501,7 @@ def process_google_oauth_callback_if_present() -> None:
         st.session_state["qa_oauth_notice"] = ""
     finally:
         st.query_params.clear()
+        st.session_state["_qa_oauth_redirect_home"] = True
         st.rerun()
 
 
@@ -1719,6 +1720,20 @@ def to_user_error_message(exc: Exception) -> str:
 
 
 process_google_oauth_callback_if_present()
+if st.session_state.pop("_qa_oauth_redirect_home", False):
+    components.html(
+        """
+        <script>
+          const target = window.location.origin + "/";
+          if (window.location.href !== target) {
+            window.location.replace(target);
+          }
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+    st.stop()
 
 
 source = "실시간 디버깅 스트림"
