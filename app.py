@@ -281,8 +281,23 @@ def _load_google_client_config(client_secrets_file: str) -> Dict[str, str]:
     if not isinstance(base, dict):
         raise RuntimeError("client_secret.json 형식이 올바르지 않습니다. web/installed 설정이 필요합니다.")
 
-    redirect_uris = base.get("redirect_uris") or []
-    redirect_uri = str(redirect_uris[0]).strip() if redirect_uris else ""
+    redirect_uris = [str(u).strip() for u in (base.get("redirect_uris") or []) if str(u).strip()]
+    redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", "").strip()
+
+    def _is_local_redirect(uri_text: str) -> bool:
+        try:
+            host = (urlparse(uri_text).hostname or "").strip().lower()
+        except Exception:
+            host = ""
+        return host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local")
+
+    if redirect_uri_override:
+        redirect_uri = redirect_uri_override
+    else:
+        https_non_local = [
+            u for u in redirect_uris if u.lower().startswith("https://") and not _is_local_redirect(u)
+        ]
+        redirect_uri = https_non_local[0] if https_non_local else (redirect_uris[0] if redirect_uris else "")
     if not redirect_uri:
         raise RuntimeError("client_secret.json에 redirect_uris가 없습니다.")
 
@@ -342,6 +357,12 @@ def exchange_google_oauth_code(
             token_resp = json.loads(resp.read().decode("utf-8"))
     except urllib_error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
+        if "redirect_uri_mismatch" in detail:
+            raise RuntimeError(
+                "Google 로그인 토큰 교환 실패: redirect_uri_mismatch. "
+                "Google Cloud OAuth 설정에 현재 redirect URI를 추가하세요 "
+                "(예: https://asknuggetdata.com/oauth2callback)."
+            ) from exc
         raise RuntimeError(f"Google 로그인 토큰 교환 실패: {exc.code} {detail}") from exc
     except Exception as exc:
         raise RuntimeError(f"Google 로그인 토큰 교환 실패: {exc}") from exc
