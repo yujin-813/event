@@ -48,6 +48,7 @@ st.set_page_config(page_title="GA4 QA Reporter", layout="wide")
 st.title("GA4 QA 리포터 (룰 기반)")
 st.caption("실시간 DebugView 대체가 아닌, 로그 수집 + 자동 정리 + 룰 기반 판정을 위한 내부 QA 도구")
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_OAUTH_REDIRECT_URI = "https://asknuggetdata.com/oauth2callback"
 
 
 def _bootstrap_dotenv_value(key: str) -> str:
@@ -282,7 +283,7 @@ def _load_google_client_config(client_secrets_file: str) -> Dict[str, str]:
         raise RuntimeError("client_secret.json 형식이 올바르지 않습니다. web/installed 설정이 필요합니다.")
 
     redirect_uris = [str(u).strip() for u in (base.get("redirect_uris") or []) if str(u).strip()]
-    redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", "").strip()
+    redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", DEFAULT_OAUTH_REDIRECT_URI).strip()
 
     def _is_local_redirect(uri_text: str) -> bool:
         try:
