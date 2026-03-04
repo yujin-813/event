@@ -8,6 +8,8 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/ga4-qa-mvp
 Environment=PYTHONUNBUFFERED=1
+Environment=USE_XVFB=1
+Environment=XVFB_ARGS=-screen 0 1920x1080x24 -ac +extension RANDR
 ExecStart=/opt/ga4-qa-mvp/scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --server.headless true
 Restart=always
 RestartSec=3

@@ -16,7 +16,7 @@ if [[ ! -d "${APP_DIR}" ]]; then
 fi
 
 apt update
-apt install -y python3 python3-venv nginx certbot python3-certbot-nginx
+apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb
 
 chown -R ubuntu:ubuntu "${APP_DIR}"
 

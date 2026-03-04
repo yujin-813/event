@@ -53,6 +53,12 @@ playwright install chromium
 streamlit run app.py
 ```
 
+EC2에서 Playwright headful이 필요하면:
+```bash
+sudo apt install -y xvfb
+USE_XVFB=1 ./scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --server.headless true
+```
+
 ## 사용 흐름
 1. 사이드바 `실시간 디버깅 스트림`에서 `디버깅 모드 시작`
 2. 테스트 사이트에서 실제 사용자 액션 수행

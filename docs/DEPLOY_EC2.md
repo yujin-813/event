@@ -14,7 +14,7 @@
 ## 3) 서버 패키지 설치 (Ubuntu 기준)
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx
+sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb
 ```
 
 원클릭 스크립트 사용 시:
@@ -85,3 +85,7 @@ sudo certbot renew --dry-run
 cd /opt/ga4-qa-mvp
 sqlite3 data/test_logs/qa_runs.db ".backup '/opt/ga4-qa-mvp/data/test_logs/qa_runs_$(date +%F).db'"
 ```
+
+## 11) Playwright Headful (Xvfb)
+- 서비스는 기본적으로 `USE_XVFB=1`로 실행되어 가상 디스플레이에서 Playwright headful 브라우저를 띄웁니다.
+- 실제 창을 EC2 콘솔에서 직접 보려면 별도 VNC/noVNC 구성이 필요합니다.

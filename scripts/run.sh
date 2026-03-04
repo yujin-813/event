@@ -10,4 +10,15 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
+
+if [[ "${USE_XVFB:-0}" == "1" ]]; then
+  if command -v xvfb-run >/dev/null 2>&1; then
+    XVFB_ARGS="${XVFB_ARGS:--screen 0 1920x1080x24 -ac +extension RANDR}"
+    exec xvfb-run -a -s "$XVFB_ARGS" streamlit run app.py "$@"
+  else
+    echo "USE_XVFB=1 이지만 xvfb-run 명령을 찾지 못했습니다. xvfb 패키지를 설치하세요."
+    exit 1
+  fi
+fi
+
 exec streamlit run app.py "$@"
