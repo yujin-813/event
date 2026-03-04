@@ -583,20 +583,20 @@ def _run_debug_session(session_id: str) -> None:
 
             def on_request(request):  # noqa: ANN001
                 try:
-                    hit_payloads = _extract_ga_hit_payloads(
-                        url=str(request.url),
-                        method=str(request.method),
-                        post_data=str(request.post_data or ""),
+                    # Playwright request hook -> Event Collector core path
+                    # (/qa/collect과 동일한 ingest 로직을 재사용)
+                    captured = ingest_collect_request(
                         session_id=session_id,
+                        request_url=str(request.url),
+                        request_method=str(request.method),
+                        request_body=str(request.post_data or ""),
                     )
-                    if not hit_payloads:
+                    if not captured:
                         return
-                    for payload in hit_payloads:
-                        _append_event_with_db(output_path, payload, session.db_path)
                     with _LOCK:
                         s = _SESSIONS.get(session_id)
                         if s:
-                            s.captured_events += len(hit_payloads)
+                            # ingest_collect_request 내부에서 누적되므로 중복 증가 방지
                             should_sync = (s.captured_events % 10 == 0)
                         else:
                             should_sync = False
