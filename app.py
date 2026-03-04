@@ -93,6 +93,38 @@ def get_config_value(key: str, default: str = "") -> str:
     return default
 
 
+def is_truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_novnc_popup_url() -> str:
+    configured = get_config_value("QA_NOVNC_PUBLIC_URL", "").strip()
+    if configured:
+        return configured
+    return "/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify"
+
+
+def auto_open_popup_window(url: str, popup_name: str = "qa_debug_popup") -> None:
+    target_url = str(url or "").strip()
+    if not target_url:
+        return
+    safe_url = json.dumps(target_url)
+    safe_name = json.dumps(popup_name)
+    components.html(
+        f"""
+        <script>
+          (() => {{
+            const w = window.parent || window;
+            const features = "width=1320,height=900,resizable=yes,scrollbars=yes";
+            w.open({safe_url}, {safe_name}, features);
+          }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
     target = str(url or "").strip()
     if not target:
@@ -1663,6 +1695,9 @@ with st.sidebar:
             placeholder="예: https://datanugget.io/",
         )
         st.caption("디버깅 모드 시작 시 Playwright 테스트 브라우저가 열리고 collect 히트를 감시합니다.")
+        novnc_popup_url = get_novnc_popup_url()
+        st.caption(f"원격 디버그 팝업 URL: {novnc_popup_url}")
+        st.markdown(f"[원격 디버그 화면 열기 (noVNC)]({novnc_popup_url})")
         st.text_input(
             "테스터 이름",
             value=st.session_state.get("qa_tester_name", ""),
@@ -1775,6 +1810,9 @@ if realtime_debug_start_clicked:
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
             f"(상태: {snapshot.get('status', '-')}, 모드: playwright intercept capture)"
         )
+        if is_truthy(get_config_value("QA_OPEN_NOVNC_ON_START", "1")):
+            auto_open_popup_window(get_novnc_popup_url(), popup_name=f"qa_debug_popup_{debug_session_id}")
+            st.caption("원격 디버그 팝업(noVNC) 자동 열기를 시도했습니다. 차단되면 링크를 직접 열어주세요.")
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
 

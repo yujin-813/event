@@ -14,7 +14,7 @@
 ## 3) 서버 패키지 설치 (Ubuntu 기준)
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb
+sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb x11vnc novnc websockify
 ```
 
 원클릭 스크립트 사용 시:
@@ -39,7 +39,12 @@ cd /opt/ga4-qa-mvp
 ## 6) systemd 서비스 등록
 ```bash
 sudo cp deploy/ec2/systemd/ga4-qa-mvp.service /etc/systemd/system/
+sudo cp deploy/ec2/systemd/ga4-qa-xvfb.service /etc/systemd/system/
+sudo cp deploy/ec2/systemd/ga4-qa-x11vnc.service /etc/systemd/system/
+sudo cp deploy/ec2/systemd/ga4-qa-novnc.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
+sudo systemctl start ga4-qa-xvfb ga4-qa-x11vnc ga4-qa-novnc
 sudo systemctl enable ga4-qa-mvp
 sudo systemctl start ga4-qa-mvp
 sudo systemctl status ga4-qa-mvp
@@ -99,6 +104,24 @@ EOF
 sudo systemctl restart ga4-qa-mvp
 ```
 
-## 11) Playwright Headful (Xvfb)
-- 서비스는 기본적으로 `USE_XVFB=1`로 실행되어 가상 디스플레이에서 Playwright headful 브라우저를 띄웁니다.
-- 실제 창을 EC2 콘솔에서 직접 보려면 별도 VNC/noVNC 구성이 필요합니다.
+## 11) Playwright Popup 원격 보기 (Xvfb + noVNC)
+- 디버깅 시작 시 Playwright가 `DISPLAY=:99`에서 브라우저를 실행합니다.
+- noVNC 경로로 원격 팝업 확인:
+  - `https://asknuggetdata.com/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify`
+- 상태 점검:
+```bash
+sudo systemctl status ga4-qa-xvfb --no-pager
+sudo systemctl status ga4-qa-x11vnc --no-pager
+sudo systemctl status ga4-qa-novnc --no-pager
+curl -I http://127.0.0.1:6080/vnc.html
+```
+
+- `.env` 권장:
+```bash
+cd /opt/ga4-qa-mvp
+cat >> .env <<'EOF'
+QA_OPEN_NOVNC_ON_START=1
+QA_NOVNC_PUBLIC_URL=https://asknuggetdata.com/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify
+EOF
+sudo systemctl restart ga4-qa-mvp
+```

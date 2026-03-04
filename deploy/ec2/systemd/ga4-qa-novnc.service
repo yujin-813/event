@@ -1,0 +1,20 @@
+[Unit]
+Description=GA4 QA noVNC Web Gateway
+After=ga4-qa-x11vnc.service
+Requires=ga4-qa-x11vnc.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ga4-qa-mvp
+Environment=NOVNC_LISTEN_HOST=127.0.0.1
+Environment=NOVNC_LISTEN_PORT=6080
+Environment=NOVNC_VNC_HOST=127.0.0.1
+Environment=NOVNC_VNC_PORT=5900
+ExecStart=/opt/ga4-qa-mvp/scripts/run_novnc.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

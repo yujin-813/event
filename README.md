@@ -55,10 +55,11 @@ playwright install chromium
 streamlit run app.py
 ```
 
-EC2에서 Playwright headful이 필요하면:
+EC2에서 Playwright popup(원격 화면)이 필요하면:
 ```bash
-sudo apt install -y xvfb
-USE_XVFB=1 ./scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --server.headless true
+sudo apt install -y xvfb x11vnc novnc websockify
+# 배포 스크립트 사용 시 자동 구성
+sudo ./scripts/ec2_install.sh
 ```
 
 ## 사용 흐름
@@ -103,6 +104,8 @@ USE_XVFB=1 ./scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --serv
 - `QA_ANALYTICS_PROXY_ENABLED=1`: `/qa/collect` 수집 후 업스트림 재전송 활성화
 - `QA_ANALYTICS_PROXY_ALLOW_ANY=1`: 업스트림 도메인 제한 해제 (기본 0 권장)
 - `QA_ANALYTICS_PROXY_TIMEOUT_SEC=2.5`: 업스트림 전송 timeout
+- `QA_OPEN_NOVNC_ON_START=1`: 디버깅 시작 시 noVNC 팝업 자동 오픈
+- `QA_NOVNC_PUBLIC_URL`: noVNC URL 오버라이드
 
 ## 배포
 - EC2 + 도메인(asknuggetdata.com) 배포 가이드:

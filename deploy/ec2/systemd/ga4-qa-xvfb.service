@@ -1,0 +1,17 @@
+[Unit]
+Description=GA4 QA Virtual Display (Xvfb)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ga4-qa-mvp
+Environment=XVFB_DISPLAY=:99
+Environment=XVFB_SCREEN=1920x1080x24
+ExecStart=/opt/ga4-qa-mvp/scripts/run_xvfb.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
