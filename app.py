@@ -115,6 +115,19 @@ def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
         return False
 
 
+def build_ingest_health_url(collect_url: str) -> str:
+    target = str(collect_url or "").strip()
+    if not target:
+        return ""
+    try:
+        parsed = urlparse(target)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        return urlunparse((parsed.scheme, parsed.netloc, "/qa/health", "", "", ""))
+    except Exception:
+        return ""
+
+
 def get_google_access_token(token_path: Path) -> str:
     if not token_path.is_absolute():
         token_path = (BASE_DIR / token_path).resolve()
@@ -1662,17 +1675,36 @@ if "qa_ingest_public_url" not in st.session_state:
     st.session_state["qa_ingest_public_url"] = default_ingest_public_url
 if "qa_ingest_server_ok" not in st.session_state:
     st.session_state["qa_ingest_server_ok"] = False
+if "qa_ingest_local_ok" not in st.session_state:
+    st.session_state["qa_ingest_local_ok"] = False
+if "qa_ingest_public_ok" not in st.session_state:
+    st.session_state["qa_ingest_public_ok"] = False
 if "qa_ingest_server_error" not in st.session_state:
     st.session_state["qa_ingest_server_error"] = ""
 
+ensure_err = ""
 try:
     ensure_ingest_server(host="127.0.0.1", port=8600)
-    st.session_state["qa_ingest_server_ok"] = True
-    st.session_state["qa_ingest_server_error"] = ""
 except Exception as exc:
-    local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
-    st.session_state["qa_ingest_server_ok"] = bool(local_health_ok)
-    st.session_state["qa_ingest_server_error"] = "" if local_health_ok else str(exc)
+    ensure_err = str(exc)
+
+local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
+public_health_url = build_ingest_health_url(st.session_state.get("qa_ingest_public_url", default_ingest_public_url))
+public_health_ok = probe_ingest_health(public_health_url) if public_health_url else False
+
+st.session_state["qa_ingest_local_ok"] = bool(local_health_ok)
+st.session_state["qa_ingest_public_ok"] = bool(public_health_ok)
+st.session_state["qa_ingest_server_ok"] = bool(local_health_ok or public_health_ok)
+if st.session_state["qa_ingest_server_ok"]:
+    st.session_state["qa_ingest_server_error"] = ""
+else:
+    detail_bits: List[str] = []
+    if ensure_err:
+        detail_bits.append(f"ensure: {ensure_err}")
+    detail_bits.append(f"local_health({ 'ok' if local_health_ok else 'fail' }): http://127.0.0.1:8600/qa/health")
+    if public_health_url:
+        detail_bits.append(f"public_health({ 'ok' if public_health_ok else 'fail' }): {public_health_url}")
+    st.session_state["qa_ingest_server_error"] = " | ".join(detail_bits)
 
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
@@ -1701,7 +1733,13 @@ with st.sidebar:
                 disabled=True,
             )
             if st.session_state.get("qa_ingest_server_ok", False):
-                st.caption("서버 수집기 상태: OK (127.0.0.1:8600)")
+                ok_parts: List[str] = []
+                if st.session_state.get("qa_ingest_local_ok", False):
+                    ok_parts.append("local:127.0.0.1:8600")
+                if st.session_state.get("qa_ingest_public_ok", False):
+                    ok_parts.append("public:/qa/health")
+                ok_text = ", ".join(ok_parts) if ok_parts else "health check"
+                st.caption(f"서버 수집기 상태: OK ({ok_text})")
             else:
                 st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
                 last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
