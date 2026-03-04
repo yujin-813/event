@@ -86,6 +86,19 @@ cd /opt/ga4-qa-mvp
 sqlite3 data/test_logs/qa_runs.db ".backup '/opt/ga4-qa-mvp/data/test_logs/qa_runs_$(date +%F).db'"
 ```
 
+## 11) Analytics Proxy (옵션)
+`/qa/collect` 저장 후 업스트림 GA 재전송이 필요하면 `.env`에 설정:
+
+```bash
+cd /opt/ga4-qa-mvp
+cat >> .env <<'EOF'
+QA_ANALYTICS_PROXY_ENABLED=1
+QA_ANALYTICS_PROXY_ALLOW_ANY=0
+QA_ANALYTICS_PROXY_TIMEOUT_SEC=2.5
+EOF
+sudo systemctl restart ga4-qa-mvp
+```
+
 ## 11) Playwright Headful (Xvfb)
 - 서비스는 기본적으로 `USE_XVFB=1`로 실행되어 가상 디스플레이에서 Playwright headful 브라우저를 띄웁니다.
 - 실제 창을 EC2 콘솔에서 직접 보려면 별도 VNC/noVNC 구성이 필요합니다.

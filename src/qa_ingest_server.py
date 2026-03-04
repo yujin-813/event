@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from threading import Lock, Thread
 from typing import Dict
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import parse_qs, urlparse
 
 from src.debug_runtime import ingest_collect_request
@@ -11,6 +14,85 @@ from src.debug_runtime import ingest_collect_request
 
 _SERVER_STATE: Dict[str, object] = {"started": False, "host": "", "port": 0}
 _SERVER_LOCK = Lock()
+_UPSTREAM_GA_HOSTS = {
+    "www.google-analytics.com",
+    "region1.google-analytics.com",
+    "analytics.google.com",
+}
+
+
+def _truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _analytics_proxy_enabled() -> bool:
+    return _truthy(os.getenv("QA_ANALYTICS_PROXY_ENABLED", "0"))
+
+
+def _analytics_proxy_allow_any() -> bool:
+    return _truthy(os.getenv("QA_ANALYTICS_PROXY_ALLOW_ANY", "0"))
+
+
+def _analytics_proxy_timeout_sec() -> float:
+    raw = str(os.getenv("QA_ANALYTICS_PROXY_TIMEOUT_SEC", "2.5")).strip()
+    try:
+        val = float(raw)
+    except Exception:
+        val = 2.5
+    if val < 0.3:
+        return 0.3
+    if val > 10:
+        return 10.0
+    return val
+
+
+def _allowed_upstream(url: str) -> bool:
+    target = str(url or "").strip()
+    if not target:
+        return False
+    try:
+        parsed = urlparse(target)
+    except Exception:
+        return False
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    if _analytics_proxy_allow_any():
+        return True
+    host = (parsed.hostname or "").strip().lower()
+    return host in _UPSTREAM_GA_HOSTS
+
+
+def _forward_collect_request(request_url: str, request_method: str, request_body: str) -> Dict[str, object]:
+    url = str(request_url or "").strip()
+    method = str(request_method or "GET").strip().upper()
+    body_text = str(request_body or "")
+    if not url:
+        return {"forwarded": False, "status": 0, "reason": "missing_request_url"}
+    if method not in {"GET", "POST"}:
+        method = "GET"
+    if not _allowed_upstream(url):
+        return {"forwarded": False, "status": 0, "reason": "upstream_not_allowed"}
+
+    data = body_text.encode("utf-8") if (method == "POST" and body_text) else None
+    headers = {"User-Agent": "GA4-QA-Reporter/1.0"}
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+    req = urllib_request.Request(url, method=method, data=data, headers=headers)
+
+    try:
+        with urllib_request.urlopen(req, timeout=_analytics_proxy_timeout_sec()) as resp:
+            # 응답 바디는 판정에 사용하지 않고 상태코드만 확인한다.
+            _ = resp.read(1)
+            return {"forwarded": True, "status": int(resp.status), "reason": "ok"}
+    except urllib_error.HTTPError as exc:
+        try:
+            _ = exc.read(1)
+        except Exception:
+            pass
+        return {"forwarded": False, "status": int(exc.code), "reason": f"http_{exc.code}"}
+    except Exception as exc:
+        return {"forwarded": False, "status": 0, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 class _CollectHandler(BaseHTTPRequestHandler):
@@ -48,7 +130,12 @@ class _CollectHandler(BaseHTTPRequestHandler):
         path = (self.path or "").split("?", 1)[0]
         if path == "/qa/health":
             self._set_headers(200)
-            self.wfile.write(b'{"ok":true}')
+            payload = {
+                "ok": True,
+                "analytics_proxy_enabled": _analytics_proxy_enabled(),
+                "analytics_proxy_allow_any": _analytics_proxy_allow_any(),
+            }
+            self.wfile.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
             return
         if path != "/qa/collect":
             self._set_headers(404)
@@ -62,8 +149,31 @@ class _CollectHandler(BaseHTTPRequestHandler):
             request_method=str(q.get("request_method", ["GET"])[0]).strip().upper(),
             request_body=str(q.get("request_body", [""])[0]),
         )
+        req_url = str(q.get("request_url", [""])[0]).strip()
+        req_method = str(q.get("request_method", ["GET"])[0]).strip().upper()
+        req_body = str(q.get("request_body", [""])[0])
+        forward_requested = _truthy(q.get("forward_to_ga", [""])[0]) or _truthy(q.get("forward", [""])[0])
+        should_forward = _analytics_proxy_enabled() or forward_requested
+        proxy_result = (
+            _forward_collect_request(req_url, req_method, req_body)
+            if should_forward
+            else {"forwarded": False, "status": 0, "reason": "disabled"}
+        )
         self._set_headers(200)
-        self.wfile.write(json.dumps({"ok": True, "captured": int(captured)}).encode("utf-8"))
+        self.wfile.write(
+            json.dumps(
+                {
+                    "ok": True,
+                    "captured": int(captured),
+                    "analytics_proxy": {
+                        "enabled": bool(_analytics_proxy_enabled()),
+                        "requested": bool(forward_requested),
+                        **proxy_result,
+                    },
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
 
     def do_POST(self) -> None:  # noqa: N802
         path = (self.path or "").split("?", 1)[0]
@@ -78,18 +188,45 @@ class _CollectHandler(BaseHTTPRequestHandler):
             request_method=str(payload.get("request_method", payload.get("method", "GET"))).strip().upper(),
             request_body=str(payload.get("request_body", payload.get("body", ""))),
         )
+        req_url = str(payload.get("request_url", payload.get("collect_url", ""))).strip()
+        req_method = str(payload.get("request_method", payload.get("method", "GET"))).strip().upper()
+        req_body = str(payload.get("request_body", payload.get("body", "")))
+        forward_requested = _truthy(payload.get("forward_to_ga", payload.get("forward", "")))
+        should_forward = _analytics_proxy_enabled() or forward_requested
+        proxy_result = (
+            _forward_collect_request(req_url, req_method, req_body)
+            if should_forward
+            else {"forwarded": False, "status": 0, "reason": "disabled"}
+        )
         self._set_headers(200)
-        self.wfile.write(json.dumps({"ok": True, "captured": int(captured)}).encode("utf-8"))
+        self.wfile.write(
+            json.dumps(
+                {
+                    "ok": True,
+                    "captured": int(captured),
+                    "analytics_proxy": {
+                        "enabled": bool(_analytics_proxy_enabled()),
+                        "requested": bool(forward_requested),
+                        **proxy_result,
+                    },
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
+
+
+class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
 
 
 def ensure_ingest_server(host: str = "127.0.0.1", port: int = 8600) -> Dict[str, object]:
     with _SERVER_LOCK:
         if bool(_SERVER_STATE.get("started")):
             return dict(_SERVER_STATE)
-        httpd = ThreadingHTTPServer((host, int(port)), _CollectHandler)
+        httpd = _ReusableThreadingHTTPServer((host, int(port)), _CollectHandler)
         th = Thread(target=httpd.serve_forever, daemon=True)
         th.start()
         _SERVER_STATE.update(

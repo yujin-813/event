@@ -93,6 +93,40 @@ def get_config_value(key: str, default: str = "") -> str:
     return default
 
 
+def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
+    target = str(url or "").strip()
+    if not target:
+        return False
+    try:
+        req = urllib_request.Request(target, method="GET")
+        with urllib_request.urlopen(req, timeout=float(timeout_sec)) as resp:
+            body = resp.read().decode("utf-8", errors="ignore").strip()
+            if resp.status != 200:
+                return False
+            try:
+                parsed = json.loads(body) if body else {}
+                if isinstance(parsed, dict):
+                    return bool(parsed.get("ok", False))
+            except Exception:
+                pass
+            return '"ok":true' in body.lower().replace(" ", "")
+    except Exception:
+        return False
+
+
+def build_ingest_health_url(collect_url: str) -> str:
+    target = str(collect_url or "").strip()
+    if not target:
+        return ""
+    try:
+        parsed = urlparse(target)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        return urlunparse((parsed.scheme, parsed.netloc, "/qa/health", "", "", ""))
+    except Exception:
+        return ""
+
+
 def get_google_access_token(token_path: Path) -> str:
     if not token_path.is_absolute():
         token_path = (BASE_DIR / token_path).resolve()
@@ -1629,12 +1663,36 @@ if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
 if "qa_ingest_public_url" not in st.session_state:
     st.session_state["qa_ingest_public_url"] = default_ingest_public_url
+if "qa_ingest_server_error" not in st.session_state:
+    st.session_state["qa_ingest_server_error"] = ""
+if "qa_ingest_local_ok" not in st.session_state:
+    st.session_state["qa_ingest_local_ok"] = False
+if "qa_ingest_public_ok" not in st.session_state:
+    st.session_state["qa_ingest_public_ok"] = False
 
+ensure_err = ""
 try:
     ensure_ingest_server(host="127.0.0.1", port=8600)
-    st.session_state["qa_ingest_server_ok"] = True
-except Exception:
-    st.session_state["qa_ingest_server_ok"] = False
+except Exception as exc:
+    ensure_err = str(exc)
+
+local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
+public_health_url = build_ingest_health_url(st.session_state.get("qa_ingest_public_url", default_ingest_public_url))
+public_health_ok = probe_ingest_health(public_health_url) if public_health_url else False
+
+st.session_state["qa_ingest_local_ok"] = bool(local_health_ok)
+st.session_state["qa_ingest_public_ok"] = bool(public_health_ok)
+st.session_state["qa_ingest_server_ok"] = bool(local_health_ok or public_health_ok)
+if st.session_state["qa_ingest_server_ok"]:
+    st.session_state["qa_ingest_server_error"] = ""
+else:
+    detail_bits: List[str] = []
+    if ensure_err:
+        detail_bits.append(f"ensure: {ensure_err}")
+    detail_bits.append(f"local_health({'ok' if local_health_ok else 'fail'}): http://127.0.0.1:8600/qa/health")
+    if public_health_url:
+        detail_bits.append(f"public_health({'ok' if public_health_ok else 'fail'}): {public_health_url}")
+    st.session_state["qa_ingest_server_error"] = " | ".join(detail_bits)
 
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
@@ -1652,14 +1710,24 @@ with st.sidebar:
         st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 불러올 수 있습니다.")
         st.text_input(
             "확장 수집 엔드포인트",
-            value=st.session_state.get("qa_ingest_public_url", default_ingest_public_url),
             key="qa_ingest_public_url",
             disabled=True,
         )
         if st.session_state.get("qa_ingest_server_ok", False):
-            st.caption("서버 수집기 상태: OK (127.0.0.1:8600)")
+            ok_parts: List[str] = []
+            if st.session_state.get("qa_ingest_local_ok", False):
+                ok_parts.append("local:127.0.0.1:8600")
+            if st.session_state.get("qa_ingest_public_ok", False):
+                ok_parts.append("public:/qa/health")
+            ok_text = ", ".join(ok_parts) if ok_parts else "health check"
+            st.caption(f"서버 수집기 상태: OK ({ok_text})")
         else:
             st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
+            last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
+            if last_ingest_err:
+                st.caption(f"원인: {last_ingest_err}")
+        analytics_proxy_on = str(os.getenv("QA_ANALYTICS_PROXY_ENABLED", "0")).strip()
+        st.caption(f"Analytics Proxy: {'ON' if analytics_proxy_on in {'1', 'true', 'True'} else 'OFF'}")
 
     with st.expander("2) 실시간 디버깅 스트림", expanded=True):
         default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()

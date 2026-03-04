@@ -13,6 +13,8 @@
 ## 기능 범위
 - 브라우저 네트워크 요청 가로채기 (`/g/collect`, `/mp/collect`)
 - 실시간 디버깅 스트림 (타임라인 + 즉시 룰 경고)
+- Event Collector (`/qa/collect`) 기반 파일/DB 즉시 적재
+- Analytics Proxy(옵션): Collector 수집 후 업스트림 GA 재전송
 - 실사용 모드(사이트 테스트 연동): 케이스 ID 생성 + 테스트 URL 생성
 - 실사용 모드 준실시간 자동 새로고침 모니터
 - 이벤트/파라미터 정규화(flatten)
@@ -94,6 +96,13 @@ USE_XVFB=1 ./scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --serv
 - 이 도구는 브라우저에서 관측 가능한 히트만 수집합니다.
 - 서버사이드 전송(sGTM/백엔드 MP) 히트는 브라우저에서 직접 보이지 않을 수 있습니다.
 - 일부 사이트는 라우팅/리다이렉트 과정에서 테스트 케이스 파라미터가 누락될 수 있습니다.
+- Analytics Proxy를 켜면 업스트림 재전송이 추가되어 중복 전송 가능성이 있습니다.
+
+## 환경변수 (선택)
+- `QA_INGEST_PUBLIC_URL`: 기본 확장 수집 엔드포인트
+- `QA_ANALYTICS_PROXY_ENABLED=1`: `/qa/collect` 수집 후 업스트림 재전송 활성화
+- `QA_ANALYTICS_PROXY_ALLOW_ANY=1`: 업스트림 도메인 제한 해제 (기본 0 권장)
+- `QA_ANALYTICS_PROXY_TIMEOUT_SEC=2.5`: 업스트림 전송 timeout
 
 ## 배포
 - EC2 + 도메인(asknuggetdata.com) 배포 가이드:
