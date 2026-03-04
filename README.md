@@ -25,6 +25,7 @@
 - QA 결과 CSV/PDF 다운로드
 - 이슈 자동 저장 + 수동 Resolution 기록
 - 테스터별 세션/이벤트 로그 DB 저장 (`data/test_logs/qa_runs.db`)
+- UI 행동 로그 저장 (`qa_ui_actions`)
 
 ## 빠른 실행 (권장 스크립트)
 ```bash
@@ -92,6 +93,7 @@ sudo ./scripts/ec2_install.sh
 - 테이블:
   - `qa_sessions` (세션 메타: 테스터/상태/이벤트 수)
   - `qa_events` (수집 이벤트 원본)
+  - `qa_ui_actions` (버튼 클릭/로그인/리포트 실행 등 행동 로그)
 
 ## 참고
 - 이 도구는 브라우저에서 관측 가능한 히트만 수집합니다.
@@ -106,6 +108,11 @@ sudo ./scripts/ec2_install.sh
 - `QA_ANALYTICS_PROXY_TIMEOUT_SEC=2.5`: 업스트림 전송 timeout
 - `QA_OPEN_NOVNC_ON_START=1`: 디버깅 시작 시 noVNC 팝업 자동 오픈
 - `QA_NOVNC_PUBLIC_URL`: noVNC URL 오버라이드
+- `QA_APP_ACCESS_ENABLED=1`: 앱 진입 코드 인증 활성화
+- `QA_TESTER_ACCESS_CODE` / `QA_ADMIN_ACCESS_CODE`: 테스터/관리자 접속 코드
+- `QA_COLLECT_REQUIRE_ACTIVE_SESSION=1`: 활성 세션 없는 `/qa/collect` 요청 차단
+- `QA_COLLECT_RATE_LIMIT_*`: 수집 요청 rate limit
+- `QA_ACTION_LOG_SALT`: 행동 로그 IP 해시용 salt
 
 ## 배포
 - EC2 + 도메인(asknuggetdata.com) 배포 가이드:

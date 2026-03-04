@@ -14,7 +14,7 @@
 ## 3) 서버 패키지 설치 (Ubuntu 기준)
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb x11vnc novnc websockify
+sudo apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb x11vnc novnc websockify apache2-utils
 ```
 
 원클릭 스크립트 사용 시:
@@ -122,6 +122,29 @@ cd /opt/ga4-qa-mvp
 cat >> .env <<'EOF'
 QA_OPEN_NOVNC_ON_START=1
 QA_NOVNC_PUBLIC_URL=https://asknuggetdata.com/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify
+EOF
+sudo systemctl restart ga4-qa-mvp
+```
+
+- `/vnc/`는 nginx basic auth로 보호됩니다. 초기 설치 시 `/etc/nginx/.htpasswd_qa_vnc`가 생성됩니다.
+- 비밀번호 변경:
+```bash
+sudo htpasswd /etc/nginx/.htpasswd_qa_vnc qaadmin
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+## 12) 공개 테스트 보안 권장값
+```bash
+cd /opt/ga4-qa-mvp
+cat >> .env <<'EOF'
+QA_APP_ACCESS_ENABLED=1
+QA_TESTER_ACCESS_CODE=change-me-tester
+QA_ADMIN_ACCESS_CODE=change-me-admin
+QA_COLLECT_REQUIRE_ACTIVE_SESSION=1
+QA_COLLECT_RATE_LIMIT_ENABLED=1
+QA_COLLECT_RATE_LIMIT_RPS=8
+QA_COLLECT_RATE_LIMIT_BURST=24
+QA_ACTION_LOG_SALT=change-me-salt
 EOF
 sudo systemctl restart ga4-qa-mvp
 ```

@@ -42,3 +42,12 @@
 3. 수집 보호: nginx `limit_req` + 유효 세션 ID 없는 수집 거부
 4. 행동 로그: `qa_ui_actions` 테이블 추가(테스터/액션/시각/IP 해시)
 
+## 7) 2026-03-04 추가 반영
+- 앱 진입 제한(코드 기반): `QA_APP_ACCESS_ENABLED`, `QA_TESTER_ACCESS_CODE`, `QA_ADMIN_ACCESS_CODE`
+- `/vnc/` nginx basic auth 적용 (`/etc/nginx/.htpasswd_qa_vnc`)
+- `/qa/collect` 수집 보안:
+  - 활성 세션 검증(`QA_COLLECT_REQUIRE_ACTIVE_SESSION`)
+  - 인메모리 token bucket rate limit(`QA_COLLECT_RATE_LIMIT_*`)
+- 행동 로그 저장:
+  - `qa_ui_actions` 테이블 생성
+  - 로그인/디버깅/리포트 버튼 액션 기록

@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 import json
 import platform
 from pathlib import Path
+import re
 import threading
+import time
 from typing import Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from src.test_log_db import append_event as append_event_to_db
-from src.test_log_db import init_test_log_db, upsert_session
+from src.test_log_db import get_session, init_test_log_db, upsert_session
 
 
 @dataclass
@@ -33,6 +35,7 @@ class DebugSession:
 
 _SESSIONS: Dict[str, DebugSession] = {}
 _LOCK = threading.Lock()
+_SESSION_ID_PATTERN = re.compile(r"^dbg_\d{8}_\d{6}(?:_\d{6})?_[0-9a-f]{4,16}$")
 
 
 def _parse_form_encoded(text: str) -> Dict[str, str]:
@@ -118,6 +121,45 @@ def _infer_session_id_from_collect(url: str, method: str, post_data: str) -> str
         if sid:
             return sid
     return ""
+
+
+def infer_collect_session_id(request_url: str, request_method: str = "GET", request_body: str = "") -> str:
+    return _infer_session_id_from_collect(
+        url=str(request_url or "").strip(),
+        method=str(request_method or "GET").strip().upper(),
+        post_data=str(request_body or ""),
+    )
+
+
+def is_collect_session_allowed(session_id: str, db_path: Path | None = None) -> bool:
+    sid = str(session_id or "").strip()
+    if not sid or not _SESSION_ID_PATTERN.match(sid):
+        return False
+
+    with _LOCK:
+        sess = _SESSIONS.get(sid)
+        if sess and str(sess.status).strip() in {"running", "stopping"}:
+            return True
+
+    effective_db = Path(db_path) if db_path is not None else Path("data/test_logs/qa_runs.db")
+    try:
+        db_row = get_session(effective_db, sid)
+        db_status = str(db_row.get("status", "")).strip()
+        if db_status in {"running", "stopping"}:
+            return True
+    except Exception:
+        pass
+
+    # 런타임 메모리가 사라진 경우 파일 기준 복구 세션도 허용하되, 오래된 세션은 차단한다.
+    try:
+        p = Path(f"data/debug_stream/{sid}.jsonl")
+        if p.exists():
+            age_sec = max(0.0, time.time() - p.stat().st_mtime)
+            if age_sec <= 2 * 60 * 60:
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _infer_single_running_session_id() -> str:

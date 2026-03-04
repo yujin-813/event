@@ -4,16 +4,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from threading import Lock, Thread
+import time
 from typing import Dict
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, urlparse
 
-from src.debug_runtime import ingest_collect_request
+from src.debug_runtime import (
+    infer_collect_session_id,
+    ingest_collect_request,
+    is_collect_session_allowed,
+)
 
 
 _SERVER_STATE: Dict[str, object] = {"started": False, "host": "", "port": 0}
 _SERVER_LOCK = Lock()
+_RATE_LIMIT_LOCK = Lock()
+_RATE_LIMIT_STATE: Dict[str, Dict[str, float]] = {}
 _UPSTREAM_GA_HOSTS = {
     "www.google-analytics.com",
     "region1.google-analytics.com",
@@ -44,6 +51,78 @@ def _analytics_proxy_timeout_sec() -> float:
     if val > 10:
         return 10.0
     return val
+
+
+def _collect_rate_limit_enabled() -> bool:
+    return _truthy(os.getenv("QA_COLLECT_RATE_LIMIT_ENABLED", "1"))
+
+
+def _collect_rate_limit_rps() -> float:
+    raw = str(os.getenv("QA_COLLECT_RATE_LIMIT_RPS", "8")).strip()
+    try:
+        val = float(raw)
+    except Exception:
+        val = 8.0
+    if val < 1:
+        return 1.0
+    if val > 500:
+        return 500.0
+    return val
+
+
+def _collect_rate_limit_burst() -> float:
+    raw = str(os.getenv("QA_COLLECT_RATE_LIMIT_BURST", "24")).strip()
+    try:
+        val = float(raw)
+    except Exception:
+        val = 24.0
+    if val < 1:
+        return 1.0
+    if val > 2000:
+        return 2000.0
+    return val
+
+
+def _collect_require_active_session() -> bool:
+    return _truthy(os.getenv("QA_COLLECT_REQUIRE_ACTIVE_SESSION", "1"))
+
+
+def _extract_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    xff = str(handler.headers.get("X-Forwarded-For", "")).strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    xr = str(handler.headers.get("X-Real-IP", "")).strip()
+    if xr:
+        return xr
+    try:
+        return str(handler.client_address[0]).strip()
+    except Exception:
+        return ""
+
+
+def _allow_rate_limited_request(key: str) -> tuple[bool, float]:
+    if not _collect_rate_limit_enabled():
+        return True, 0.0
+    now = time.monotonic()
+    rate = _collect_rate_limit_rps()
+    burst = _collect_rate_limit_burst()
+    with _RATE_LIMIT_LOCK:
+        state = _RATE_LIMIT_STATE.get(key, {"tokens": burst, "updated_at": now})
+        elapsed = max(0.0, now - float(state.get("updated_at", now)))
+        tokens = min(burst, float(state.get("tokens", burst)) + elapsed * rate)
+        allowed = tokens >= 1.0
+        retry_after = 0.0
+        if allowed:
+            tokens -= 1.0
+        else:
+            retry_after = max(0.1, (1.0 - tokens) / rate)
+        _RATE_LIMIT_STATE[key] = {"tokens": tokens, "updated_at": now}
+        if len(_RATE_LIMIT_STATE) > 20000:
+            stale_cut = now - 3600
+            for rk, rv in list(_RATE_LIMIT_STATE.items()):
+                if float(rv.get("updated_at", now)) < stale_cut:
+                    _RATE_LIMIT_STATE.pop(rk, None)
+    return allowed, retry_after
 
 
 def _allowed_upstream(url: str) -> bool:
@@ -107,6 +186,10 @@ class _CollectHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def _write_json(self, code: int, payload: Dict[str, object]) -> None:
+        self._set_headers(code)
+        self.wfile.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
     def _read_json_body(self) -> Dict[str, object]:
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -129,29 +212,48 @@ class _CollectHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = (self.path or "").split("?", 1)[0]
         if path == "/qa/health":
-            self._set_headers(200)
-            payload = {
+            payload: Dict[str, object] = {
                 "ok": True,
                 "analytics_proxy_enabled": _analytics_proxy_enabled(),
                 "analytics_proxy_allow_any": _analytics_proxy_allow_any(),
+                "collect_require_active_session": _collect_require_active_session(),
+                "collect_rate_limit_enabled": _collect_rate_limit_enabled(),
+                "collect_rate_limit_rps": _collect_rate_limit_rps(),
+                "collect_rate_limit_burst": _collect_rate_limit_burst(),
             }
-            self.wfile.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+            self._write_json(200, payload)
             return
         if path != "/qa/collect":
-            self._set_headers(404)
-            self.wfile.write(b'{"ok":false,"error":"not_found"}')
+            self._write_json(404, {"ok": False, "error": "not_found"})
+            return
+        client_ip = _extract_client_ip(self)
+        allow, retry_after = _allow_rate_limited_request(f"ip:{client_ip}")
+        if not allow:
+            self._write_json(
+                429,
+                {
+                    "ok": False,
+                    "error": "rate_limited",
+                    "retry_after_sec": round(float(retry_after), 3),
+                },
+            )
             return
         parsed = urlparse(self.path)
         q = parse_qs(parsed.query, keep_blank_values=True)
-        captured = ingest_collect_request(
-            session_id=str(q.get("session_id", [""])[0]).strip(),
-            request_url=str(q.get("request_url", [""])[0]).strip(),
-            request_method=str(q.get("request_method", ["GET"])[0]).strip().upper(),
-            request_body=str(q.get("request_body", [""])[0]),
-        )
         req_url = str(q.get("request_url", [""])[0]).strip()
         req_method = str(q.get("request_method", ["GET"])[0]).strip().upper()
         req_body = str(q.get("request_body", [""])[0])
+        sid = str(q.get("session_id", [""])[0]).strip() or infer_collect_session_id(req_url, req_method, req_body)
+        if _collect_require_active_session():
+            if not sid or not is_collect_session_allowed(sid):
+                self._write_json(403, {"ok": False, "error": "invalid_or_inactive_session"})
+                return
+        captured = ingest_collect_request(
+            session_id=sid,
+            request_url=req_url,
+            request_method=req_method,
+            request_body=req_body,
+        )
         forward_requested = _truthy(q.get("forward_to_ga", [""])[0]) or _truthy(q.get("forward", [""])[0])
         should_forward = _analytics_proxy_enabled() or forward_requested
         proxy_result = (
@@ -159,38 +261,54 @@ class _CollectHandler(BaseHTTPRequestHandler):
             if should_forward
             else {"forwarded": False, "status": 0, "reason": "disabled"}
         )
-        self._set_headers(200)
-        self.wfile.write(
-            json.dumps(
-                {
-                    "ok": True,
-                    "captured": int(captured),
-                    "analytics_proxy": {
-                        "enabled": bool(_analytics_proxy_enabled()),
-                        "requested": bool(forward_requested),
-                        **proxy_result,
-                    },
+        self._write_json(
+            200,
+            {
+                "ok": True,
+                "captured": int(captured),
+                "session_id": sid,
+                "analytics_proxy": {
+                    "enabled": bool(_analytics_proxy_enabled()),
+                    "requested": bool(forward_requested),
+                    **proxy_result,
                 },
-                separators=(",", ":"),
-            ).encode("utf-8")
+            },
         )
 
     def do_POST(self) -> None:  # noqa: N802
         path = (self.path or "").split("?", 1)[0]
         if path != "/qa/collect":
-            self._set_headers(404)
-            self.wfile.write(b'{"ok":false,"error":"not_found"}')
+            self._write_json(404, {"ok": False, "error": "not_found"})
+            return
+        client_ip = _extract_client_ip(self)
+        allow, retry_after = _allow_rate_limited_request(f"ip:{client_ip}")
+        if not allow:
+            self._write_json(
+                429,
+                {
+                    "ok": False,
+                    "error": "rate_limited",
+                    "retry_after_sec": round(float(retry_after), 3),
+                },
+            )
             return
         payload = self._read_json_body()
-        captured = ingest_collect_request(
-            session_id=str(payload.get("session_id", payload.get("qa_debug_session_id", ""))).strip(),
-            request_url=str(payload.get("request_url", payload.get("collect_url", ""))).strip(),
-            request_method=str(payload.get("request_method", payload.get("method", "GET"))).strip().upper(),
-            request_body=str(payload.get("request_body", payload.get("body", ""))),
-        )
         req_url = str(payload.get("request_url", payload.get("collect_url", ""))).strip()
         req_method = str(payload.get("request_method", payload.get("method", "GET"))).strip().upper()
         req_body = str(payload.get("request_body", payload.get("body", "")))
+        sid = str(payload.get("session_id", payload.get("qa_debug_session_id", ""))).strip() or infer_collect_session_id(
+            req_url, req_method, req_body
+        )
+        if _collect_require_active_session():
+            if not sid or not is_collect_session_allowed(sid):
+                self._write_json(403, {"ok": False, "error": "invalid_or_inactive_session"})
+                return
+        captured = ingest_collect_request(
+            session_id=sid,
+            request_url=req_url,
+            request_method=req_method,
+            request_body=req_body,
+        )
         forward_requested = _truthy(payload.get("forward_to_ga", payload.get("forward", "")))
         should_forward = _analytics_proxy_enabled() or forward_requested
         proxy_result = (
@@ -198,20 +316,18 @@ class _CollectHandler(BaseHTTPRequestHandler):
             if should_forward
             else {"forwarded": False, "status": 0, "reason": "disabled"}
         )
-        self._set_headers(200)
-        self.wfile.write(
-            json.dumps(
-                {
-                    "ok": True,
-                    "captured": int(captured),
-                    "analytics_proxy": {
-                        "enabled": bool(_analytics_proxy_enabled()),
-                        "requested": bool(forward_requested),
-                        **proxy_result,
-                    },
+        self._write_json(
+            200,
+            {
+                "ok": True,
+                "captured": int(captured),
+                "session_id": sid,
+                "analytics_proxy": {
+                    "enabled": bool(_analytics_proxy_enabled()),
+                    "requested": bool(forward_requested),
+                    **proxy_result,
                 },
-                separators=(",", ":"),
-            ).encode("utf-8")
+            },
         )
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003

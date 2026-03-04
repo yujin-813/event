@@ -52,7 +52,28 @@ def init_test_log_db(db_path: Path) -> None:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qa_ui_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_at TEXT NOT NULL,
+                session_id TEXT,
+                action_type TEXT NOT NULL,
+                actor_role TEXT,
+                actor_name TEXT,
+                detail_json TEXT,
+                remote_addr_hash TEXT,
+                user_agent TEXT
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_qa_events_session_time ON qa_events(session_id, captured_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_qa_ui_actions_time ON qa_ui_actions(action_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_qa_ui_actions_session_time ON qa_ui_actions(session_id, action_at)"
         )
 
 
@@ -146,3 +167,63 @@ def list_recent_sessions(db_path: Path, limit: int = 50) -> pd.DataFrame:
             params=(int(limit),),
         )
     return df
+
+
+def get_session(db_path: Path, session_id: str) -> Dict[str, object]:
+    sid = str(session_id or "").strip()
+    if not sid or not Path(db_path).exists():
+        return {}
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT
+                session_id, status, target_url, started_at, ended_at,
+                captured_events, last_error, tester_name, tester_note
+            FROM qa_sessions
+            WHERE session_id = ?
+            LIMIT 1
+            """,
+            (sid,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {}
+    return {
+        "session_id": row[0] or "",
+        "status": row[1] or "",
+        "target_url": row[2] or "",
+        "started_at": row[3] or "",
+        "ended_at": row[4] or "",
+        "captured_events": int(row[5] or 0),
+        "last_error": row[6] or "",
+        "tester_name": row[7] or "",
+        "tester_note": row[8] or "",
+    }
+
+
+def append_ui_action(db_path: Path, payload: Dict[str, object]) -> None:
+    action_type = str(payload.get("action_type", "")).strip()
+    if not action_type:
+        return
+    action_at = str(payload.get("action_at", "")).strip() or datetime.now(timezone.utc).isoformat()
+    detail = payload.get("detail")
+    detail_json = json.dumps(detail, ensure_ascii=False, sort_keys=True) if isinstance(detail, dict) else "{}"
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO qa_ui_actions (
+                action_at, session_id, action_type, actor_role, actor_name,
+                detail_json, remote_addr_hash, user_agent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                action_at,
+                str(payload.get("session_id", "")).strip(),
+                action_type,
+                str(payload.get("actor_role", "")).strip(),
+                str(payload.get("actor_name", "")).strip(),
+                detail_json,
+                str(payload.get("remote_addr_hash", "")).strip(),
+                str(payload.get("user_agent", "")).strip(),
+            ),
+        )

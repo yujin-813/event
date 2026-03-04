@@ -16,7 +16,7 @@ if [[ ! -d "${APP_DIR}" ]]; then
 fi
 
 apt update
-apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb x11vnc novnc websockify
+apt install -y python3 python3-venv nginx certbot python3-certbot-nginx xvfb x11vnc novnc websockify apache2-utils
 
 chown -R ubuntu:ubuntu "${APP_DIR}"
 chmod +x "${APP_DIR}/scripts/run.sh" \
@@ -41,6 +41,17 @@ systemctl restart "${SERVICE_NAME}"
 
 cp "${APP_DIR}/deploy/ec2/nginx/${NGINX_CONF}" "/etc/nginx/sites-available/${NGINX_CONF}"
 ln -sfn "/etc/nginx/sites-available/${NGINX_CONF}" "/etc/nginx/sites-enabled/${NGINX_CONF}"
+
+if [[ ! -f "/etc/nginx/.htpasswd_qa_vnc" ]]; then
+  VNC_USER="${QA_VNC_BASIC_AUTH_USER:-qaadmin}"
+  VNC_PASS="${QA_VNC_BASIC_AUTH_PASS:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14)}"
+  htpasswd -bc "/etc/nginx/.htpasswd_qa_vnc" "${VNC_USER}" "${VNC_PASS}"
+  chmod 640 "/etc/nginx/.htpasswd_qa_vnc"
+  chown root:www-data "/etc/nginx/.htpasswd_qa_vnc"
+  echo "VNC basic auth 생성: user=${VNC_USER} pass=${VNC_PASS}"
+  echo "비밀번호는 즉시 안전한 위치에 저장하고 필요시 htpasswd로 변경하세요."
+fi
+
 nginx -t
 systemctl reload nginx
 

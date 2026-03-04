@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 import os
 import io
@@ -42,6 +43,7 @@ from src.reporting import (
 from src.scenario_validation import validate_single_scenario
 from src.rules import run_qa_rules
 from src.scoring import compute_integrity_score
+from src.test_log_db import append_ui_action, init_test_log_db
 
 
 st.set_page_config(page_title="GA4 QA Reporter", layout="wide")
@@ -49,6 +51,7 @@ st.title("GA4 QA 리포터 (룰 기반)")
 st.caption("실시간 DebugView 대체가 아닌, 로그 수집 + 자동 정리 + 룰 기반 판정을 위한 내부 QA 도구")
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_OAUTH_REDIRECT_URI = "https://asknuggetdata.com/oauth2callback"
+TEST_LOG_DB_PATH = Path("data/test_logs/qa_runs.db")
 
 
 def _bootstrap_dotenv_value(key: str) -> str:
@@ -159,6 +162,114 @@ def auto_open_popup_window(url: str, popup_name: str = "qa_debug_popup") -> None
         height=0,
         width=0,
     )
+
+
+def _get_request_headers() -> Dict[str, str]:
+    try:
+        raw_headers = st.context.headers
+    except Exception:
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        for k, v in raw_headers.items():
+            out[str(k).strip().lower()] = str(v)
+    except Exception:
+        return {}
+    return out
+
+
+def _extract_remote_addr() -> str:
+    headers = _get_request_headers()
+    xff = str(headers.get("x-forwarded-for", "")).strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    xr = str(headers.get("x-real-ip", "")).strip()
+    if xr:
+        return xr
+    return ""
+
+
+def _hash_remote_addr(remote_addr: str) -> str:
+    raw = str(remote_addr or "").strip()
+    if not raw:
+        return ""
+    salt = get_config_value("QA_ACTION_LOG_SALT", "qa_action_salt")
+    return hashlib.sha256(f"{salt}:{raw}".encode("utf-8")).hexdigest()[:20]
+
+
+def log_ui_action(action_type: str, detail: Dict[str, object] | None = None) -> None:
+    action = str(action_type or "").strip()
+    if not action:
+        return
+    try:
+        init_test_log_db(TEST_LOG_DB_PATH)
+        headers = _get_request_headers()
+        actor_name = str(
+            st.session_state.get("qa_access_user", "")
+            or st.session_state.get("qa_tester_name", "")
+            or "-"
+        ).strip()
+        append_ui_action(
+            TEST_LOG_DB_PATH,
+            {
+                "action_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                "session_id": str(st.session_state.get("qa_debug_session_id", "")).strip(),
+                "action_type": action,
+                "actor_role": str(st.session_state.get("qa_access_role", "guest")).strip(),
+                "actor_name": actor_name,
+                "detail": detail or {},
+                "remote_addr_hash": _hash_remote_addr(_extract_remote_addr()),
+                "user_agent": str(headers.get("user-agent", "")).strip(),
+            },
+        )
+    except Exception:
+        return
+
+
+def enforce_access_gate() -> None:
+    enabled = is_truthy(get_config_value("QA_APP_ACCESS_ENABLED", "0"))
+    if not enabled:
+        if not st.session_state.get("qa_access_authenticated", False):
+            st.session_state["qa_access_authenticated"] = True
+            st.session_state["qa_access_role"] = "admin"
+            st.session_state["qa_access_user"] = "open_access"
+        return
+
+    if st.session_state.get("qa_access_authenticated", False):
+        return
+
+    tester_code = get_config_value("QA_TESTER_ACCESS_CODE", "").strip()
+    admin_code = get_config_value("QA_ADMIN_ACCESS_CODE", "").strip()
+
+    st.subheader("접근 제한")
+    st.caption("테스트 전용 접속 코드가 필요합니다.")
+    with st.form("qa_access_form", clear_on_submit=False):
+        input_user = st.text_input("테스터 식별자", placeholder="예: tester_01")
+        input_code = st.text_input("접속 코드", type="password")
+        submitted = st.form_submit_button("입장")
+
+    if submitted:
+        code = str(input_code or "").strip()
+        role = ""
+        if admin_code and code == admin_code:
+            role = "admin"
+        elif tester_code and code == tester_code:
+            role = "tester"
+        elif (not tester_code) and (not admin_code):
+            log_ui_action("access_login_error", {"reason": "codes_not_configured"})
+            st.error("서버 접근 코드가 설정되지 않았습니다. 관리자에게 문의하세요.")
+            st.stop()
+
+        if role:
+            st.session_state["qa_access_authenticated"] = True
+            st.session_state["qa_access_role"] = role
+            st.session_state["qa_access_user"] = str(input_user or "").strip() or f"{role}_user"
+            log_ui_action("access_login_success", {"role": role})
+            st.rerun()
+        else:
+            log_ui_action("access_login_failed", {"user": str(input_user or "").strip()})
+            st.error("접속 코드가 올바르지 않습니다.")
+    st.stop()
 
 
 def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
@@ -492,11 +603,13 @@ def process_google_oauth_callback_if_present() -> None:
             code=code,
             token_file=token_file,
         )
+        log_ui_action("oauth_callback_success")
         st.session_state["qa_oauth_notice"] = f"Google 로그인 완료. 토큰 저장: {token_file}"
         st.session_state["qa_oauth_error"] = ""
         st.session_state["qa_oauth_auth_url"] = ""
         st.session_state["qa_oauth_state"] = ""
     except Exception as exc:
+        log_ui_action("oauth_callback_error", {"error": str(exc)})
         st.session_state["qa_oauth_error"] = to_user_error_message(exc)
         st.session_state["qa_oauth_notice"] = ""
     finally:
@@ -1775,6 +1888,16 @@ if "qa_ingest_server_error" not in st.session_state:
     st.session_state["qa_ingest_server_error"] = ""
 if "qa_ingest_local_ok" not in st.session_state:
     st.session_state["qa_ingest_local_ok"] = False
+if "qa_access_authenticated" not in st.session_state:
+    st.session_state["qa_access_authenticated"] = False
+if "qa_access_role" not in st.session_state:
+    st.session_state["qa_access_role"] = "guest"
+if "qa_access_user" not in st.session_state:
+    st.session_state["qa_access_user"] = ""
+if "qa_oauth_go_now_url" not in st.session_state:
+    st.session_state["qa_oauth_go_now_url"] = ""
+
+enforce_access_gate()
 
 ensure_err = ""
 try:
@@ -1805,6 +1928,16 @@ realtime_debug_stop_clicked = False
 
 with st.sidebar:
     st.header("설정")
+    st.caption(
+        f"접속: {st.session_state.get('qa_access_user', '-') or '-'} "
+        f"({st.session_state.get('qa_access_role', 'guest')})"
+    )
+    if st.button("로그아웃", key="qa_access_logout_btn"):
+        log_ui_action("access_logout")
+        st.session_state["qa_access_authenticated"] = False
+        st.session_state["qa_access_role"] = "guest"
+        st.session_state["qa_access_user"] = ""
+        st.rerun()
     with st.expander("1) 데이터 소스/연결", expanded=True):
         st.markdown("**Playwright 네트워크 인터셉트 + QA 리포트 API 참조 모드**")
         st.caption("확장/스니펫 없이 Playwright request hook으로 collect 히트를 수집합니다.")
@@ -1832,8 +1965,11 @@ with st.sidebar:
         )
         st.caption("디버깅 모드 시작 시 Playwright 테스트 브라우저가 열리고 collect 히트를 감시합니다.")
         novnc_popup_url = get_novnc_popup_url()
-        st.caption(f"원격 디버그 팝업 URL: {novnc_popup_url}")
-        st.markdown(f"[원격 디버그 화면 열기 (noVNC)]({novnc_popup_url})")
+        if st.session_state.get("qa_access_role", "guest") == "admin":
+            st.caption(f"원격 디버그 팝업 URL: {novnc_popup_url}")
+            st.markdown(f"[원격 디버그 화면 열기 (noVNC)]({novnc_popup_url})")
+        else:
+            st.caption("원격 디버그 팝업(noVNC)은 관리자 계정에서만 열 수 있습니다.")
         st.text_input(
             "테스터 이름",
             value=st.session_state.get("qa_tester_name", ""),
@@ -1930,6 +2066,10 @@ st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서
 
 if realtime_debug_start_clicked:
     try:
+        log_ui_action(
+            "debug_start_click",
+            {"target_url": st.session_state.get("qa_debug_target_url", "").strip()},
+        )
         previous_sid = st.session_state.get("qa_debug_session_id", "").strip()
         if previous_sid:
             stop_debug_session(previous_sid)
@@ -1941,26 +2081,33 @@ if realtime_debug_start_clicked:
             output_file=debug_file,
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
-            db_path=Path("data/test_logs/qa_runs.db"),
+            db_path=TEST_LOG_DB_PATH,
             launch_browser=True,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
         st.session_state["qa_debug_started_at"] = str(snapshot.get("started_at", "")).strip()
+        log_ui_action("debug_start_success", {"session_id": debug_session_id})
         st.success(
             f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
             f"(상태: {snapshot.get('status', '-')}, 모드: playwright intercept capture)"
         )
-        if is_truthy(get_config_value("QA_OPEN_NOVNC_ON_START", "1")):
+        if (
+            st.session_state.get("qa_access_role", "guest") == "admin"
+            and is_truthy(get_config_value("QA_OPEN_NOVNC_ON_START", "1"))
+        ):
             auto_open_popup_window(get_novnc_popup_url(), popup_name=f"qa_debug_popup_{debug_session_id}")
             st.caption("원격 디버그 팝업(noVNC) 자동 열기를 시도했습니다. 차단되면 링크를 직접 열어주세요.")
     except Exception as exc:
+        log_ui_action("debug_start_error", {"error": str(exc)})
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
 
 if realtime_debug_stop_clicked:
+    log_ui_action("debug_stop_click")
     sid = st.session_state.get("qa_debug_session_id", "").strip()
     if sid:
         stop_debug_session(sid)
+        log_ui_action("debug_stop_success", {"session_id": sid})
         st.success("디버깅 모드 종료 요청을 보냈습니다.")
     else:
         st.info("종료할 디버깅 세션이 없습니다.")
@@ -1992,6 +2139,7 @@ with realtime_tab:
         st.caption(f"마지막 갱신: {st.session_state.get('realtime_last_refresh_at', '-')}")
 
     if realtime_manual_refresh_clicked:
+        log_ui_action("realtime_manual_refresh")
         st.rerun()
 
     if not debug_snapshot and not recovered_from_file:
@@ -2251,6 +2399,7 @@ with report_tab:
         st.error(oauth_error)
 
     if oauth_start_clicked:
+        log_ui_action("oauth_start_click")
         try:
             oauth_state = uuid4().hex
             auth_url = build_google_oauth_url(
@@ -2264,6 +2413,7 @@ with report_tab:
             st.session_state["qa_oauth_error"] = ""
             st.rerun()
         except Exception as exc:
+            log_ui_action("oauth_start_error", {"error": str(exc)})
             st.session_state["qa_oauth_error"] = to_user_error_message(exc)
             st.session_state["qa_oauth_auth_url"] = ""
             st.session_state["qa_oauth_go_now_url"] = ""
@@ -2305,14 +2455,17 @@ with report_tab:
         st.caption("로그인 완료 후 앱으로 돌아오면 토큰이 저장되고 속성 리스트를 불러올 수 있습니다.")
 
     if property_refresh_clicked:
+        log_ui_action("ga_property_refresh_click")
         try:
             with st.spinner("GA4 속성 리스트를 조회 중입니다..."):
                 prop_df = fetch_ga4_property_list(
                     token_file=st.session_state.get("qa_report_token_file", "").strip() or "token.json"
                 )
             st.session_state["qa_report_property_options"] = prop_df.to_dict("records")
+            log_ui_action("ga_property_refresh_success", {"count": int(len(prop_df))})
             st.success(f"속성 {len(prop_df)}개를 불러왔습니다.")
         except Exception as exc:
+            log_ui_action("ga_property_refresh_error", {"error": str(exc)})
             st.error(to_user_error_message(exc))
 
     property_options_df = pd.DataFrame(st.session_state.get("qa_report_property_options", []))
@@ -2338,7 +2491,9 @@ with report_tab:
     st.divider()
     st.subheader("최근 30일 API 이벤트/매개변수")
 
-    if st.button("API 목록 조회(최근 30일)", key="qa_report_fetch_api"):
+    api_fetch_clicked = st.button("API 목록 조회(최근 30일)", key="qa_report_fetch_api")
+    if api_fetch_clicked:
+        log_ui_action("ga_api_ref_fetch_click")
         try:
             with st.spinner("GA4 API에서 이벤트/매개변수 목록을 조회 중입니다..."):
                 api_events_df, api_params_df = fetch_ga4_reference_data(
@@ -2350,10 +2505,15 @@ with report_tab:
             st.session_state["qa_report_api_events"] = api_events_df.to_dict("records")
             st.session_state["qa_report_api_params"] = api_params_df.to_dict("records")
             st.session_state["qa_report_api_fetched_at"] = pd.Timestamp.now(tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            log_ui_action(
+                "ga_api_ref_fetch_success",
+                {"event_count": int(len(api_events_df)), "param_count": int(len(api_params_df))},
+            )
             st.success(
                 f"API 조회 완료: 이벤트 {len(api_events_df)}개, 매개변수 {len(api_params_df)}개"
             )
         except Exception as exc:
+            log_ui_action("ga_api_ref_fetch_error", {"error": str(exc)})
             st.error(to_user_error_message(exc))
 
     api_events_view = pd.DataFrame(st.session_state.get("qa_report_api_events", []))
@@ -2407,6 +2567,10 @@ with report_tab:
     st.divider()
     run_clicked = st.button("QA 리포트 생성", type="primary")
     if run_clicked:
+        log_ui_action(
+            "qa_report_run_click",
+            {"source_mode": st.session_state.get("qa_report_source_mode", "")},
+        )
         requested_params = parse_csv_list(param_text)
         selected_events = [
             str(v).strip() for v in st.session_state.get("qa_report_selected_events", []) if str(v).strip()
@@ -2540,8 +2704,17 @@ with report_tab:
 
             st.subheader("정규화 이벤트 미리보기")
             st.dataframe(build_event_preview(qa_df, requested_params), use_container_width=True, height=320)
+            log_ui_action(
+                "qa_report_run_success",
+                {
+                    "source_mode": report_source_mode,
+                    "row_count": int(len(qa_df)),
+                    "rule_count": int(len(results_df)),
+                },
+            )
 
         except Exception as exc:
+            log_ui_action("qa_report_run_error", {"error": str(exc)})
             st.error(to_user_error_message(exc))
             with st.expander("기술 상세"):
                 st.code(str(exc))
@@ -2562,6 +2735,7 @@ with report_tab:
             else:
                 ok = resolve_issue(issue_id=issue_id, resolution=resolution, issue_path=DEFAULT_ISSUE_PATH)
                 if ok:
+                    log_ui_action("issue_resolved", {"issue_id": str(issue_id)})
                     st.success("이슈를 resolved 상태로 저장했습니다.")
                     st.rerun()
                 else:
