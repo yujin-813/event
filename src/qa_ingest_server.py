@@ -4,7 +4,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from threading import Lock, Thread
 from typing import Dict
-from urllib import request as urllib_request
 from urllib.parse import parse_qs, urlparse
 
 from src.debug_runtime import ingest_collect_request
@@ -86,73 +85,20 @@ class _CollectHandler(BaseHTTPRequestHandler):
         return
 
 
-class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-
-
-def _health_ok(host: str, port: int, timeout: float = 0.8) -> bool:
-    url = f"http://{host}:{int(port)}/qa/health"
-    try:
-        with urllib_request.urlopen(url, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="ignore").strip()
-            if resp.status != 200:
-                return False
-            try:
-                parsed = json.loads(body) if body else {}
-                if isinstance(parsed, dict):
-                    return bool(parsed.get("ok", False))
-            except Exception:
-                pass
-            normalized = body.lower().replace(" ", "")
-            return '"ok":true' in normalized
-    except Exception:
-        return False
-
-
 def ensure_ingest_server(host: str = "127.0.0.1", port: int = 8600) -> Dict[str, object]:
     with _SERVER_LOCK:
         if bool(_SERVER_STATE.get("started")):
             return dict(_SERVER_STATE)
-        # 이미 동일 포트에서 정상 동작 중이면 외부 프로세스를 재사용한다.
-        for health_host in (host, "127.0.0.1", "localhost"):
-            if _health_ok(health_host, int(port)):
-                _SERVER_STATE.update(
-                    {"started": True, "host": health_host, "port": int(port), "external": True}
-                )
-                return dict(_SERVER_STATE)
-
-        last_err: Exception | None = None
-        for bind_host in (host, "0.0.0.0"):
-            try:
-                httpd = _ReusableThreadingHTTPServer((bind_host, int(port)), _CollectHandler)
-                th = Thread(target=httpd.serve_forever, daemon=True)
-                th.start()
-                _SERVER_STATE.update(
-                    {
-                        "started": True,
-                        "host": bind_host,
-                        "port": int(port),
-                        "thread": th,
-                        "httpd": httpd,
-                        "external": False,
-                    }
-                )
-                return dict(_SERVER_STATE)
-            except OSError as exc:
-                last_err = exc
-                # 포트 점유 상태면 기존 프로세스 헬스체크 후 재사용 처리
-                if exc.errno in {98, 48}:  # Linux EADDRINUSE / macOS EADDRINUSE
-                    for health_host in (host, "127.0.0.1", "localhost"):
-                        if _health_ok(health_host, int(port)):
-                            _SERVER_STATE.update(
-                                {"started": True, "host": health_host, "port": int(port), "external": True}
-                            )
-                            return dict(_SERVER_STATE)
-                continue
-            except Exception as exc:
-                last_err = exc
-                continue
-
-        if last_err is not None:
-            raise RuntimeError(f"ingest server start failed: {last_err}") from last_err
-        raise RuntimeError("ingest server start failed: unknown")
+        httpd = ThreadingHTTPServer((host, int(port)), _CollectHandler)
+        th = Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        _SERVER_STATE.update(
+            {
+                "started": True,
+                "host": host,
+                "port": int(port),
+                "thread": th,
+                "httpd": httpd,
+            }
+        )
+        return dict(_SERVER_STATE)

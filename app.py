@@ -93,41 +93,6 @@ def get_config_value(key: str, default: str = "") -> str:
     return default
 
 
-def probe_ingest_health(url: str, timeout_sec: float = 1.0) -> bool:
-    target = str(url or "").strip()
-    if not target:
-        return False
-    try:
-        req = urllib_request.Request(target, method="GET")
-        with urllib_request.urlopen(req, timeout=float(timeout_sec)) as resp:
-            body = resp.read().decode("utf-8", errors="ignore").strip()
-            if resp.status != 200:
-                return False
-            try:
-                parsed = json.loads(body) if body else {}
-                if isinstance(parsed, dict):
-                    return bool(parsed.get("ok", False))
-            except Exception:
-                pass
-            normalized = body.lower().replace(" ", "")
-            return '"ok":true' in normalized
-    except Exception:
-        return False
-
-
-def build_ingest_health_url(collect_url: str) -> str:
-    target = str(collect_url or "").strip()
-    if not target:
-        return ""
-    try:
-        parsed = urlparse(target)
-        if not parsed.scheme or not parsed.netloc:
-            return ""
-        return urlunparse((parsed.scheme, parsed.netloc, "/qa/health", "", "", ""))
-    except Exception:
-        return ""
-
-
 def get_google_access_token(token_path: Path) -> str:
     if not token_path.is_absolute():
         token_path = (BASE_DIR / token_path).resolve()
@@ -1384,28 +1349,6 @@ def build_test_url(base_url: str, param_name: str, param_value: str) -> str:
     )
 
 
-def auto_open_popup_window(url: str) -> None:
-    if not url.strip():
-        return
-    js_url = json.dumps(url)
-    components.html(
-        f"""
-        <script>
-          const targetName = "qa_live_window";
-          const features = "popup=yes,width=1280,height=900,scrollbars=yes,resizable=yes";
-          let popup = window.open({js_url}, targetName, features);
-          if (!popup && window.parent && window.parent !== window) {{
-            try {{
-              popup = window.parent.open({js_url}, targetName, features);
-            }} catch (e) {{}}
-          }}
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
-
-
 def resolve_debug_output_file(
     session_id: str,
     snapshot: Dict[str, object],
@@ -1458,6 +1401,27 @@ def inject_case_from_page_location(df: pd.DataFrame, case_param: str) -> pd.Data
     out.loc[missing_mask, param] = out.loc[missing_mask, "page_location"].apply(extract_value)
     return out
 
+
+def auto_open_popup_window(url: str) -> None:
+    if not url.strip():
+        return
+    js_url = json.dumps(url)
+    components.html(
+        f"""
+        <script>
+          const targetName = "qa_live_window";
+          const features = "popup=yes,width=1280,height=900,scrollbars=yes,resizable=yes";
+          let popup = window.open({js_url}, targetName, features);
+          if (!popup && window.parent && window.parent !== window) {{
+            try {{
+              popup = window.parent.open({js_url}, targetName, features);
+            }} catch (e) {{}}
+          }}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 def _safe_params_dict(value: object) -> Dict[str, object]:
     if isinstance(value, dict):
@@ -1630,11 +1594,6 @@ risk_level_ko = {"Low": "낮음", "Medium": "중간", "High": "높음"}
 scenario_mode_ko = {"key": "키 기반", "user": "사용자 기반", "aggregate": "집계형", "empty": "데이터 없음"}
 debug_case_param_name = "qa_debug_session_id"
 default_ingest_public_url = get_config_value("QA_INGEST_PUBLIC_URL", "https://asknuggetdata.com/qa/collect")
-qa_mode_options = [
-    "Mode 1 · 실시간 QA (Chrome Extension)",
-    "Mode 2 · 자동 QA (Playwright)",
-    "Mode 3 · 운영 데이터 QA (GA4 API)",
-]
 
 if "qa_debug_session_id" not in st.session_state:
     st.session_state["qa_debug_session_id"] = ""
@@ -1668,44 +1627,14 @@ if "qa_oauth_notice" not in st.session_state:
     st.session_state["qa_oauth_notice"] = ""
 if "qa_oauth_error" not in st.session_state:
     st.session_state["qa_oauth_error"] = ""
-if "qa_extension_ready" not in st.session_state:
-    st.session_state["qa_extension_ready"] = False
-if "qa_operating_mode" not in st.session_state:
-    st.session_state["qa_operating_mode"] = qa_mode_options[0]
 if "qa_ingest_public_url" not in st.session_state:
     st.session_state["qa_ingest_public_url"] = default_ingest_public_url
-if "qa_ingest_server_ok" not in st.session_state:
-    st.session_state["qa_ingest_server_ok"] = False
-if "qa_ingest_local_ok" not in st.session_state:
-    st.session_state["qa_ingest_local_ok"] = False
-if "qa_ingest_public_ok" not in st.session_state:
-    st.session_state["qa_ingest_public_ok"] = False
-if "qa_ingest_server_error" not in st.session_state:
-    st.session_state["qa_ingest_server_error"] = ""
 
-ensure_err = ""
 try:
     ensure_ingest_server(host="127.0.0.1", port=8600)
-except Exception as exc:
-    ensure_err = str(exc)
-
-local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
-public_health_url = build_ingest_health_url(st.session_state.get("qa_ingest_public_url", default_ingest_public_url))
-public_health_ok = probe_ingest_health(public_health_url) if public_health_url else False
-
-st.session_state["qa_ingest_local_ok"] = bool(local_health_ok)
-st.session_state["qa_ingest_public_ok"] = bool(public_health_ok)
-st.session_state["qa_ingest_server_ok"] = bool(local_health_ok or public_health_ok)
-if st.session_state["qa_ingest_server_ok"]:
-    st.session_state["qa_ingest_server_error"] = ""
-else:
-    detail_bits: List[str] = []
-    if ensure_err:
-        detail_bits.append(f"ensure: {ensure_err}")
-    detail_bits.append(f"local_health({ 'ok' if local_health_ok else 'fail' }): http://127.0.0.1:8600/qa/health")
-    if public_health_url:
-        detail_bits.append(f"public_health({ 'ok' if public_health_ok else 'fail' }): {public_health_url}")
-    st.session_state["qa_ingest_server_error"] = " | ".join(detail_bits)
+    st.session_state["qa_ingest_server_ok"] = True
+except Exception:
+    st.session_state["qa_ingest_server_ok"] = False
 
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
@@ -1714,58 +1643,23 @@ scenario_key_field = "transaction_id"
 scenario_key_value = ""
 realtime_debug_start_clicked = False
 realtime_debug_stop_clicked = False
-selected_mode = str(st.session_state.get("qa_operating_mode", qa_mode_options[0]))
-is_mode_1 = selected_mode == qa_mode_options[0]
-is_mode_2 = selected_mode == qa_mode_options[1]
-is_mode_3 = selected_mode == qa_mode_options[2]
 
 with st.sidebar:
     st.header("설정")
-    st.radio(
-        "운영 모드",
-        options=qa_mode_options,
-        key="qa_operating_mode",
-    )
-    selected_mode = str(st.session_state.get("qa_operating_mode", qa_mode_options[0]))
-    is_mode_1 = selected_mode == qa_mode_options[0]
-    is_mode_2 = selected_mode == qa_mode_options[1]
-    is_mode_3 = selected_mode == qa_mode_options[2]
-
     with st.expander("1) 데이터 소스/연결", expanded=True):
-        if is_mode_1:
-            st.markdown("**Mode 1: 실시간 QA (Chrome Extension)**")
-            st.caption("배포 환경에서 테스터 브라우저 히트를 즉시 수집합니다.")
-            st.text_input(
-                "확장 수집 엔드포인트",
-                key="qa_ingest_public_url",
-                disabled=True,
-            )
-            if st.session_state.get("qa_ingest_server_ok", False):
-                ok_parts: List[str] = []
-                if st.session_state.get("qa_ingest_local_ok", False):
-                    ok_parts.append("local:127.0.0.1:8600")
-                if st.session_state.get("qa_ingest_public_ok", False):
-                    ok_parts.append("public:/qa/health")
-                ok_text = ", ".join(ok_parts) if ok_parts else "health check"
-                st.caption(f"서버 수집기 상태: OK ({ok_text})")
-            else:
-                st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
-                last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
-                if last_ingest_err:
-                    st.caption(f"원인: {last_ingest_err}")
-            st.caption("확장 설치: `chrome://extensions` → 개발자 모드 ON → 압축해제 확장 로드")
-            st.checkbox("확장 설치/활성화 완료", key="qa_extension_ready")
-        elif is_mode_2:
-            st.markdown("**Mode 2: 자동 QA (Playwright)**")
-            st.caption("확장 없이 앱이 띄운 브라우저 팝업의 collect 히트를 수집합니다.")
-            st.info(
-                "이 모드는 GUI가 있는 로컬 실행에서만 권장됩니다. "
-                "EC2/서버 환경에서는 팝업 브라우저 실행이 실패할 수 있습니다."
-            )
+        st.markdown("**브라우저 확장프로그램 히트 캡처 + QA 리포트 API 참조 모드**")
+        st.caption("스니펫 없이 Chrome 확장프로그램이 collect 히트를 가로채어 전송합니다.")
+        st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 불러올 수 있습니다.")
+        st.text_input(
+            "확장 수집 엔드포인트",
+            value=st.session_state.get("qa_ingest_public_url", default_ingest_public_url),
+            key="qa_ingest_public_url",
+            disabled=True,
+        )
+        if st.session_state.get("qa_ingest_server_ok", False):
+            st.caption("서버 수집기 상태: OK (127.0.0.1:8600)")
         else:
-            st.markdown("**Mode 3: 운영 데이터 QA (GA4 API)**")
-            st.caption("실시간 브라우저 캡처 없이, 최근 30일 API 집계 데이터 기준으로 QA를 수행합니다.")
-            st.info("운영 데이터 모드는 지연 반영 데이터 기준입니다.")
+            st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
 
     with st.expander("2) 실시간 디버깅 스트림", expanded=True):
         default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()
@@ -1778,12 +1672,7 @@ with st.sidebar:
             key="qa_debug_target_url",
             placeholder="예: https://datanugget.io/",
         )
-        if is_mode_1:
-            st.caption("시작 시 테스트 URL 팝업이 열리고, 확장프로그램이 히트를 `/qa/collect`로 전송합니다.")
-        elif is_mode_2:
-            st.caption("디버깅 모드 시작 시 Playwright 팝업 브라우저가 자동으로 열립니다.")
-        else:
-            st.caption("Mode 3에서는 실시간 디버깅 스트림을 사용하지 않습니다.")
+        st.caption("확장프로그램이 활성화된 Chrome에서 디버그 팝업 URL을 열어 테스트하세요.")
         st.text_input(
             "테스터 이름",
             value=st.session_state.get("qa_tester_name", ""),
@@ -1797,15 +1686,10 @@ with st.sidebar:
             placeholder="예: 랜딩 배너 클릭 시나리오",
         )
         dc1, dc2 = st.columns(2)
-        start_disabled = is_mode_3 or (is_mode_1 and (not st.session_state.get("qa_extension_ready", False)))
         with dc1:
-            realtime_debug_start_clicked = st.button("디버깅 모드 시작", type="primary", disabled=start_disabled)
+            realtime_debug_start_clicked = st.button("디버깅 모드 시작", type="primary")
         with dc2:
             realtime_debug_stop_clicked = st.button("디버깅 모드 종료")
-        if is_mode_1 and start_disabled:
-            st.warning("확장 설치/활성화 완료 체크 후 시작할 수 있습니다.")
-        if is_mode_3:
-            st.info("Mode 3에서는 디버깅 모드 시작 버튼이 비활성화됩니다.")
 
         active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
         debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
@@ -1831,12 +1715,15 @@ with st.sidebar:
                 st.caption(f"테스터: {tester_name_view}")
             if debug_snapshot and debug_snapshot.get("last_error", "").strip():
                 st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
-            if is_mode_1:
-                st.caption("확장프로그램이 수집한 히트가 실시간 QA 리스트에 반영됩니다.")
-            elif is_mode_2:
-                st.caption("팝업 브라우저에서 행동하면 실시간 QA 리스트에 즉시 반영됩니다.")
-            else:
-                st.caption("운영 데이터 QA 모드입니다.")
+            debug_popup_url = build_test_url(
+                st.session_state.get("qa_debug_target_url", "").strip(),
+                debug_case_param_name,
+                sid_for_view,
+            )
+            if debug_popup_url:
+                st.caption("디버그 팝업 URL")
+                st.code(debug_popup_url, language="text")
+            st.caption("실시간 QA 리스트는 메인 영역의 `실시간 테스트 QA 리스트` 탭에서 확인하세요.")
         else:
             st.caption("디버깅 시작 후 타임라인이 표시됩니다.")
 
@@ -1889,12 +1776,6 @@ st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서
 
 if realtime_debug_start_clicked:
     try:
-        selected_mode = str(st.session_state.get("qa_operating_mode", qa_mode_options[0]))
-        is_mode_1 = selected_mode == qa_mode_options[0]
-        is_mode_2 = selected_mode == qa_mode_options[1]
-        if not (is_mode_1 or is_mode_2):
-            st.info("Mode 3에서는 디버깅 모드를 시작하지 않습니다.")
-            st.stop()
         debug_session_id = f"dbg_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:4]}"
         debug_file = Path(f"data/debug_stream/{debug_session_id}.jsonl")
         snapshot = start_debug_session(
@@ -1904,27 +1785,21 @@ if realtime_debug_start_clicked:
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
             db_path=Path("data/test_logs/qa_runs.db"),
-            launch_browser=is_mode_2,
+            launch_browser=False,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
-        if is_mode_1:
-            debug_popup_url = build_test_url(
-                st.session_state.get("qa_debug_target_url", "").strip(),
-                debug_case_param_name,
-                debug_session_id,
-            )
-            if debug_popup_url:
-                auto_open_popup_window(debug_popup_url)
-            st.success(
-                f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
-                f"(상태: {snapshot.get('status', '-')}, 모드: extension hit capture)"
-            )
-        else:
-            st.success(
-                f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
-                f"(상태: {snapshot.get('status', '-')}, 모드: browser runtime capture)"
-            )
+        debug_popup_url = build_test_url(
+            st.session_state.get("qa_debug_target_url", "").strip(),
+            debug_case_param_name,
+            debug_session_id,
+        )
+        if debug_popup_url:
+            auto_open_popup_window(debug_popup_url)
+        st.success(
+            f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
+            f"(상태: {snapshot.get('status', '-')}, 모드: extension hit capture)"
+        )
     except Exception as exc:
         st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
 
@@ -1938,11 +1813,6 @@ if realtime_debug_stop_clicked:
 
 realtime_tab, report_tab = st.tabs(["1단: 실시간 테스트 화면", "2단: QA 리포트 화면"])
 with realtime_tab:
-    selected_mode = str(st.session_state.get("qa_operating_mode", qa_mode_options[0]))
-    is_mode_3 = selected_mode == qa_mode_options[2]
-    if is_mode_3:
-        st.info("Mode 3(운영 데이터 QA)에서는 실시간 디버깅 스트림 대신 QA 리포트 화면에서 API 기반 판정을 사용하세요.")
-
     active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
     debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
     resolved_output_path = resolve_debug_output_file(
@@ -2329,24 +2199,12 @@ with report_tab:
         options=selected_param_options,
         key="qa_report_selected_params",
     )
-    report_mode_options = [
-        "실사용 QA (GA4 API 집계, 지연 반영)",
-        "테스트 QA (실시간 세션 히트)",
-    ]
-    selected_mode = str(st.session_state.get("qa_operating_mode", qa_mode_options[0]))
-    preferred_report_mode = report_mode_options[0] if selected_mode == qa_mode_options[2] else report_mode_options[1]
-    if st.session_state.get("qa_report_source_mode") not in report_mode_options:
-        st.session_state["qa_report_source_mode"] = preferred_report_mode
     report_source_mode = st.radio(
         "리포트 판정 데이터 소스",
-        options=report_mode_options,
+        options=["GA4 API 집계(최근 30일)", "브라우저 히트(디버깅 세션)"],
         horizontal=True,
         key="qa_report_source_mode",
     )
-    if report_source_mode == "실사용 QA (GA4 API 집계, 지연 반영)":
-        st.caption("참고: API 집계 데이터는 실시간 스트림이 아닌 지연 반영 데이터입니다.")
-    else:
-        st.caption("참고: 현재 디버깅 세션 파일(확장/팝업 캡처 공통) 기준으로 즉시 판정합니다.")
 
     st.divider()
     run_clicked = st.button("QA 리포트 생성", type="primary")
@@ -2386,7 +2244,7 @@ with report_tab:
             config_notes.append("퍼널 시퀀스 미설정: 퍼널 기반 체크는 제한됩니다.")
 
         try:
-            if report_source_mode == "테스트 QA (실시간 세션 히트)":
+            if report_source_mode == "브라우저 히트(디버깅 세션)":
                 debug_file = Path(st.session_state.get("qa_debug_output_file", "").strip())
                 if not debug_file.exists():
                     st.error("디버깅 스트림 데이터가 없습니다. 사이드바에서 '디버깅 모드 시작' 후 테스트를 진행하세요.")
@@ -2449,7 +2307,7 @@ with report_tab:
                     required_params_by_event=required_param_map,
                     selected_params=selected_params,
                 )
-                config_notes.append("현재 리포트는 실사용 QA용 GA4 API 집계(최근 30일, 지연 반영) 기준입니다.")
+                config_notes.append("현재 리포트는 GA4 API 30일 집계 데이터 기준으로 생성되었습니다.")
 
             results_view = build_qa_results_view(results_df)
             issue_property = st.session_state.get("qa_report_property_id", "").strip() or "browser_intercept_stream"
