@@ -132,7 +132,6 @@ function postCollectHit(details) {
   withConfig((cfg) => {
     const ingestUrl = cfg.qa_ingest_url || DEFAULT_INGEST_URL;
     const sessionId = resolveSessionId(details, cfg);
-    if (!sessionId) return;
     const bodyText = requestBodyToText(details.requestBody);
     fetch(ingestUrl, {
       method: "POST",

@@ -89,6 +89,45 @@ def _decode_collect_event_params(payload: Dict[str, str]) -> Dict[str, object]:
     return params
 
 
+def _extract_debug_sid_from_page_url(page_url: str) -> str:
+    raw = str(page_url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        q = _parse_form_encoded(parsed.query)
+        return str(q.get("qa_debug_session_id", "")).strip()
+    except Exception:
+        return ""
+
+
+def _infer_session_id_from_collect(url: str, method: str, post_data: str) -> str:
+    parsed = urlparse(url or "")
+    query = _parse_form_encoded(parsed.query)
+    body = _parse_form_encoded(post_data) if method.upper() == "POST" else {}
+    merged = dict(query)
+    merged.update(body)
+
+    for key in ("qa_debug_session_id", "ep.qa_debug_session_id"):
+        sid = str(merged.get(key, "")).strip()
+        if sid:
+            return sid
+
+    for page_key in ("dl", "ep.page_location"):
+        sid = _extract_debug_sid_from_page_url(str(merged.get(page_key, "")).strip())
+        if sid:
+            return sid
+    return ""
+
+
+def _infer_single_running_session_id() -> str:
+    with _LOCK:
+        running = [sid for sid, sess in _SESSIONS.items() if str(getattr(sess, "status", "")).strip() == "running"]
+    if len(running) == 1:
+        return running[0]
+    return ""
+
+
 def _extract_ga_hit_payloads(url: str, method: str, post_data: str, session_id: str) -> List[Dict[str, object]]:
     if not _is_ga_like_request(url, method, post_data):
         return []
@@ -644,6 +683,14 @@ def ingest_collect_request(
     request_body: str = "",
 ) -> int:
     sid = session_id.strip()
+    if not sid:
+        sid = _infer_session_id_from_collect(
+            url=request_url.strip(),
+            method=(request_method or "GET").strip().upper(),
+            post_data=request_body or "",
+        )
+    if not sid:
+        sid = _infer_single_running_session_id()
     if not sid or not request_url.strip():
         return 0
 
