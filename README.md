@@ -116,6 +116,8 @@ sudo ./scripts/ec2_install.sh
 - `QA_COLLECT_REQUIRE_ACTIVE_SESSION=1`: 활성 세션 없는 `/qa/collect` 요청 차단
 - `QA_COLLECT_RATE_LIMIT_*`: 수집 요청 rate limit
 - `QA_ACTION_LOG_SALT`: 행동 로그 IP 해시용 salt
+- `QA_INGEST_EMBEDDED_MODE=0`: 수집기를 앱 내부 스레드가 아닌 독립 서비스로 사용
+- `QA_MAX_RUNNING_DEBUG_SESSIONS=1`: 동시 디버깅 세션 상한
 
 ## 배포
 - EC2 + 도메인(asknuggetdata.com) 배포 가이드:

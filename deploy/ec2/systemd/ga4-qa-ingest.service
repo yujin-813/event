@@ -13,6 +13,8 @@ Environment=QA_INGEST_PORT=8600
 ExecStart=/opt/ga4-qa-mvp/scripts/run_ingest.sh
 Restart=always
 RestartSec=2
+TimeoutStopSec=10
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target

@@ -1923,10 +1923,13 @@ if "qa_oauth_go_now_url" not in st.session_state:
 enforce_access_gate()
 
 ensure_err = ""
-try:
-    ensure_ingest_server(host="127.0.0.1", port=8600)
-except Exception as exc:
-    ensure_err = str(exc)
+# 기본은 독립 systemd 수집기(ga4-qa-ingest.service)를 사용한다.
+ingest_embedded_mode = is_truthy(get_config_value("QA_INGEST_EMBEDDED_MODE", "0"))
+if ingest_embedded_mode:
+    try:
+        ensure_ingest_server(host="127.0.0.1", port=8600)
+    except Exception as exc:
+        ensure_err = str(exc)
 
 local_health_ok = probe_ingest_health("http://127.0.0.1:8600/qa/health")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 import platform
 from pathlib import Path
 import re
@@ -36,6 +37,19 @@ class DebugSession:
 _SESSIONS: Dict[str, DebugSession] = {}
 _LOCK = threading.Lock()
 _SESSION_ID_PATTERN = re.compile(r"^dbg_\d{8}_\d{6}(?:_\d{6})?_[0-9a-f]{4,16}$")
+
+
+def _max_running_debug_sessions() -> int:
+    raw = str(os.getenv("QA_MAX_RUNNING_DEBUG_SESSIONS", "1")).strip()
+    try:
+        val = int(raw)
+    except Exception:
+        val = 1
+    if val < 1:
+        return 1
+    if val > 20:
+        return 20
+    return val
 
 
 def _parse_form_encoded(text: str) -> Dict[str, str]:
@@ -805,6 +819,12 @@ def start_debug_session(
     effective_db_path = Path(db_path) if db_path is not None else Path("data/test_logs/qa_runs.db")
 
     with _LOCK:
+        running_count = sum(1 for s in _SESSIONS.values() if str(getattr(s, "status", "")).strip() == "running")
+        if running_count >= _max_running_debug_sessions():
+            raise RuntimeError(
+                f"동시 디버깅 세션 제한을 초과했습니다. "
+                f"(running={running_count}, limit={_max_running_debug_sessions()})"
+            )
         existing = _SESSIONS.get(sid)
         if existing and existing.status == "running":
             return get_debug_session_snapshot(sid)

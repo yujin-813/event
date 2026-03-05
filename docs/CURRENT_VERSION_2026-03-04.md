@@ -53,3 +53,7 @@
   - 로그인/디버깅/리포트 버튼 액션 기록
 - 수집기 독립 서비스:
   - `ga4-qa-ingest.service`로 `127.0.0.1:8600` 상시 유지
+- 서버 안정화:
+  - watchdog 타이머(`ga4-qa-watchdog.timer`) 1분 주기 자동복구
+  - swap 자동 구성 스크립트(`scripts/ec2_prepare_swap.sh`)
+  - Streamlit 메모리 상한(`MemoryMax=5G`)

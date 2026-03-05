@@ -14,6 +14,10 @@ Environment=USE_XVFB=0
 ExecStart=/opt/ga4-qa-mvp/scripts/run.sh --server.port 8501 --server.address 127.0.0.1 --server.headless true
 Restart=always
 RestartSec=3
+TimeoutStopSec=20
+LimitNOFILE=65535
+MemoryMax=5G
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

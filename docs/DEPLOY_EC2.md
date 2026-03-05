@@ -58,6 +58,12 @@ sudo systemctl status ga4-qa-mvp
 sudo journalctl -u ga4-qa-mvp -f
 ```
 
+watchdog 타이머 상태:
+```bash
+sudo systemctl status ga4-qa-watchdog.timer --no-pager
+sudo systemctl list-timers | grep ga4-qa-watchdog
+```
+
 ## 7) nginx 리버스프록시
 ```bash
 sudo cp deploy/ec2/nginx/asknuggetdata.com.conf /etc/nginx/sites-available/asknuggetdata.com.conf
@@ -152,6 +158,18 @@ QA_COLLECT_RATE_LIMIT_BURST=24
 QA_ACTION_LOG_SALT=change-me-salt
 EOF
 sudo systemctl restart ga4-qa-mvp
+```
+
+## 13) 먹통 방지(8GB 권장)
+- 설치 스크립트는 기본적으로 다음을 적용합니다.
+  - 4GB swap 파일 생성(`/swapfile`)
+  - `ga4-qa-watchdog.timer`(1분 간격 헬스체크 후 자동 재시작)
+  - Streamlit 서비스 메모리 상한(`MemoryMax=5G`)
+
+수동 실행:
+```bash
+sudo /opt/ga4-qa-mvp/scripts/ec2_prepare_swap.sh
+sudo systemctl restart ga4-qa-watchdog.timer
 ```
 
 임시로 진입 제한을 즉시 해제하려면:

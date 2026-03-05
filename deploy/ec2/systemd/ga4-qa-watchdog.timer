@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GA4 QA watchdog every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=ga4-qa-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
