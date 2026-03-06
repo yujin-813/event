@@ -1243,6 +1243,7 @@ def get_novnc_popup_url() -> str:
     configured = get_config_value("QA_NOVNC_PUBLIC_URL", "").strip()
     if configured:
         return configured
+    # Nginx /vnc/ reverse-proxy uses the /vnc/websockify backend path.
     return "/vnc/vnc.html?autoconnect=1&resize=remote&path=vnc/websockify"
 
 
