@@ -6,6 +6,9 @@ import json
 import os
 import io
 import re
+import shutil
+import sqlite3
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib import error as urllib_error
@@ -43,7 +46,7 @@ from src.reporting import (
 from src.scenario_validation import validate_single_scenario
 from src.rules import run_qa_rules
 from src.scoring import compute_integrity_score
-from src.test_log_db import append_ui_action, init_test_log_db
+from src.test_log_db import append_ui_action, get_session, init_test_log_db, list_recent_sessions
 
 
 st.set_page_config(page_title="GA4 QA Reporter", layout="wide")
@@ -52,6 +55,347 @@ st.caption("실시간 DebugView 대체가 아닌, 로그 수집 + 자동 정리 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_OAUTH_REDIRECT_URI = "https://asknuggetdata.com/oauth2callback"
 TEST_LOG_DB_PATH = Path("data/test_logs/qa_runs.db")
+SCHEMA_STORE_PATH = Path("data/schemas/event_schemas.json")
+WORKSPACE_ROOT = Path("data/workspace")
+DEFAULT_PROJECT_SLUG = "default-project"
+OAUTH_CONTEXT_DIR = Path("data/oauth_context")
+CIRCLED_NUMBERS = {
+    1: "①", 2: "②", 3: "③", 4: "④", 5: "⑤", 6: "⑥", 7: "⑦", 8: "⑧", 9: "⑨", 10: "⑩",
+    11: "⑪", 12: "⑫", 13: "⑬", 14: "⑭", 15: "⑮", 16: "⑯", 17: "⑰", 18: "⑱", 19: "⑲", 20: "⑳",
+}
+
+
+def _slugify_project_name(text: str) -> str:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return DEFAULT_PROJECT_SLUG
+    # Keep unicode alnum chars (e.g. Korean), normalize separators to '-'
+    normalized = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "-" for ch in raw)
+    normalized = re.sub(r"[-_]{2,}", "-", normalized)
+    slug = normalized.strip("-_")
+    return slug or DEFAULT_PROJECT_SLUG
+
+
+def to_circled_number(n: int) -> str:
+    return CIRCLED_NUMBERS.get(int(n), str(n))
+
+
+def get_current_app_base_url() -> str:
+    override = get_config_value("GA4_APP_BASE_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    headers = _get_request_headers()
+    host = str(headers.get("x-forwarded-host", "")).strip() or str(headers.get("host", "")).strip()
+    proto = str(headers.get("x-forwarded-proto", "")).split(",")[0].strip().lower()
+    if not host:
+        return ""
+    if proto not in {"http", "https"}:
+        proto = "https"
+    return f"{proto}://{host}".rstrip("/")
+
+
+def save_oauth_context(state: str, context: Dict[str, object]) -> None:
+    sid = str(state or "").strip()
+    if not sid:
+        return
+    OAUTH_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    payload = dict(context)
+    payload["saved_at"] = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    (OAUTH_CONTEXT_DIR / f"{sid}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def pop_oauth_context(state: str) -> Dict[str, object]:
+    sid = str(state or "").strip()
+    if not sid:
+        return {}
+    path = OAUTH_CONTEXT_DIR / f"{sid}.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return data
+
+
+def _workspace_projects_root() -> Path:
+    return WORKSPACE_ROOT / "projects"
+
+
+def list_workspace_projects() -> List[str]:
+    root = _workspace_projects_root()
+    if not root.exists():
+        return [DEFAULT_PROJECT_SLUG]
+    names = sorted([p.name for p in root.iterdir() if p.is_dir()])
+    return names or [DEFAULT_PROJECT_SLUG]
+
+
+def ensure_project_structure(project_slug: str) -> Dict[str, Path]:
+    slug = _slugify_project_name(project_slug)
+    project_root = _workspace_projects_root() / slug
+    paths = {
+        "project_root": project_root,
+        "schemas_dir": project_root / "schemas",
+        "qa_sessions_dir": project_root / "qa_sessions",
+        "event_logs_dir": project_root / "event_logs",
+        "tracking_dir": project_root / "tracking_plan",
+        "exports_dir": project_root / "exports",
+        "artifacts_dir": project_root / "artifacts",
+        "schema_file": project_root / "schemas" / "event_schemas.json",
+        "db_file": project_root / "qa_sessions" / "qa_runs.db",
+        "action_map_file": project_root / "tracking_plan" / "action_object_map.csv",
+    }
+    for key in ["project_root", "schemas_dir", "qa_sessions_dir", "event_logs_dir", "tracking_dir", "exports_dir", "artifacts_dir"]:
+        paths[key].mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def get_active_project_slug() -> str:
+    try:
+        slug = _slugify_project_name(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
+    except Exception:
+        slug = DEFAULT_PROJECT_SLUG
+    return slug
+
+
+def get_active_project_paths() -> Dict[str, Path]:
+    return ensure_project_structure(get_active_project_slug())
+
+
+def get_active_schema_path() -> Path:
+    return get_active_project_paths()["schema_file"]
+
+
+def get_active_test_log_db_path() -> Path:
+    return get_active_project_paths()["db_file"]
+
+
+def get_active_action_map_path() -> Path:
+    return get_active_project_paths()["action_map_file"]
+
+
+def _normalize_action_map_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "event_name",
+                "action",
+                "object",
+                "page_id",
+                "section_name",
+                "section_index",
+                "description",
+                "object_index",
+            ]
+        )
+    rename = {str(c): normalize_param_name(str(c)) for c in df.columns}
+    work = df.rename(columns=rename).copy()
+    aliases = {
+        "section": "section_name",
+        "sectionid": "section_index",
+        "index": "object_index",
+        "event": "event_name",
+    }
+    for src, dst in aliases.items():
+        if src in work.columns and dst not in work.columns:
+            work[dst] = work[src]
+
+    required_cols = [
+        "event_name",
+        "action",
+        "object",
+        "page_id",
+        "section_name",
+        "section_index",
+        "description",
+        "object_index",
+    ]
+    for col in required_cols:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[required_cols].copy()
+    for col in required_cols:
+        work[col] = work[col].astype(str).str.strip()
+    work = work[work["event_name"] != ""].drop_duplicates(subset=["event_name"], keep="last").reset_index(drop=True)
+    return work
+
+
+def load_action_object_map(path: Path | None = None) -> pd.DataFrame:
+    if path is None:
+        path = get_active_action_map_path()
+    if not path.exists():
+        return _normalize_action_map_df(pd.DataFrame())
+    try:
+        raw = pd.read_csv(path)
+    except Exception:
+        return _normalize_action_map_df(pd.DataFrame())
+    return _normalize_action_map_df(raw)
+
+
+def save_action_object_map(df: pd.DataFrame, path: Path | None = None) -> None:
+    if path is None:
+        path = get_active_action_map_path()
+    normalized = _normalize_action_map_df(df)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def action_map_template_csv_bytes() -> bytes:
+    template = pd.DataFrame(
+        [
+            {
+                "event_name": "click_button",
+                "action": "click",
+                "object": "button",
+                "page_id": "/home",
+                "section_name": "hero_banner",
+                "section_index": "1",
+                "description": "메인 배너 버튼 클릭",
+                "object_index": "1",
+            },
+            {
+                "event_name": "view_item_list",
+                "action": "view",
+                "object": "product",
+                "page_id": "/home",
+                "section_name": "product_list",
+                "section_index": "2",
+                "description": "상품 리스트 노출",
+                "object_index": "{index}",
+            },
+        ]
+    )
+    return template.to_csv(index=False).encode("utf-8-sig")
+
+
+def import_legacy_data_to_project(project_slug: str) -> Dict[str, int]:
+    paths = ensure_project_structure(project_slug)
+    target_db = paths["db_file"]
+    init_test_log_db(target_db)
+
+    counts = {
+        "sessions": 0,
+        "events": 0,
+        "actions": 0,
+        "streams": 0,
+        "schemas": 0,
+    }
+
+    legacy_db = Path("data/test_logs/qa_runs.db")
+    if legacy_db.exists():
+        with sqlite3.connect(str(legacy_db)) as src, sqlite3.connect(str(target_db)) as dst:
+            src.row_factory = sqlite3.Row
+            dst.execute("PRAGMA journal_mode=WAL;")
+            dst.execute("PRAGMA synchronous=NORMAL;")
+
+            session_cols = [
+                "session_id",
+                "target_url",
+                "status",
+                "started_at",
+                "ended_at",
+                "captured_events",
+                "last_error",
+                "tester_name",
+                "tester_note",
+                "created_at",
+            ]
+            src_rows = src.execute(f"SELECT {', '.join(session_cols)} FROM qa_sessions").fetchall()
+            for row in src_rows:
+                vals = [row[c] for c in session_cols]
+                dst.execute(
+                    f"INSERT OR IGNORE INTO qa_sessions ({', '.join(session_cols)}) VALUES ({', '.join(['?'] * len(session_cols))})",
+                    vals,
+                )
+            counts["sessions"] = int(len(src_rows))
+
+            event_cols = [
+                "session_id",
+                "captured_at",
+                "source",
+                "event_name",
+                "params_json",
+                "page_url",
+                "measurement_id",
+                "client_id",
+                "request_method",
+            ]
+            existing_event_count = int(dst.execute("SELECT COUNT(1) FROM qa_events").fetchone()[0] or 0)
+            if existing_event_count == 0:
+                event_rows = src.execute(f"SELECT {', '.join(event_cols)} FROM qa_events").fetchall()
+                for row in event_rows:
+                    vals = [row[c] for c in event_cols]
+                    dst.execute(
+                        f"INSERT INTO qa_events ({', '.join(event_cols)}) VALUES ({', '.join(['?'] * len(event_cols))})",
+                        vals,
+                    )
+                counts["events"] = int(len(event_rows))
+
+            action_cols = [
+                "action_at",
+                "session_id",
+                "action_type",
+                "actor_role",
+                "actor_name",
+                "detail_json",
+                "remote_addr_hash",
+                "user_agent",
+            ]
+            existing_action_count = int(dst.execute("SELECT COUNT(1) FROM qa_ui_actions").fetchone()[0] or 0)
+            if existing_action_count == 0:
+                action_rows = src.execute(f"SELECT {', '.join(action_cols)} FROM qa_ui_actions").fetchall()
+                for row in action_rows:
+                    vals = [row[c] for c in action_cols]
+                    dst.execute(
+                        f"INSERT INTO qa_ui_actions ({', '.join(action_cols)}) VALUES ({', '.join(['?'] * len(action_cols))})",
+                        vals,
+                    )
+                counts["actions"] = int(len(action_rows))
+
+            dst.commit()
+
+    legacy_stream_dir = Path("data/debug_stream")
+    if legacy_stream_dir.exists():
+        for src_file in legacy_stream_dir.glob("dbg_*.jsonl"):
+            sid = src_file.stem
+            dst_file = paths["qa_sessions_dir"] / sid / "debug_stream.jsonl"
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            if not dst_file.exists():
+                shutil.copy2(src_file, dst_file)
+                counts["streams"] += 1
+
+    legacy_schema_file = Path("data/schemas/event_schemas.json")
+    target_schema_file = paths["schema_file"]
+    try:
+        src_schema = {}
+        dst_schema = {}
+        if legacy_schema_file.exists():
+            src_raw = json.loads(legacy_schema_file.read_text(encoding="utf-8"))
+            src_schema = src_raw.get("events", src_raw) if isinstance(src_raw, dict) else {}
+        if target_schema_file.exists():
+            dst_raw = json.loads(target_schema_file.read_text(encoding="utf-8"))
+            dst_schema = dst_raw.get("events", dst_raw) if isinstance(dst_raw, dict) else {}
+        if isinstance(src_schema, dict) and src_schema:
+            merged = dict(dst_schema) if isinstance(dst_schema, dict) else {}
+            for k, v in src_schema.items():
+                if k not in merged:
+                    merged[k] = v
+                    counts["schemas"] += 1
+            target_schema_file.parent.mkdir(parents=True, exist_ok=True)
+            target_schema_file.write_text(
+                json.dumps({"events": merged, "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat()}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+    return counts
 
 
 def _bootstrap_dotenv_value(key: str) -> str:
@@ -95,6 +439,765 @@ def parse_required_params(text: str) -> Dict[str, List[str]]:
         event, params = line.split(":", 1)
         mapping[event.strip()] = parse_csv_list(params)
     return mapping
+
+
+def load_event_schemas(path: Path | None = None) -> Dict[str, Dict[str, object]]:
+    if path is None:
+        path = get_active_schema_path()
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    src = raw.get("events", raw) if isinstance(raw, dict) else {}
+    if not isinstance(src, dict):
+        return {}
+
+    out: Dict[str, Dict[str, object]] = {}
+    for event_name, schema in src.items():
+        if not isinstance(schema, dict):
+            continue
+        name = str(event_name).strip()
+        if not name:
+            continue
+        required = [str(v).strip() for v in schema.get("required", []) if str(v).strip()]
+        optional = [str(v).strip() for v in schema.get("optional", []) if str(v).strip()]
+        out[name] = {
+            "required": list(dict.fromkeys(required)),
+            "optional": list(dict.fromkeys(optional)),
+            "updated_at": str(schema.get("updated_at", "")).strip(),
+        }
+    return out
+
+
+def save_event_schemas(schemas: Dict[str, Dict[str, object]], path: Path | None = None) -> None:
+    if path is None:
+        path = get_active_schema_path()
+    payload = {
+        "events": schemas,
+        "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def infer_event_schema_from_rows(
+    rt_events: pd.DataFrame,
+    event_name: str,
+    include_system_params: bool = False,
+) -> Dict[str, object]:
+    if rt_events.empty:
+        return {"required": [], "optional": [], "sample_size": 0, "excluded_system_params": 0}
+    subset = rt_events[rt_events["이벤트"].astype(str) == str(event_name)].copy()
+    if subset.empty:
+        return {"required": [], "optional": [], "sample_size": 0, "excluded_system_params": 0}
+
+    nonmissing_count: Dict[str, int] = {}
+    seen_count: Dict[str, int] = {}
+    total = int(len(subset))
+    excluded_system_params = 0
+
+    for _, row in subset.iterrows():
+        params = row.get("전체 파라미터")
+        if not isinstance(params, dict):
+            continue
+        row_seen: set[str] = set()
+        row_nonmissing: set[str] = set()
+        for key, value in params.items():
+            key_text = str(key).strip()
+            if not key_text:
+                continue
+            if _is_system_param_key(key_text) and (not include_system_params):
+                excluded_system_params += 1
+                continue
+            row_seen.add(key_text)
+            if not _is_missing_like_value(_to_text_value(value)):
+                row_nonmissing.add(key_text)
+        for key in row_seen:
+            seen_count[key] = seen_count.get(key, 0) + 1
+        for key in row_nonmissing:
+            nonmissing_count[key] = nonmissing_count.get(key, 0) + 1
+
+    all_keys = sorted(seen_count.keys())
+    required = [k for k in all_keys if nonmissing_count.get(k, 0) >= total]
+    optional = [k for k in all_keys if k not in required]
+    return {
+        "required": required,
+        "optional": optional,
+        "sample_size": total,
+        "excluded_system_params": int(excluded_system_params),
+    }
+
+
+def validate_schema_for_event(
+    event_name: str,
+    params: Dict[str, object],
+    schemas: Dict[str, Dict[str, object]],
+) -> Dict[str, object]:
+    schema = schemas.get(str(event_name).strip(), {})
+    required = [str(v).strip() for v in schema.get("required", []) if str(v).strip()] if isinstance(schema, dict) else []
+    optional = [str(v).strip() for v in schema.get("optional", []) if str(v).strip()] if isinstance(schema, dict) else []
+    checks: List[Dict[str, object]] = []
+
+    if not required and not optional:
+        return {
+            "status": "WARN",
+            "message": "기준표 없음(스키마 없음)",
+            "checks": checks,
+        }
+
+    missing_required: List[str] = []
+    for key in required:
+        value = _to_text_value(params.get(key, ""))
+        ok = (key in params) and (not _is_missing_like_value(value))
+        if not ok:
+            missing_required.append(key)
+        checks.append({"param": key, "ok": ok, "value": value or "-", "group": "required"})
+
+    for key in optional:
+        value = _to_text_value(params.get(key, ""))
+        checks.append(
+            {
+                "param": key,
+                "ok": (key in params) and (not _is_missing_like_value(value)),
+                "value": value or "-",
+                "group": "optional",
+            }
+        )
+
+    if missing_required:
+        return {
+            "status": "FAIL",
+            "message": f"필수 누락 {len(missing_required)}개",
+            "checks": checks,
+        }
+    return {
+        "status": "PASS",
+        "message": "필수 파라미터 정상",
+        "checks": checks,
+    }
+
+
+def summarize_schema_validation(rt_events: pd.DataFrame, schemas: Dict[str, Dict[str, object]]) -> Dict[str, int]:
+    out = {"PASS": 0, "WARN": 0, "FAIL": 0}
+    if rt_events.empty:
+        return out
+    for row in rt_events.to_dict("records"):
+        params = row.get("전체 파라미터", {})
+        if not isinstance(params, dict):
+            params = {}
+        status = str(
+            validate_schema_for_event(
+                event_name=str(row.get("이벤트", "")),
+                params=params,
+                schemas=schemas,
+            ).get("status", "WARN")
+        ).upper()
+        if status not in out:
+            status = "WARN"
+        out[status] += 1
+    return out
+
+
+def build_schema_validation_by_event(rt_events: pd.DataFrame, schemas: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    if rt_events.empty:
+        return pd.DataFrame(columns=["event_name", "PASS", "WARN", "FAIL", "total"])
+    rows: List[Dict[str, object]] = []
+    for row in rt_events.to_dict("records"):
+        event_name = str(row.get("이벤트", "")).strip()
+        if not event_name:
+            continue
+        params = row.get("전체 파라미터", {})
+        if not isinstance(params, dict):
+            params = {}
+        status = str(
+            validate_schema_for_event(
+                event_name=event_name,
+                params=params,
+                schemas=schemas,
+            ).get("status", "WARN")
+        ).upper()
+        if status not in {"PASS", "WARN", "FAIL"}:
+            status = "WARN"
+        rows.append({"event_name": event_name, "status": status, "count": 1})
+    if not rows:
+        return pd.DataFrame(columns=["event_name", "PASS", "WARN", "FAIL", "total"])
+    work = pd.DataFrame(rows)
+    pivot = (
+        work.pivot_table(index="event_name", columns="status", values="count", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    for col in ["PASS", "WARN", "FAIL"]:
+        if col not in pivot.columns:
+            pivot[col] = 0
+    pivot["total"] = pivot["PASS"] + pivot["WARN"] + pivot["FAIL"]
+    return pivot[["event_name", "PASS", "WARN", "FAIL", "total"]].sort_values(
+        by=["FAIL", "WARN", "total", "event_name"], ascending=[False, False, False, True]
+    )
+
+
+def build_issue_summary(rt_events: pd.DataFrame, schemas: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    if rt_events.empty:
+        return pd.DataFrame(columns=["event_name", "status", "reason", "count"])
+
+    issue_rows: List[Dict[str, object]] = []
+    for row in rt_events.to_dict("records"):
+        event_name = str(row.get("이벤트", "")).strip()
+        if not event_name:
+            continue
+
+        reasons: List[str] = []
+        event_status = str(row.get("상태", "OK")).upper()
+        if event_status == "ERROR":
+            reasons.append("이벤트 판정 오류(ERROR)")
+        elif event_status == "WARN":
+            reasons.append("이벤트 판정 경고(WARN)")
+
+        missing_group = row.get("값없음 그룹", {})
+        if isinstance(missing_group, dict) and missing_group:
+            reasons.append(f"값 비어있음 {len(missing_group)}개")
+        suspicious_group = row.get("의심 그룹", {})
+        if isinstance(suspicious_group, dict) and suspicious_group:
+            reasons.append(f"항상 동일한 값 {len(suspicious_group)}개")
+
+        params = row.get("전체 파라미터", {})
+        if not isinstance(params, dict):
+            params = {}
+        schema_check = validate_schema_for_event(event_name=event_name, params=params, schemas=schemas)
+        schema_status = str(schema_check.get("status", "WARN")).upper()
+        if schema_status in {"WARN", "FAIL"}:
+            reasons.append(f"스키마: {schema_check.get('message', '-')}")
+
+        if not reasons:
+            continue
+
+        merged_status = "FAIL" if ("FAIL" in {schema_status} or event_status == "ERROR") else "WARN"
+        issue_rows.append(
+            {
+                "event_name": event_name,
+                "status": merged_status,
+                "reason": " | ".join(dict.fromkeys(reasons)),
+                "count": 1,
+            }
+        )
+
+    if not issue_rows:
+        return pd.DataFrame(columns=["event_name", "status", "reason", "count"])
+
+    out = pd.DataFrame(issue_rows)
+    out = (
+        out.groupby(["event_name", "status", "reason"], as_index=False)["count"]
+        .sum()
+        .sort_values(by=["status", "count", "event_name"], ascending=[True, False, True])
+    )
+    return out
+
+
+def build_tracking_plan_df(rt_events: pd.DataFrame, schemas: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    event_counts: Dict[str, int] = {}
+    if not rt_events.empty:
+        for name in rt_events["이벤트"].astype(str).tolist():
+            key = str(name).strip()
+            if not key:
+                continue
+            event_counts[key] = event_counts.get(key, 0) + 1
+
+    all_event_names = sorted(list(dict.fromkeys(list(schemas.keys()) + list(event_counts.keys()))))
+    rows: List[Dict[str, object]] = []
+    for event_name in all_event_names:
+        schema = schemas.get(event_name, {})
+        required = [str(v).strip() for v in schema.get("required", []) if str(v).strip()] if isinstance(schema, dict) else []
+        optional = [str(v).strip() for v in schema.get("optional", []) if str(v).strip()] if isinstance(schema, dict) else []
+        rows.append(
+            {
+                "event_name": event_name,
+                "triggered_count": int(event_counts.get(event_name, 0)),
+                "schema_status": "ready" if (required or optional) else "missing",
+                "required": ", ".join(required),
+                "optional": ", ".join(optional),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df.empty:
+        return b""
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    if not sheets:
+        return b""
+    out = io.BytesIO()
+    try:
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            for sheet_name, df in sheets.items():
+                safe_sheet = str(sheet_name or "Sheet1")[:31]
+                df_to_write = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+                df_to_write.to_excel(writer, index=False, sheet_name=safe_sheet)
+        return out.getvalue()
+    except Exception:
+        return b""
+
+
+def build_event_logs_export_df(rt_events: pd.DataFrame) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    if rt_events.empty:
+        return pd.DataFrame(columns=["timestamp", "event_name", "page_url", "parameter", "value"])
+    for row in rt_events.to_dict("records"):
+        event_name = str(row.get("이벤트", "")).strip()
+        timestamp = str(row.get("시간", "-"))
+        params = row.get("전체 파라미터", {})
+        if not isinstance(params, dict):
+            params = {}
+        page_url = _to_text_value(params.get("page_location", params.get("page_url", "")))
+        if not params:
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "event_name": event_name,
+                    "page_url": page_url,
+                    "parameter": "-",
+                    "value": "-",
+                }
+            )
+            continue
+        for key, value in params.items():
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "event_name": event_name,
+                    "page_url": page_url,
+                    "parameter": str(key),
+                    "value": _to_text_value(value),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_parameter_validation_export_df(rt_events: pd.DataFrame, schemas: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for row in rt_events.to_dict("records"):
+        event_name = str(row.get("이벤트", "")).strip()
+        params = row.get("전체 파라미터", {})
+        if not isinstance(params, dict):
+            params = {}
+        check = validate_schema_for_event(event_name=event_name, params=params, schemas=schemas)
+        schema_required = set()
+        schema_optional = set()
+        schema_obj = schemas.get(event_name, {})
+        if isinstance(schema_obj, dict):
+            schema_required = {str(v).strip() for v in schema_obj.get("required", []) if str(v).strip()}
+            schema_optional = {str(v).strip() for v in schema_obj.get("optional", []) if str(v).strip()}
+        known_schema_params = schema_required | schema_optional
+
+        for item in check.get("checks", []) if isinstance(check.get("checks", []), list) else []:
+            if not isinstance(item, dict):
+                continue
+            param_name = str(item.get("param", "-"))
+            value_text = str(item.get("value", "-"))
+            result = "PASS" if bool(item.get("ok", False)) else "FAIL"
+            issue_type = "required_missing" if (str(item.get("group", "")) == "required" and result == "FAIL") else "schema_check"
+            rows.append(
+                {
+                    "event_name": event_name,
+                    "schema_status": str(check.get("status", "WARN")),
+                    "parameter": param_name,
+                    "group": str(item.get("group", "-")),
+                    "value": value_text,
+                    "result": result,
+                    "severity": "FAIL" if result == "FAIL" else "PASS",
+                    "issue_type": issue_type,
+                    "reason": "필수 누락" if issue_type == "required_missing" else "-",
+                }
+            )
+
+        for key, value in params.items():
+            key_text = str(key).strip()
+            if not key_text or _is_system_param_key(key_text):
+                continue
+            value_text = _to_text_value(value)
+            if known_schema_params and key_text not in known_schema_params:
+                rows.append(
+                    {
+                        "event_name": event_name,
+                        "schema_status": str(check.get("status", "WARN")),
+                        "parameter": key_text,
+                        "group": "extra",
+                        "value": value_text,
+                        "result": "WARN",
+                        "severity": "WARN",
+                        "issue_type": "unexpected_parameter",
+                        "reason": "스키마에 정의되지 않은 파라미터",
+                    }
+                )
+            valid_ok, valid_msg = validate_param_format(key_text, value_text)
+            if not valid_ok:
+                rows.append(
+                    {
+                        "event_name": event_name,
+                        "schema_status": str(check.get("status", "WARN")),
+                        "parameter": key_text,
+                        "group": "format",
+                        "value": value_text,
+                        "result": "FAIL",
+                        "severity": "FAIL",
+                        "issue_type": "type_validation_fail",
+                        "reason": valid_msg,
+                    }
+                )
+    if not rows:
+        return pd.DataFrame(
+            columns=["event_name", "schema_status", "parameter", "group", "value", "result", "severity", "issue_type", "reason"]
+        )
+    return pd.DataFrame(rows)
+
+
+def build_event_order_validation_df(rt_events: pd.DataFrame, expected_steps: List[str]) -> pd.DataFrame:
+    cols = ["timestamp", "event_name", "status", "reason", "expected_prev_step", "actual_step_pointer"]
+    steps = [str(v).strip() for v in expected_steps if str(v).strip()]
+    if rt_events.empty or not steps:
+        return pd.DataFrame(columns=cols)
+
+    work = rt_events.copy()
+    work["captured_at"] = pd.to_datetime(work["captured_at"], errors="coerce")
+    work = work.sort_values("captured_at")
+    step_index = {name: idx for idx, name in enumerate(steps)}
+    pointer = 0
+    rows: List[Dict[str, object]] = []
+
+    for _, row in work.iterrows():
+        event_name = str(row.get("이벤트", "")).strip()
+        if event_name not in step_index:
+            continue
+        idx = step_index[event_name]
+        ts = format_local_time(row.get("captured_at"))
+        if idx < pointer:
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "event_name": event_name,
+                    "status": "WARN",
+                    "reason": "이미 지난 step의 이벤트가 재발생",
+                    "expected_prev_step": steps[pointer - 1] if pointer > 0 else "-",
+                    "actual_step_pointer": pointer,
+                }
+            )
+        elif idx == pointer:
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "event_name": event_name,
+                    "status": "PASS",
+                    "reason": "순서 정상",
+                    "expected_prev_step": steps[pointer - 1] if pointer > 0 else "-",
+                    "actual_step_pointer": pointer,
+                }
+            )
+            pointer += 1
+        else:
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "event_name": event_name,
+                    "status": "FAIL",
+                    "reason": "선행 step 누락 상태에서 발생",
+                    "expected_prev_step": steps[pointer] if pointer < len(steps) else "-",
+                    "actual_step_pointer": pointer,
+                }
+            )
+
+    if pointer < len(steps):
+        rows.append(
+            {
+                "timestamp": "-",
+                "event_name": steps[pointer],
+                "status": "FAIL",
+                "reason": "필수 순서 step 미도달",
+                "expected_prev_step": steps[pointer - 1] if pointer > 0 else "-",
+                "actual_step_pointer": pointer,
+            }
+        )
+    return pd.DataFrame(rows, columns=cols)
+
+
+def build_event_qa_report_export_df(
+    rt_events: pd.DataFrame,
+    issue_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+    parameter_validation_df: pd.DataFrame,
+    order_validation_df: pd.DataFrame,
+) -> pd.DataFrame:
+    qa_by_event = build_schema_validation_by_event(rt_events, schemas)
+    issue_reason_map: Dict[str, str] = {}
+    if not issue_df.empty:
+        for event_name, group in issue_df.groupby("event_name"):
+            reasons = [str(v).strip() for v in group["reason"].tolist() if str(v).strip()]
+            issue_reason_map[str(event_name).strip()] = " | ".join(dict.fromkeys(reasons))
+
+    param_fail_map: Dict[str, int] = {}
+    param_warn_map: Dict[str, int] = {}
+    if not parameter_validation_df.empty:
+        work = parameter_validation_df.copy()
+        work["event_name"] = work["event_name"].astype(str).str.strip()
+        for event_name, group in work.groupby("event_name"):
+            param_fail_map[event_name] = int((group["severity"].astype(str) == "FAIL").sum())
+            param_warn_map[event_name] = int((group["severity"].astype(str) == "WARN").sum())
+
+    order_fail_map: Dict[str, int] = {}
+    order_warn_map: Dict[str, int] = {}
+    if not order_validation_df.empty:
+        owork = order_validation_df.copy()
+        owork["event_name"] = owork["event_name"].astype(str).str.strip()
+        for event_name, group in owork.groupby("event_name"):
+            order_fail_map[event_name] = int((group["status"].astype(str) == "FAIL").sum())
+            order_warn_map[event_name] = int((group["status"].astype(str) == "WARN").sum())
+
+    event_error_map: Dict[str, int] = {}
+    if not rt_events.empty:
+        ework = rt_events.copy()
+        ework["이벤트"] = ework["이벤트"].astype(str).str.strip()
+        for event_name, group in ework.groupby("이벤트"):
+            event_error_map[event_name] = int((group["상태"].astype(str).str.upper() == "ERROR").sum())
+
+    rows: List[Dict[str, object]] = []
+    if qa_by_event.empty:
+        return pd.DataFrame(columns=["event_name", "schema_status", "parameter_issue", "test_count", "result"])
+    for _, row in qa_by_event.iterrows():
+        event_name = str(row.get("event_name", "")).strip()
+        pass_n = int(row.get("PASS", 0))
+        warn_n = int(row.get("WARN", 0))
+        fail_n = int(row.get("FAIL", 0))
+        total = int(row.get("total", 0))
+        param_fail = int(param_fail_map.get(event_name, 0))
+        param_warn = int(param_warn_map.get(event_name, 0))
+        order_fail = int(order_fail_map.get(event_name, 0))
+        order_warn = int(order_warn_map.get(event_name, 0))
+        event_error = int(event_error_map.get(event_name, 0))
+
+        # QA 상태 기준
+        # FAIL: 스키마 FAIL 또는 필수/타입 FAIL 또는 순서 FAIL 또는 이벤트 ERROR
+        # WARN: FAIL이 아니고 스키마 WARN 또는 optional/extra 경고 또는 순서 WARN
+        # PASS: 위 조건이 없을 때
+        if fail_n > 0 or param_fail > 0 or order_fail > 0 or event_error > 0:
+            schema_status = "FAIL"
+        elif warn_n > 0 or param_warn > 0 or order_warn > 0:
+            schema_status = "WARN"
+        else:
+            schema_status = "PASS"
+        parameter_issue_text = issue_reason_map.get(event_name, "-")
+        if parameter_issue_text == "-" and param_fail > 0:
+            parameter_issue_text = f"파라미터 FAIL {param_fail}개"
+        if parameter_issue_text == "-" and param_warn > 0:
+            parameter_issue_text = f"파라미터 WARN {param_warn}개"
+
+        rows.append(
+            {
+                "event_name": event_name,
+                "schema_status": schema_status,
+                "parameter_issue": parameter_issue_text,
+                "test_count": total,
+                "result": schema_status,
+                "pass_count": pass_n,
+                "warn_count": warn_n,
+                "fail_count": fail_n,
+                "parameter_fail_count": param_fail,
+                "parameter_warn_count": param_warn,
+                "order_fail_count": order_fail,
+                "order_warn_count": order_warn,
+                "event_error_count": event_error,
+                "qa_status_criteria": "FAIL=스키마FAIL/필수·타입FAIL/순서FAIL/이벤트ERROR, WARN=스키마WARN/추가파라미터/순서WARN, PASS=그외",
+            }
+        )
+    return pd.DataFrame(rows).sort_values(by=["result", "test_count", "event_name"], ascending=[True, False, True])
+
+
+def _infer_action_object(event_name: str) -> Tuple[str, str]:
+    name = str(event_name).strip().lower()
+    action = name.split("_", 1)[0] if "_" in name else name
+    if action in {"", "gtm.click", "gtm.linkclick"}:
+        action = "click"
+    if "impression" in name:
+        action = "impression"
+    obj = "content"
+    if "button" in name:
+        obj = "button"
+    elif "product" in name:
+        obj = "product"
+    elif "popup" in name:
+        obj = "popup"
+    elif "link" in name:
+        obj = "link"
+    return action or "event", obj
+
+
+def build_tracking_plan_export_df(
+    rt_events: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+    action_map_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    event_names = sorted(list(dict.fromkeys(list(schemas.keys()) + rt_events.get("이벤트", pd.Series(dtype=str)).astype(str).tolist())))
+    action_map: Dict[str, Dict[str, str]] = {}
+    if isinstance(action_map_df, pd.DataFrame) and not action_map_df.empty:
+        norm_map_df = _normalize_action_map_df(action_map_df)
+        for _, map_row in norm_map_df.iterrows():
+            ev = str(map_row.get("event_name", "")).strip()
+            if not ev:
+                continue
+            action_map[ev] = {
+                "action": str(map_row.get("action", "")).strip(),
+                "object": str(map_row.get("object", "")).strip(),
+                "page_id": str(map_row.get("page_id", "")).strip(),
+                "section_name": str(map_row.get("section_name", "")).strip(),
+                "section_index": str(map_row.get("section_index", "")).strip(),
+                "description": str(map_row.get("description", "")).strip(),
+                "object_index": str(map_row.get("object_index", "")).strip(),
+            }
+    event_meta: Dict[str, Dict[str, str]] = {}
+    if not rt_events.empty:
+        for _, row in rt_events.iterrows():
+            ev = str(row.get("이벤트", "")).strip()
+            if not ev:
+                continue
+            params = row.get("전체 파라미터", {})
+            if not isinstance(params, dict):
+                params = {}
+            meta = event_meta.setdefault(ev, {})
+            for key in ["page_id", "section_name", "section_index", "action", "object", "description", "index"]:
+                val = _to_text_value(params.get(key, ""))
+                if val and (key not in meta or not meta[key]):
+                    meta[key] = val
+
+    for event_name in event_names:
+        if not str(event_name).strip():
+            continue
+        schema = schemas.get(str(event_name).strip(), {})
+        required = [str(v).strip() for v in schema.get("required", []) if str(v).strip()] if isinstance(schema, dict) else []
+        optional = [str(v).strip() for v in schema.get("optional", []) if str(v).strip()] if isinstance(schema, dict) else []
+        params = required + [v for v in optional if v not in required]
+        action, obj = _infer_action_object(str(event_name))
+        meta = event_meta.get(str(event_name).strip(), {})
+        map_override = action_map.get(str(event_name).strip(), {})
+        page_id = map_override.get("page_id") or meta.get("page_id", "unknown")
+        section_name = map_override.get("section_name") or meta.get("section_name", "general")
+        section_index = map_override.get("section_index") or meta.get("section_index", "-")
+        action_value = map_override.get("action") or meta.get("action", action)
+        object_value = map_override.get("object") or meta.get("object", obj)
+        description = map_override.get("description") or meta.get("description", "-")
+        object_index = map_override.get("object_index") or meta.get("index", "-")
+        if not params:
+            params = ["-"]
+        for p in params:
+            rows.append(
+                {
+                    "page_id": page_id,
+                    "section_name": section_name,
+                    "section_index": section_index,
+                    "action": action_value,
+                    "object": object_value,
+                    "event_name": str(event_name).strip(),
+                    "description": description,
+                    "object_index": object_index,
+                    "parameter": p,
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "page_id",
+                "section_name",
+                "section_index",
+                "action",
+                "object",
+                "event_name",
+                "description",
+                "object_index",
+                "parameter",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def build_screen_definition_export_df(tracking_plan_df: pd.DataFrame) -> pd.DataFrame:
+    if tracking_plan_df.empty:
+        return pd.DataFrame(columns=["section_index", "section_name", "UI_type", "event"])
+    unique_sections = (
+        tracking_plan_df[["section_index", "section_name", "object", "event_name"]]
+        .drop_duplicates()
+        .fillna("-")
+    )
+    rows: List[Dict[str, object]] = []
+    for idx, row in unique_sections.reset_index(drop=True).iterrows():
+        event_name = str(row.get("event_name", "")).strip()
+        action, obj = _infer_action_object(event_name)
+        sec_idx = str(row.get("section_index", "")).strip() or str(idx + 1)
+        sec_name = str(row.get("section_name", "")).strip() or f"section_{idx+1}"
+        ui_type = str(row.get("object", "")).strip() or obj
+        rows.append(
+            {
+                "section_index": sec_idx,
+                "section_name": sec_name,
+                "UI_type": ui_type,
+                "event": event_name,
+                "action": action,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_screen_marked_png_bytes(screen_definition_df: pd.DataFrame) -> bytes:
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return b""
+
+    width, height = 1280, 720
+    image = Image.new("RGB", (width, height), color=(248, 250, 252))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([20, 20, width - 20, 90], outline=(30, 64, 175), width=3)
+    draw.text((40, 45), "Screen Marked Preview (QA)", fill=(30, 64, 175))
+
+    rows = screen_definition_df.to_dict("records")[:8] if not screen_definition_df.empty else []
+    top = 130
+    box_h = 64
+    circle_r = 18
+    for idx, row in enumerate(rows, start=1):
+        y1 = top + (idx - 1) * (box_h + 14)
+        y2 = y1 + box_h
+        draw.rectangle([80, y1, width - 40, y2], outline=(220, 38, 38), width=3)
+        cx, cy = 54, y1 + int(box_h / 2)
+        draw.ellipse([cx - circle_r, cy - circle_r, cx + circle_r, cy + circle_r], fill=(30, 64, 175), outline=(30, 64, 175), width=2)
+        draw.text((cx - 6, cy - 10), str(idx), fill=(255, 255, 255))
+        marker = to_circled_number(idx)
+        label = f"{marker} {row.get('section_name', '-')} | event: {row.get('event', '-')}"
+        draw.text((96, y1 + 20), label, fill=(17, 24, 39))
+
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def build_tracking_package_zip_bytes(
+    tracking_plan_xlsx: bytes,
+    screen_definition_xlsx: bytes,
+    screen_marked_png: bytes,
+    qa_report_xlsx: bytes,
+) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if tracking_plan_xlsx:
+            zf.writestr("tracking_plan.xlsx", tracking_plan_xlsx)
+        if screen_definition_xlsx:
+            zf.writestr("screen_definition.xlsx", screen_definition_xlsx)
+        if screen_marked_png:
+            zf.writestr("screen_marked.png", screen_marked_png)
+        if qa_report_xlsx:
+            zf.writestr("qa_report.xlsx", qa_report_xlsx)
+    return out.getvalue()
 
 
 def load_dotenv_values(dotenv_path: Path | None = None) -> Dict[str, str]:
@@ -217,7 +1320,8 @@ def log_ui_action(action_type: str, detail: Dict[str, object] | None = None) -> 
     if not action:
         return
     try:
-        init_test_log_db(TEST_LOG_DB_PATH)
+        active_db_path = get_active_test_log_db_path()
+        init_test_log_db(active_db_path)
         headers = _get_request_headers()
         actor_name = str(
             st.session_state.get("qa_access_user", "")
@@ -225,7 +1329,7 @@ def log_ui_action(action_type: str, detail: Dict[str, object] | None = None) -> 
             or "-"
         ).strip()
         append_ui_action(
-            TEST_LOG_DB_PATH,
+            active_db_path,
             {
                 "action_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
                 "session_id": str(st.session_state.get("qa_debug_session_id", "")).strip(),
@@ -431,9 +1535,15 @@ def _load_google_client_config(client_secrets_file: str) -> Dict[str, str]:
         if sec_client_id and sec_client_secret:
             redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", "").strip()
             sec_redirect_uri = str(auth_conf.get("redirect_uri", "")).strip() if hasattr(auth_conf, "get") else ""
+            dynamic_redirect_uri = ""
+            if is_truthy(get_config_value("GA4_OAUTH_DYNAMIC_REDIRECT", "0")):
+                current_base = get_current_app_base_url()
+                if current_base:
+                    dynamic_redirect_uri = f"{current_base}/oauth2callback"
             redirect_uri = (
                 redirect_uri_override
                 or sec_redirect_uri
+                or dynamic_redirect_uri
                 or DEFAULT_OAUTH_REDIRECT_URI
             )
             auth_uri = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -473,7 +1583,12 @@ def _load_google_client_config(client_secrets_file: str) -> Dict[str, str]:
         raise RuntimeError("client_secret.json 형식이 올바르지 않습니다. web/installed 설정이 필요합니다.")
 
     redirect_uris = [str(u).strip() for u in (base.get("redirect_uris") or []) if str(u).strip()]
-    redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", DEFAULT_OAUTH_REDIRECT_URI).strip()
+    dynamic_redirect_uri = ""
+    if is_truthy(get_config_value("GA4_OAUTH_DYNAMIC_REDIRECT", "0")):
+        current_base = get_current_app_base_url()
+        if current_base:
+            dynamic_redirect_uri = f"{current_base}/oauth2callback"
+    redirect_uri_override = get_config_value("GA4_OAUTH_REDIRECT_URI", "").strip()
 
     def _is_local_redirect(uri_text: str) -> bool:
         try:
@@ -484,11 +1599,13 @@ def _load_google_client_config(client_secrets_file: str) -> Dict[str, str]:
 
     if redirect_uri_override:
         redirect_uri = redirect_uri_override
+    elif dynamic_redirect_uri:
+        redirect_uri = dynamic_redirect_uri
     else:
         https_non_local = [
             u for u in redirect_uris if u.lower().startswith("https://") and not _is_local_redirect(u)
         ]
-        redirect_uri = https_non_local[0] if https_non_local else (redirect_uris[0] if redirect_uris else "")
+        redirect_uri = https_non_local[0] if https_non_local else (redirect_uris[0] if redirect_uris else DEFAULT_OAUTH_REDIRECT_URI)
     if not redirect_uri:
         raise RuntimeError("client_secret.json에 redirect_uris가 없습니다.")
 
@@ -519,6 +1636,11 @@ def build_google_oauth_url(client_secrets_file: str, state: str) -> str:
         }
     )
     return f"{conf['auth_uri']}?{query}"
+
+
+def get_google_oauth_redirect_uri(client_secrets_file: str) -> str:
+    conf = _load_google_client_config(client_secrets_file)
+    return str(conf.get("redirect_uri", "")).strip()
 
 
 def exchange_google_oauth_code(
@@ -626,11 +1748,35 @@ def process_google_oauth_callback_if_present() -> None:
             code=code,
             token_file=token_file,
         )
+        resume_state = state or expected_state
+        oauth_ctx = pop_oauth_context(resume_state)
+        restore_keys = [
+            "qa_project_slug",
+            "qa_project_domain",
+            "qa_debug_session_id",
+            "qa_debug_output_file",
+            "qa_debug_started_at",
+            "qa_debug_target_url",
+            "qa_tester_name",
+            "qa_tester_note",
+            "required_event_text_input",
+            "unknown_event_policy",
+            "qa_report_property_id",
+        ]
+        for key in restore_keys:
+            if key in oauth_ctx:
+                st.session_state[key] = oauth_ctx.get(key)
+        if str(st.session_state.get("qa_debug_session_id", "")).strip():
+            st.session_state["qa_oauth_resume_notice"] = (
+                "Google 로그인 후 기존 실시간 QA 세션을 복원했습니다. "
+                "실시간 데이터 새로고침으로 이어서 확인하세요."
+            )
         log_ui_action("oauth_callback_success")
         st.session_state["qa_oauth_notice"] = f"Google 로그인 완료. 토큰 저장: {token_file}"
         st.session_state["qa_oauth_error"] = ""
         st.session_state["qa_oauth_auth_url"] = ""
         st.session_state["qa_oauth_state"] = ""
+        st.session_state["qa_ui_focus_after_oauth"] = "report"
     except Exception as exc:
         log_ui_action("oauth_callback_error", {"error": str(exc)})
         st.session_state["qa_oauth_error"] = to_user_error_message(exc)
@@ -1665,6 +2811,7 @@ def resolve_debug_output_file(
 
     sid = str(session_id or "").strip()
     if sid:
+        candidates.append(get_active_project_paths()["qa_sessions_dir"] / sid / "debug_stream.jsonl")
         candidates.append(Path(f"data/debug_stream/{sid}.jsonl"))
 
     for cand in candidates:
@@ -1919,6 +3066,22 @@ if "qa_access_user" not in st.session_state:
     st.session_state["qa_access_user"] = ""
 if "qa_oauth_go_now_url" not in st.session_state:
     st.session_state["qa_oauth_go_now_url"] = ""
+if "qa_oauth_resume_notice" not in st.session_state:
+    st.session_state["qa_oauth_resume_notice"] = ""
+if "qa_ui_focus_after_oauth" not in st.session_state:
+    st.session_state["qa_ui_focus_after_oauth"] = ""
+if "qa_project_slug" not in st.session_state:
+    st.session_state["qa_project_slug"] = DEFAULT_PROJECT_SLUG
+if "qa_project_domain" not in st.session_state:
+    st.session_state["qa_project_domain"] = ""
+if "qa_new_project_name" not in st.session_state:
+    st.session_state["qa_new_project_name"] = ""
+if "qa_new_project_domain" not in st.session_state:
+    st.session_state["qa_new_project_domain"] = ""
+if "qa_project_notice" not in st.session_state:
+    st.session_state["qa_project_notice"] = ""
+
+ensure_project_structure(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
 
 enforce_access_gate()
 
@@ -1964,6 +3127,87 @@ with st.sidebar:
         st.session_state["qa_access_role"] = "guest"
         st.session_state["qa_access_user"] = ""
         st.rerun()
+    with st.expander("0) Workspace / Project", expanded=True):
+        project_notice = str(st.session_state.get("qa_project_notice", "")).strip()
+        if project_notice:
+            st.info(project_notice)
+            st.session_state["qa_project_notice"] = ""
+        project_options = list_workspace_projects()
+        current_project = _slugify_project_name(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
+        if current_project not in project_options:
+            project_options = sorted(list(dict.fromkeys(project_options + [current_project])))
+        selected_project = st.selectbox(
+            "Project",
+            options=project_options,
+            index=project_options.index(current_project) if current_project in project_options else 0,
+            key="qa_project_slug_selectbox",
+        )
+        st.session_state["qa_project_slug"] = _slugify_project_name(selected_project)
+        st.text_input(
+            "Project Domain",
+            value=st.session_state.get("qa_project_domain", ""),
+            key="qa_project_domain",
+            placeholder="예: datanugget.io",
+        )
+        p1, p2 = st.columns(2)
+        with p1:
+            st.text_input("새 Project", key="qa_new_project_name", placeholder="예: musinsa")
+        with p2:
+            st.text_input("도메인", key="qa_new_project_domain", placeholder="예: musinsa.com")
+        if st.button("Project 생성", key="qa_create_project_btn"):
+            new_name = str(st.session_state.get("qa_new_project_name", "")).strip()
+            if not new_name:
+                st.session_state["qa_project_notice"] = "새 Project 이름을 먼저 입력하세요."
+                st.rerun()
+            new_slug = _slugify_project_name(new_name)
+            ensure_project_structure(new_slug)
+            existed = new_slug in project_options
+            st.session_state["qa_project_slug"] = new_slug
+            if existed:
+                st.session_state["qa_project_notice"] = f"이미 존재하는 Project를 선택했습니다: {new_slug}"
+            else:
+                st.session_state["qa_project_notice"] = f"Project 생성 완료: {new_slug}"
+            st.rerun()
+        if st.button("이전 테스트 데이터 가져오기", key="qa_import_legacy_btn"):
+            import_counts = import_legacy_data_to_project(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
+            st.success(
+                "가져오기 완료 | "
+                f"session {import_counts['sessions']}개, "
+                f"event {import_counts['events']}개, "
+                f"ui_action {import_counts['actions']}개, "
+                f"stream {import_counts['streams']}개, "
+                f"schema {import_counts['schemas']}개"
+            )
+            st.rerun()
+        project_paths = get_active_project_paths()
+        st.caption(f"Workspace 경로: {project_paths['project_root']}")
+        sess_df = pd.DataFrame()
+        try:
+            sess_df = list_recent_sessions(get_active_test_log_db_path(), limit=10)
+            if sess_df.empty:
+                st.caption("QA Sessions: 없음")
+            else:
+                st.caption(f"QA Sessions: 최근 {len(sess_df)}개")
+                st.dataframe(sess_df[["session_id", "status", "captured_events"]], use_container_width=True, height=180)
+        except Exception:
+            st.caption("QA Sessions 목록을 불러오지 못했습니다.")
+        if not sess_df.empty:
+            load_options = sess_df["session_id"].astype(str).tolist()
+            load_sid = st.selectbox("불러올 QA Session", options=load_options, key="qa_load_session_id")
+            if st.button("선택 세션 불러오기", key="qa_load_session_btn"):
+                sid = str(load_sid).strip()
+                snap = get_session(get_active_test_log_db_path(), sid)
+                output_file = project_paths["qa_sessions_dir"] / sid / "debug_stream.jsonl"
+                if not output_file.exists():
+                    fallback = Path(f"data/debug_stream/{sid}.jsonl")
+                    if fallback.exists():
+                        output_file = fallback
+                st.session_state["qa_debug_session_id"] = sid
+                st.session_state["qa_debug_output_file"] = str(output_file)
+                st.session_state["qa_debug_started_at"] = str(snap.get("started_at", "")).strip()
+                st.success(f"세션 불러오기 완료: {sid}")
+                st.rerun()
+
     with st.expander("1) 데이터 소스/연결", expanded=True):
         st.markdown("**Playwright 네트워크 인터셉트 + QA 리포트 API 참조 모드**")
         st.caption("확장/스니펫 없이 Playwright request hook으로 collect 히트를 수집합니다.")
@@ -1990,6 +3234,7 @@ with st.sidebar:
             placeholder="예: https://datanugget.io/",
         )
         st.caption("디버깅 모드 시작 시 Playwright 테스트 브라우저가 열리고 collect 히트를 감시합니다.")
+        st.caption(f"현재 Project: {get_active_project_slug()} (Session 단위 저장)")
         novnc_popup_url = get_novnc_popup_url()
         if st.session_state.get("qa_access_role", "guest") == "admin":
             st.caption(f"원격 디버그 팝업 URL: {novnc_popup_url}")
@@ -2010,9 +3255,9 @@ with st.sidebar:
         )
         dc1, dc2 = st.columns(2)
         with dc1:
-            realtime_debug_start_clicked = st.button("디버깅 모드 시작", type="primary")
+            realtime_debug_start_clicked = st.button("Start QA Session", type="primary")
         with dc2:
-            realtime_debug_stop_clicked = st.button("디버깅 모드 종료")
+            realtime_debug_stop_clicked = st.button("QA Session 종료")
 
         active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
         debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
@@ -2090,6 +3335,11 @@ with st.sidebar:
 
 st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서 실행합니다.")
 
+resume_notice = str(st.session_state.get("qa_oauth_resume_notice", "")).strip()
+if resume_notice:
+    st.info(resume_notice)
+    st.session_state["qa_oauth_resume_notice"] = ""
+
 if realtime_debug_start_clicked:
     try:
         normalized_target_url = normalize_debug_target_url(st.session_state.get("qa_debug_target_url", ""))
@@ -2105,14 +3355,16 @@ if realtime_debug_start_clicked:
         if previous_sid:
             stop_debug_session(previous_sid)
         debug_session_id = f"dbg_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid4().hex[:8]}"
-        debug_file = Path(f"data/debug_stream/{debug_session_id}.jsonl")
+        active_paths = get_active_project_paths()
+        debug_file = active_paths["qa_sessions_dir"] / debug_session_id / "debug_stream.jsonl"
+        debug_file.parent.mkdir(parents=True, exist_ok=True)
         snapshot = start_debug_session(
             session_id=debug_session_id,
             target_url=normalized_target_url,
             output_file=debug_file,
             tester_name=st.session_state.get("qa_tester_name", "").strip(),
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
-            db_path=TEST_LOG_DB_PATH,
+            db_path=get_active_test_log_db_path(),
             launch_browser=True,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
@@ -2143,8 +3395,17 @@ if realtime_debug_stop_clicked:
     else:
         st.info("종료할 디버깅 세션이 없습니다.")
 
-realtime_tab, report_tab = st.tabs(["1단: 실시간 테스트 화면", "2단: QA 리포트 화면"])
+realtime_tab, report_tab, schema_tab = st.tabs(
+    ["1단: 실시간 테스트 화면", "2단: QA 리포트 화면", "3단: 이벤트 기준표 탭"]
+)
 with realtime_tab:
+    st.markdown("### QA Workflow")
+    wf1, wf2, wf3, wf4 = st.columns(4)
+    wf1.info("1. Test Events\n사이트 클릭으로 이벤트 발생")
+    wf2.info("2. Define Rules\n이벤트별 필수/선택 규칙 정의")
+    wf3.info("3. Validate Events\npayload와 기준표 비교")
+    wf4.info("4. Confirm Rules\n수정 후 다시 클릭해 재검증")
+
     active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
     debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
     resolved_output_path = resolve_debug_output_file(
@@ -2173,11 +3434,16 @@ with realtime_tab:
         log_ui_action("realtime_manual_refresh")
         st.rerun()
 
-    if not debug_snapshot and not recovered_from_file:
-        st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
-    else:
+    sid_for_view = "-"
+    status_for_view = "-"
+    captured_for_view = 0
+    timeline_df = pd.DataFrame()
+    rt_events = pd.DataFrame()
+    st.session_state["schema_rt_events_cache"] = []
+
+    if debug_snapshot or recovered_from_file:
         if recovered_from_file:
-            st.warning("세션 객체가 없어 파일 기준으로 복구 표시합니다. (상태: recovered(file))")
+            st.info("세션 객체는 없지만 파일 기준으로 이어서 표시 중입니다. (상태: recovered(file))")
         debug_output_file = str(resolved_output_path) if resolved_output_path else ""
         timeline_df_raw = load_debug_events(Path(debug_output_file), limit=3000) if debug_output_file else pd.DataFrame()
         session_started_at = (
@@ -2200,205 +3466,346 @@ with realtime_tab:
         captured_from_snapshot = int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else 0
         captured_from_file = int(len(timeline_df))
         captured_for_view = max(captured_from_snapshot, captured_from_file)
-        st.caption(
-            f"세션: {sid_for_view} | "
-            f"상태: {status_for_view} | "
-            f"캡처: {captured_for_view}건"
-        )
-        allowed_events_rt = parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
+    else:
+        st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
 
-        st.subheader("실시간 이벤트 리스트")
+    allowed_events_rt = parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
+    if not timeline_df.empty:
         rt_events = build_realtime_event_rows(
             timeline_df,
             allowed_events=allowed_events_rt,
             unknown_event_policy=st.session_state.get("unknown_event_policy", "정보"),
         )
+    if not rt_events.empty:
+        st.session_state["schema_rt_events_cache"] = rt_events.to_dict("records")
+
+    schema_store = load_event_schemas()
+    issue_df = build_issue_summary(rt_events, schema_store)
+    tracking_plan_df = build_tracking_plan_df(rt_events, schema_store)
+    schema_summary = summarize_schema_validation(rt_events, schema_store)
+    rt_summary = summarize_realtime_quality(rt_events)
+    parameter_validation_df_all = build_parameter_validation_export_df(rt_events, schema_store)
+    order_validation_df_all = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
+
+    event_names_seen = (
+        sorted(rt_events["이벤트"].astype(str).str.strip().unique().tolist()) if not rt_events.empty else []
+    )
+    missing_schema_count = 0
+    for ev in event_names_seen:
+        schema_obj = schema_store.get(ev, {})
+        has_schema = isinstance(schema_obj, dict) and bool(schema_obj.get("required", []) or schema_obj.get("optional", []))
+        if not has_schema:
+            missing_schema_count += 1
+    missing_parameter_count = 0
+    if not parameter_validation_df_all.empty:
+        pwork = parameter_validation_df_all.copy()
+        pwork["issue_type"] = pwork["issue_type"].astype(str)
+        pwork["severity"] = pwork["severity"].astype(str)
+        missing_parameter_count = int(
+            (
+                (pwork["severity"] == "FAIL")
+                & (pwork["issue_type"].isin(["required_missing", "type_validation_fail"]))
+            ).sum()
+        )
+    flow_issue_count = 0
+    if not order_validation_df_all.empty:
+        owork = order_validation_df_all.copy()
+        owork["status"] = owork["status"].astype(str)
+        flow_issue_count = int((owork["status"].isin(["FAIL", "WARN"])).sum())
+
+    section_overview, section_issues, section_detail, section_export = st.tabs(
+        ["1. QA Overview", "2. Issues (문제 이벤트)", "3. Event Detail", "4. Export / Tracking Plan"]
+    )
+
+    with section_overview:
+        st.caption(
+            f"세션: {sid_for_view} | 상태: {status_for_view} | 캡처: {captured_for_view}건 | 시간대: {DISPLAY_TZ_NAME}"
+        )
         if rt_events.empty:
             st.info("아직 캡처된 이벤트가 없습니다.")
         else:
-            st.subheader("실시간 결과 요약")
-            rt_summary = summarize_realtime_quality(rt_events)
-            m1, m2, m3, m4, m5 = st.columns(5)
+            st.subheader("QA Summary")
+            m0, m1, m2, m3, m4, m5 = st.columns(6)
+            m0.metric("Events captured", int(captured_for_view))
             m1.metric("실시간 품질 점수", f"{rt_summary['score']} / 100")
             m2.metric("🔴 치명 오류", int(rt_summary["critical"]))
             m3.metric("🟡 주의 필요", int(rt_summary["caution"]))
             m4.metric("⚪ 참고 정보", int(rt_summary["info"]))
             m5.metric("🟢 정상", int(rt_summary["ok"]))
             st.caption(
+                f"기준표 QA 상태 | PASS {schema_summary['PASS']} · WARN {schema_summary['WARN']} · FAIL {schema_summary['FAIL']}"
+            )
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Missing schema", int(missing_schema_count))
+            q2.metric("Missing parameter", int(missing_parameter_count))
+            q3.metric("Flow issues", int(flow_issue_count))
+            st.caption(
                 f"대상 이벤트 {rt_summary['event_count']}건 기준 | {rt_summary['message']}"
             )
 
-            suspicious_profile = build_suspicious_param_profile(timeline_df)
-            if suspicious_profile:
-                with st.expander(f"의심 값 그룹 요약 ({len(suspicious_profile)}개 파라미터)", expanded=False):
-                    suspicious_rows = [
-                        {"파라미터": k, "의심 사유": v}
-                        for k, v in suspicious_profile.items()
-                    ]
-                    st.dataframe(pd.DataFrame(suspicious_rows), use_container_width=True, height=180)
+            quick_cols = ["시간", "이벤트", "대표 파라미터", "대표 값", "상태"]
+            st.dataframe(rt_events[quick_cols].head(30), use_container_width=True, height=320)
 
-            st.caption(
-                "이벤트당 대표 파라미터 1개만 기본 표시됩니다. "
-                "나머지는 4개 그룹(정상/값없음/의심/시스템-고급)으로 확인하세요."
+    with section_issues:
+        st.caption("문제가 있는 이벤트를 확인하고 여기서 바로 이벤트 기준표를 만들 수 있습니다.")
+        if issue_df.empty:
+            st.success("현재 문제 이벤트가 없습니다.")
+        else:
+            issue_event_names = sorted(issue_df["event_name"].astype(str).unique().tolist())
+            st.markdown("**이벤트 기준표 만들기 (문제 이벤트 기준)**")
+            include_system_params_for_schema = st.checkbox(
+                "기술 파라미터까지 포함해서 기준표 만들기",
+                value=False,
+                key="issue_include_system_params",
+                help="기본은 measurement_id/client_id 같은 시스템 파라미터를 제외합니다.",
             )
-            session_groups = rt_events.groupby("group_session_id", sort=False)
-            for session_key, session_df in session_groups:
-                session_df = session_df.copy()
-                session_df["captured_at"] = pd.to_datetime(session_df["captured_at"], errors="coerce")
-                session_df = session_df.sort_values("captured_at", ascending=False)
-                session_start = format_local_time(session_df["captured_at"].min())
-                session_end = format_local_time(session_df["captured_at"].max())
-                with st.expander(
-                    f"세션 {session_key} · 이벤트 {len(session_df)}건 · {session_start} ~ {session_end}",
-                    expanded=True,
-                ):
-                    for idx, row_ev in enumerate(session_df.to_dict("records")):
-                        conclusion = summarize_event_conclusion(row_ev)
-                        st.markdown(
-                            "\n".join(
-                                [
-                                    f"**✅ {row_ev.get('이벤트', '-') or '-'} 이벤트 결과**",
-                                    "",
-                                    f"🔴 치명 오류: {conclusion['critical']}개",
-                                    f"🟡 주의 필요: {conclusion['caution']}개",
-                                    f"⚪ 참고 정보: {conclusion['info']}개",
-                                    f"🟢 정상: {conclusion['ok']}개",
-                                    "",
-                                    f"👉 {conclusion['message']}",
-                                ]
-                            )
+            selected_issue_events = st.multiselect(
+                "기준표 생성 대상 이벤트",
+                options=issue_event_names,
+                default=issue_event_names,
+                key="issue_schema_targets",
+            )
+            ia1, ia2 = st.columns([1.2, 1.2])
+            with ia1:
+                if st.button("선택 이벤트 기준표 생성", key="issue_generate_selected"):
+                    generated = 0
+                    total_excluded = 0
+                    for event_name in selected_issue_events:
+                        inferred = infer_event_schema_from_rows(
+                            rt_events,
+                            event_name,
+                            include_system_params=include_system_params_for_schema,
                         )
-                        status_text = str(row_ev.get("상태", "OK"))
-                        status_view = {"OK": "정상", "WARN": "주의", "ERROR": "오류", "INFO": "참고"}.get(status_text, status_text)
-                        c1, c2, c3, c4 = st.columns([1.2, 1.6, 4.0, 1.0])
-                        c1.markdown(f"`{row_ev.get('시간', '-')}`")
-                        c2.markdown(f"**{row_ev.get('이벤트', '-') or '-'}**")
-                        primary_key = str(row_ev.get("대표 파라미터", "-"))
-                        primary_val = str(row_ev.get("대표 값", "-"))
-                        c3.markdown(f"`{primary_key}` = `{primary_val}`")
-                        c4.markdown(f"`{status_view}`")
+                        if int(inferred.get("sample_size", 0)) <= 0:
+                            continue
+                        schema_store[event_name] = {
+                            "required": list(inferred.get("required", [])),
+                            "optional": list(inferred.get("optional", [])),
+                            "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                        }
+                        generated += 1
+                        total_excluded += int(inferred.get("excluded_system_params", 0))
+                    save_event_schemas(schema_store)
+                    st.success(f"선택 이벤트 기준표 {generated}개 생성 완료")
+                    if not include_system_params_for_schema:
+                        st.info(f"시스템/기술 파라미터 제외: {total_excluded}건")
+                    st.rerun()
+            with ia2:
+                if st.button("문제 이벤트 전체 기준표 생성", key="issue_generate_all"):
+                    generated = 0
+                    total_excluded = 0
+                    for event_name in issue_event_names:
+                        inferred = infer_event_schema_from_rows(
+                            rt_events,
+                            event_name,
+                            include_system_params=include_system_params_for_schema,
+                        )
+                        if int(inferred.get("sample_size", 0)) <= 0:
+                            continue
+                        schema_store[event_name] = {
+                            "required": list(inferred.get("required", [])),
+                            "optional": list(inferred.get("optional", [])),
+                            "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                        }
+                        generated += 1
+                        total_excluded += int(inferred.get("excluded_system_params", 0))
+                    save_event_schemas(schema_store)
+                    st.success(f"문제 이벤트 전체 기준표 {generated}개 생성 완료")
+                    if not include_system_params_for_schema:
+                        st.info(f"시스템/기술 파라미터 제외: {total_excluded}건")
+                    st.rerun()
 
-                        all_params = row_ev.get("전체 파라미터", {})
-                        if isinstance(all_params, dict) and all_params:
-                            with st.expander(f"전체 파라미터 ({len(all_params)}개)", expanded=False):
-                                all_rows = [{"파라미터": str(k), "값": _to_text_value(v)} for k, v in all_params.items()]
-                                st.table(pd.DataFrame(all_rows))
-
-                        normal_group = row_ev.get("정상 그룹", {})
-                        if isinstance(normal_group, dict) and normal_group:
-                            with st.expander(
-                                f"✅ 정상 작동 중인 파라미터 ({len(normal_group)}개)",
-                                expanded=False,
-                            ):
-                                normal_rows = [
-                                    {"파라미터": k, "값": v.get("값", "-"), "검증": v.get("사유", "-")}
-                                    for k, v in normal_group.items()
-                                ]
-                                st.table(pd.DataFrame(normal_rows))
-
-                        missing_group = row_ev.get("값없음 그룹", {})
-                        if isinstance(missing_group, dict) and missing_group:
-                            with st.expander(
-                                f"⚠ 값이 비어있음 (확인 필요) ({len(missing_group)}개)",
-                                expanded=False,
-                            ):
-                                missing_rows = [
-                                    {"파라미터": k, "값": v.get("값", "-"), "사유": v.get("사유", "-")}
-                                    for k, v in missing_group.items()
-                                ]
-                                st.table(pd.DataFrame(missing_rows))
-
-                        suspicious_group = row_ev.get("의심 그룹", {})
-                        if isinstance(suspicious_group, dict) and suspicious_group:
-                            with st.expander(
-                                f"🤔 항상 동일한 값 (불필요 가능성) ({len(suspicious_group)}개)",
-                                expanded=False,
-                            ):
-                                suspicious_rows = [
-                                    {"파라미터": k, "값": v.get("값", "-"), "의심 사유": v.get("사유", "-")}
-                                    for k, v in suspicious_group.items()
-                                ]
-                                st.table(pd.DataFrame(suspicious_rows))
-
-                        system_group = row_ev.get("시스템 그룹", {})
-                        if isinstance(system_group, dict) and system_group:
-                            with st.expander(
-                                f"⚙ 분석과 무관 (숨김 권장, 고급 보기) ({len(system_group)}개)",
-                                expanded=False,
-                            ):
-                                system_rows = [
-                                    {"파라미터": k, "값": v.get("값", "-"), "분류": v.get("사유", "-")}
-                                    for k, v in system_group.items()
-                                ]
-                                st.table(pd.DataFrame(system_rows))
-                        if idx < len(session_df) - 1:
-                            st.divider()
-
-            export_format = st.radio(
-                "테스트 데이터 다운로드 형식",
-                options=["CSV", "Excel"],
-                horizontal=True,
-                key="realtime_export_format",
+            st.dataframe(issue_df, use_container_width=True, height=320)
+            st.markdown("**기준표 비교 QA 결과 (이벤트별)**")
+            issue_param_validation = build_parameter_validation_export_df(rt_events, schema_store)
+            issue_order_validation = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
+            event_schema_qa = build_event_qa_report_export_df(
+                rt_events=rt_events,
+                issue_df=issue_df,
+                schemas=schema_store,
+                parameter_validation_df=issue_param_validation,
+                order_validation_df=issue_order_validation,
             )
-            rt_csv_bytes = realtime_events_to_csv_bytes(rt_events)
-            rt_excel_bytes = realtime_events_to_excel_bytes(rt_events) if export_format == "Excel" else b""
-            export_data = rt_excel_bytes if export_format == "Excel" else rt_csv_bytes
-            export_file = (
-                build_report_filename("realtime_event_list_full", "xlsx")
-                if export_format == "Excel"
-                else build_report_filename("realtime_event_list_full", "csv")
-            )
-            export_mime = (
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                if export_format == "Excel"
-                else "text/csv"
-            )
-            if export_format == "Excel" and not export_data:
-                st.caption("Excel 내보내기 엔진이 없으면 CSV를 사용하세요.")
-            st.download_button(
-                "테스트 데이터 전체 다운로드",
-                data=export_data,
-                file_name=export_file,
-                mime=export_mime,
-                disabled=not bool(export_data),
-            )
-
-        st.subheader("퍼널 진행 상태")
-        realtime_steps = parse_csv_list(funnel_text)
-        if not realtime_steps:
-            st.info("퍼널 시퀀스가 비어 있습니다. 사이드바 QA 설정에서 퍼널 step을 입력하세요.")
-        else:
-            rt_funnel = build_realtime_funnel_progress(timeline_df, realtime_steps)
-            if rt_funnel.empty:
-                st.info("퍼널 진행 상태를 계산할 수 있는 이벤트가 아직 없습니다.")
+            if event_schema_qa.empty:
+                st.info("비교할 데이터가 없습니다.")
             else:
-                st.dataframe(rt_funnel, use_container_width=True, height=220)
+                show_cols = [
+                    "event_name",
+                    "schema_status",
+                    "parameter_issue",
+                    "test_count",
+                    "parameter_fail_count",
+                    "parameter_warn_count",
+                    "order_fail_count",
+                    "order_warn_count",
+                ]
+                keep_cols = [c for c in show_cols if c in event_schema_qa.columns]
+                st.dataframe(event_schema_qa[keep_cols], use_container_width=True, height=240)
 
-        st.subheader("브라우저 전송 직전 오류")
-        rt_timeline = build_realtime_timeline_view(
-            timeline_df,
-            allowed_events=allowed_events_rt,
-            unknown_event_policy=st.session_state.get("unknown_event_policy", "정보"),
-        )
-        rt_issues = rt_timeline[rt_timeline["상태"].isin(["WARN", "ERROR"])] if not rt_timeline.empty else rt_timeline
-        if rt_issues.empty:
-            st.success("전송 직전 오류(WARN/ERROR)가 없습니다.")
+    with section_detail:
+        st.caption("이벤트를 선택해 payload 확인 → schema 검증 순서로 점검하세요.")
+        if rt_events.empty:
+            st.info("확인할 이벤트가 없습니다.")
         else:
-            st.dataframe(style_realtime_timeline(rt_issues.head(200)), use_container_width=True, height=260)
+            event_names = sorted(rt_events["이벤트"].astype(str).unique().tolist())
+            selected_event_name = st.selectbox("이벤트 선택", options=event_names, key="detail_event_name")
+            event_rows = rt_events[rt_events["이벤트"].astype(str) == selected_event_name].copy()
+            event_rows["captured_at"] = pd.to_datetime(event_rows["captured_at"], errors="coerce")
+            event_rows = event_rows.sort_values("captured_at", ascending=False).reset_index(drop=True)
+            option_labels = [
+                f"{to_circled_number(idx + 1)} {selected_event_name} | {row.get('시간', '-')} | {row.get('상태', '-')}"
+                for idx, row in event_rows.iterrows()
+            ]
+            selected_option = st.selectbox("발생 건 선택", options=option_labels, key="detail_event_occurrence")
+            selected_idx = option_labels.index(selected_option)
+            row_ev = event_rows.iloc[selected_idx].to_dict()
 
-        if (
-            st.session_state.get("realtime_panel_auto_refresh", False)
-            and status_for_view in {"running", "stopping", "recovered(file)"}
-        ):
-            interval_sec = int(st.session_state.get("realtime_panel_refresh_interval", 2))
-            components.html(
-                f"<script>setTimeout(() => window.parent.location.reload(), {interval_sec * 1000});</script>",
-                height=0,
-                width=0,
+            c1, c2, c3 = st.columns([2, 2, 2])
+            c1.metric("이벤트", str(row_ev.get("이벤트", "-")))
+            c2.metric("수집 시각", str(row_ev.get("시간", "-")))
+            c3.metric("상태", str(row_ev.get("상태", "-")))
+
+            all_params = row_ev.get("전체 파라미터", {})
+            st.markdown("**Payload**")
+            if isinstance(all_params, dict) and all_params:
+                payload_rows = [{"param": str(k), "value": _to_text_value(v)} for k, v in all_params.items()]
+                st.table(pd.DataFrame(payload_rows))
+            else:
+                st.caption("payload가 없습니다.")
+
+            schema_check = validate_schema_for_event(
+                event_name=str(row_ev.get("이벤트", "")),
+                params=all_params if isinstance(all_params, dict) else {},
+                schemas=schema_store,
             )
-            st.caption(f"실시간 자동 갱신 동작 중 ({interval_sec}초 간격)")
+            schema_status = str(schema_check.get("status", "WARN")).upper()
+            st.markdown(f"**기준표 검증 (Schema Validation)**: `{schema_status}` · {schema_check.get('message', '-')}")
+            schema_checks = schema_check.get("checks", [])
+            if isinstance(schema_checks, list) and schema_checks:
+                check_rows = []
+                for item in schema_checks:
+                    if not isinstance(item, dict):
+                        continue
+                    check_rows.append(
+                        {
+                            "group": str(item.get("group", "-")),
+                            "param": str(item.get("param", "-")),
+                            "result": "PASS" if bool(item.get("ok", False)) else "FAIL",
+                            "value": str(item.get("value", "-")),
+                        }
+                    )
+                if check_rows:
+                    st.table(pd.DataFrame(check_rows))
+
+    with section_export:
+        st.caption("Export는 QA 문서/이벤트 원본/트래킹 패키지 3개로 제공합니다.")
+        if rt_events.empty:
+            st.info("내보낼 실시간 데이터가 없습니다.")
+        else:
+            browser_timeline = build_realtime_timeline_view(
+                timeline_df,
+                allowed_events=allowed_events_rt,
+                unknown_event_policy=st.session_state.get("unknown_event_policy", "정보"),
+            )
+            browser_errors_df = (
+                browser_timeline[browser_timeline["상태"].isin(["WARN", "ERROR"])].copy()
+                if not browser_timeline.empty
+                else pd.DataFrame(columns=["시간", "수집원", "event_name", "주요 파라미터", "상태", "상세"])
+            )
+            event_logs_df = build_event_logs_export_df(rt_events)
+            parameter_validation_df = build_parameter_validation_export_df(rt_events, schema_store)
+            order_validation_df = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
+            event_qa_result_df = build_event_qa_report_export_df(
+                rt_events=rt_events,
+                issue_df=issue_df,
+                schemas=schema_store,
+                parameter_validation_df=parameter_validation_df,
+                order_validation_df=order_validation_df,
+            )
+            qa_report_xlsx = dataframes_to_excel_bytes(
+                {
+                    "Event QA Result": event_qa_result_df,
+                    "Parameter Validation": parameter_validation_df,
+                    "Browser Errors": browser_errors_df,
+                    "Event Order Validation": order_validation_df,
+                }
+            )
+            event_logs_csv = dataframe_to_csv_bytes(event_logs_df)
+
+            current_action_map_df = load_action_object_map()
+            tracking_plan_export_df = build_tracking_plan_export_df(
+                rt_events,
+                schema_store,
+                action_map_df=current_action_map_df,
+            )
+            screen_definition_df = build_screen_definition_export_df(tracking_plan_export_df)
+            tracking_plan_xlsx = dataframes_to_excel_bytes({"tracking_plan": tracking_plan_export_df})
+            screen_definition_xlsx = dataframes_to_excel_bytes({"screen_definition": screen_definition_df})
+            screen_marked_png = build_screen_marked_png_bytes(screen_definition_df)
+            tracking_package_zip = build_tracking_package_zip_bytes(
+                tracking_plan_xlsx=tracking_plan_xlsx,
+                screen_definition_xlsx=screen_definition_xlsx,
+                screen_marked_png=screen_marked_png,
+                qa_report_xlsx=qa_report_xlsx,
+            )
+
+            st.markdown("### Export")
+            st.caption("QA 상태 기준: FAIL(필수/타입/순서 오류), WARN(기준표 없음/추가 파라미터/순서 경고), PASS(그 외)")
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                st.download_button(
+                    "[1] QA Report",
+                    data=qa_report_xlsx,
+                    file_name="qa_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    disabled=not bool(qa_report_xlsx),
+                    help="이벤트 QA 결과 문서",
+                )
+                st.caption("이벤트 QA 결과 문서")
+            with b2:
+                st.download_button(
+                    "[2] Event Logs",
+                    data=event_logs_csv,
+                    file_name="event_logs.csv",
+                    mime="text/csv",
+                    disabled=not bool(event_logs_csv),
+                    help="테스트 중 수집된 이벤트 로그",
+                )
+                st.caption("테스트 중 수집된 이벤트 로그")
+            with b3:
+                st.download_button(
+                    "[3] Tracking Plan",
+                    data=tracking_package_zip,
+                    file_name="tracking_package.zip",
+                    mime="application/zip",
+                    disabled=not bool(tracking_package_zip),
+                    help="tracking_plan + qa_report + screen_marked 패키지",
+                )
+                st.caption("tracking_plan.xlsx + qa_report.xlsx + screen_marked.png")
+
+            st.markdown("**Tracking Plan 미리보기**")
+            st.caption(f"Action/Object 매핑 적용: {int(len(current_action_map_df))}개 이벤트")
+            if tracking_plan_export_df.empty:
+                st.info("Tracking Plan을 만들 데이터가 없습니다.")
+            else:
+                st.dataframe(tracking_plan_export_df, use_container_width=True, height=320)
+
+    if (
+        st.session_state.get("realtime_panel_auto_refresh", False)
+        and status_for_view in {"running", "stopping", "recovered(file)"}
+    ):
+        interval_sec = int(st.session_state.get("realtime_panel_refresh_interval", 2))
+        components.html(
+            f"<script>setTimeout(() => window.parent.location.reload(), {interval_sec * 1000});</script>",
+            height=0,
+            width=0,
+        )
+        st.caption(f"실시간 자동 갱신 동작 중 ({interval_sec}초 간격)")
 
 with report_tab:
+    if str(st.session_state.get("qa_ui_focus_after_oauth", "")).strip() == "report":
+        st.success("로그인 완료. QA 리포트 화면에서 이어서 작업하세요.")
+        st.session_state["qa_ui_focus_after_oauth"] = ""
     st.subheader("Google 로그인 및 속성 선택")
     c_auth1, c_auth2 = st.columns([2, 2])
     with c_auth1:
@@ -2415,6 +3822,16 @@ with report_tab:
             key="qa_report_token_file",
             placeholder="예: token.json",
         )
+    redirect_preview = ""
+    try:
+        redirect_preview = get_google_oauth_redirect_uri(
+            st.session_state.get("qa_report_client_secret_file", "").strip() or "client_secret.json"
+        )
+    except Exception:
+        redirect_preview = ""
+    if redirect_preview:
+        st.caption(f"현재 OAuth Redirect URI: {redirect_preview}")
+        st.caption("Google Cloud Console의 Authorized redirect URI에 위 주소가 정확히 등록되어 있어야 합니다.")
 
     b_auth1, b_auth2 = st.columns([1.3, 1.3])
     with b_auth1:
@@ -2437,6 +3854,22 @@ with report_tab:
                 client_secrets_file=st.session_state.get("qa_report_client_secret_file", "").strip() or "client_secret.json",
                 state=oauth_state,
             )
+            save_oauth_context(
+                oauth_state,
+                {
+                    "qa_project_slug": st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG),
+                    "qa_project_domain": st.session_state.get("qa_project_domain", ""),
+                    "qa_debug_session_id": st.session_state.get("qa_debug_session_id", ""),
+                    "qa_debug_output_file": st.session_state.get("qa_debug_output_file", ""),
+                    "qa_debug_started_at": st.session_state.get("qa_debug_started_at", ""),
+                    "qa_debug_target_url": st.session_state.get("qa_debug_target_url", ""),
+                    "qa_tester_name": st.session_state.get("qa_tester_name", ""),
+                    "qa_tester_note": st.session_state.get("qa_tester_note", ""),
+                    "required_event_text_input": st.session_state.get("required_event_text_input", ""),
+                    "unknown_event_policy": st.session_state.get("unknown_event_policy", "정보"),
+                    "qa_report_property_id": st.session_state.get("qa_report_property_id", ""),
+                },
+            )
             st.session_state["qa_oauth_state"] = oauth_state
             st.session_state["qa_oauth_auth_url"] = auth_url
             st.session_state["qa_oauth_go_now_url"] = auth_url
@@ -2452,7 +3885,7 @@ with report_tab:
     go_now_url = str(st.session_state.pop("qa_oauth_go_now_url", "")).strip()
     if go_now_url:
         safe_url = json.dumps(go_now_url)
-        st.info("Google 로그인 페이지로 이동합니다...")
+        st.info("현재 창에서 Google 로그인 페이지로 이동합니다...")
         components.html(
             f"""
             <script>
@@ -2460,29 +3893,35 @@ with report_tab:
                 const url = {safe_url};
                 try {{
                   if (window.top && window.top.location) {{
-                    window.top.location.assign(url);
+                    window.top.location.replace(url);
                     return;
                   }}
                 }} catch (e) {{}}
                 try {{
                   if (window.parent && window.parent.location) {{
-                    window.parent.location.assign(url);
+                    window.parent.location.replace(url);
                     return;
                   }}
                 }} catch (e) {{}}
-                window.location.assign(url);
+                window.location.replace(url);
               }})();
             </script>
             """,
             height=0,
             width=0,
         )
-        st.markdown(f"[자동 이동이 안 되면 Google 로그인 페이지를 직접 열기]({go_now_url})")
+        st.markdown(
+            f'<a href="{go_now_url}" target="_self">자동 이동이 안 되면 같은 창에서 Google 로그인 열기</a>',
+            unsafe_allow_html=True,
+        )
         st.stop()
 
     pending_auth_url = str(st.session_state.get("qa_oauth_auth_url", "")).strip()
     if pending_auth_url:
-        st.markdown(f"[Google 로그인 페이지 열기]({pending_auth_url})")
+        st.markdown(
+            f'<a href="{pending_auth_url}" target="_self">같은 창에서 Google 로그인 페이지 열기</a>',
+            unsafe_allow_html=True,
+        )
         st.caption("로그인 완료 후 앱으로 돌아오면 토큰이 저장되고 속성 리스트를 불러올 수 있습니다.")
 
     if property_refresh_clicked:
@@ -2773,3 +4212,174 @@ with report_tab:
                     st.error("issue_id를 찾지 못했습니다.")
     else:
         st.caption("현재 open 상태 이슈가 없습니다.")
+
+with schema_tab:
+    st.subheader("Event Rule Manager (이벤트 기준표)")
+    st.caption(
+        f"Project: {get_active_project_slug()} | 이벤트별 필수/선택 파라미터 기준표를 관리합니다."
+    )
+
+    cached_rt_events = pd.DataFrame(st.session_state.get("schema_rt_events_cache", []))
+    schema_store = load_event_schemas()
+
+    captured_events = []
+    if not cached_rt_events.empty and "이벤트" in cached_rt_events.columns:
+        captured_events = sorted(
+            list({str(v).strip() for v in cached_rt_events["이벤트"].dropna().tolist() if str(v).strip()})
+        )
+    saved_events = sorted(list(schema_store.keys()))
+    selectable_events = sorted(list(dict.fromkeys(captured_events + saved_events)))
+
+    if not selectable_events:
+        st.info("기준표를 만들 이벤트가 없습니다. 먼저 실시간 테스트에서 이벤트를 수집하세요.")
+    else:
+        selected_event = st.selectbox("이벤트 선택", options=selectable_events, key="schema_manager_selected_event")
+        include_system_params_schema_tab = st.checkbox(
+            "기술 파라미터까지 포함",
+            value=False,
+            key="schema_tab_include_system_params",
+            help="기본은 시스템/기술 파라미터를 제외합니다.",
+        )
+        inferred = infer_event_schema_from_rows(
+            cached_rt_events,
+            selected_event,
+            include_system_params=include_system_params_schema_tab,
+        )
+        existing_schema = schema_store.get(selected_event, {})
+        all_params = sorted(
+            list(
+                dict.fromkeys(
+                    list(inferred.get("required", []))
+                    + list(inferred.get("optional", []))
+                    + [str(v).strip() for v in existing_schema.get("required", []) if str(v).strip()]
+                    + [str(v).strip() for v in existing_schema.get("optional", []) if str(v).strip()]
+                )
+            )
+        )
+
+        c1, c2 = st.columns([1.2, 1.2])
+        with c1:
+            if st.button("선택 이벤트 기준표 자동 생성", key="schema_generate_for_selected"):
+                required_auto = list(inferred.get("required", []))
+                optional_auto = list(inferred.get("optional", []))
+                schema_store[selected_event] = {
+                    "required": required_auto,
+                    "optional": optional_auto,
+                    "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                }
+                save_event_schemas(schema_store)
+                st.success(
+                    f"{selected_event}: 필수 {len(required_auto)}개 / 선택 {len(optional_auto)}개 저장"
+                )
+                if not include_system_params_schema_tab:
+                    st.info(f"시스템/기술 파라미터 제외: {int(inferred.get('excluded_system_params', 0))}건")
+                st.rerun()
+        with c2:
+            st.caption(
+                f"자동 생성 기준 샘플 수: {int(inferred.get('sample_size', 0))}건 | "
+                f"제외된 기술 파라미터: {int(inferred.get('excluded_system_params', 0))}건"
+            )
+
+        current_required = [str(v).strip() for v in existing_schema.get("required", []) if str(v).strip()]
+        current_optional = [str(v).strip() for v in existing_schema.get("optional", []) if str(v).strip()]
+
+        required_keys = st.multiselect(
+            "required",
+            options=all_params,
+            default=[v for v in current_required if v in all_params],
+            key=f"schema_required_{selected_event}",
+        )
+        optional_keys = st.multiselect(
+            "optional",
+            options=[v for v in all_params if v not in required_keys],
+            default=[v for v in current_optional if v in all_params and v not in required_keys],
+            key=f"schema_optional_{selected_event}",
+        )
+
+        b1, b2 = st.columns([1.2, 1.2])
+        with b1:
+            if st.button("기준표 저장", key=f"schema_save_{selected_event}"):
+                schema_store[selected_event] = {
+                    "required": required_keys,
+                    "optional": optional_keys,
+                    "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                }
+                save_event_schemas(schema_store)
+                st.success(f"{selected_event} 기준표를 저장했습니다.")
+                st.rerun()
+        with b2:
+            if st.button("기준표 삭제", key=f"schema_delete_{selected_event}"):
+                if selected_event in schema_store:
+                    del schema_store[selected_event]
+                    save_event_schemas(schema_store)
+                    st.success(f"{selected_event} 기준표를 삭제했습니다.")
+                    st.rerun()
+
+        preview = validate_schema_for_event(
+            event_name=selected_event,
+            params={k: "sample" for k in required_keys},
+            schemas={selected_event: {"required": required_keys, "optional": optional_keys}},
+        )
+        st.caption(f"기준표 미리보기: {preview.get('status', 'WARN')} · {preview.get('message', '-')}")
+
+    st.divider()
+    st.markdown("**저장된 기준표 목록**")
+    schema_rows = []
+    for event_name, schema in sorted(schema_store.items()):
+        required = [str(v).strip() for v in schema.get("required", []) if str(v).strip()]
+        optional = [str(v).strip() for v in schema.get("optional", []) if str(v).strip()]
+        schema_rows.append(
+            {
+                "event_name": event_name,
+                "required_count": len(required),
+                "optional_count": len(optional),
+                "required": ", ".join(required),
+                "optional": ", ".join(optional),
+                "updated_at": str(schema.get("updated_at", "")).strip(),
+            }
+        )
+    if schema_rows:
+        st.dataframe(pd.DataFrame(schema_rows), use_container_width=True, height=280)
+    else:
+        st.info("저장된 기준표가 없습니다.")
+
+    st.divider()
+    st.markdown("**Action/Object 매핑표**")
+    st.caption("tracking_plan의 action/object/page/section을 이벤트별로 고정합니다.")
+    map_col1, map_col2 = st.columns([1.2, 2.0])
+    with map_col1:
+        st.download_button(
+            "매핑표 템플릿 다운로드",
+            data=action_map_template_csv_bytes(),
+            file_name="action_object_map_template.csv",
+            mime="text/csv",
+        )
+    with map_col2:
+        st.caption("필수 컬럼: event_name, action, object (나머지는 선택)")
+    upload_file = st.file_uploader(
+        "매핑표 업로드 (CSV)",
+        type=["csv"],
+        key="action_object_map_upload",
+        accept_multiple_files=False,
+    )
+    if st.button("업로드 매핑표 저장", key="save_action_object_map_btn"):
+        if upload_file is None:
+            st.warning("업로드할 CSV 파일을 먼저 선택하세요.")
+        else:
+            try:
+                uploaded_df = pd.read_csv(upload_file)
+                normalized_df = _normalize_action_map_df(uploaded_df)
+                if normalized_df.empty:
+                    st.error("유효한 event_name 행이 없습니다. 템플릿 형식으로 다시 업로드하세요.")
+                else:
+                    save_action_object_map(normalized_df)
+                    st.success(f"매핑표 저장 완료: {len(normalized_df)}개 이벤트")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"매핑표 업로드 실패: {to_user_error_message(exc)}")
+
+    current_map_df = load_action_object_map()
+    if current_map_df.empty:
+        st.info("저장된 매핑표가 없습니다. 기본 규칙(이벤트명 추정)으로 tracking_plan을 생성합니다.")
+    else:
+        st.dataframe(current_map_df, use_container_width=True, height=240)
