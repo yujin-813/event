@@ -816,12 +816,15 @@ def _extract_candidate_metadata(handle) -> Dict[str, object]:
           const tag = (el.tagName || "").toLowerCase();
           const classAttribute = normalizeText(readAttr(el, "class"));
           const role = readAttr(el, "role");
-          const targetId = readAttr(el, "data-qa")
-            ? `data-qa:${readAttr(el, "data-qa")}`
-            : (readAttr(el, "data-button-id")
-              ? `data-button-id:${readAttr(el, "data-button-id")}`
-              : (readAttr(el, "data-section-name")
-                ? `data-section-name:${readAttr(el, "data-section-name")}`
+          const dataQa = readAttr(el, "data-qa");
+          const dataButtonId = readAttr(el, "data-button-id");
+          const dataSectionName = readAttr(el, "data-section-name");
+          const targetId = dataQa
+            ? `data-qa:${dataQa}`
+            : (dataButtonId
+              ? `data-button-id:${dataButtonId}`
+              : (dataSectionName
+                ? `data-section-name:${dataSectionName}`
                 : (el.id ? `id:${el.id}` : "")));
           const uiRole = role || (tag === "a" ? "link" : (tag === "button" || tag === "input" ? "button_like" : "clickable"));
           const selector = buildSelector(el);
@@ -830,10 +833,15 @@ def _extract_candidate_metadata(handle) -> Dict[str, object]:
           const pageId = location.pathname || "/";
           const classPattern = toPattern(classAttribute.split(" ").slice(0, 2).join("."));
           const key = [pageId, tag, targetId || selector, text.slice(0, 80), href].join("|");
-          const patternKey = [pageId, sectionName || "section", uiRole, tag, classPattern || selectorPattern, targetId || "na", screenState].join("|");
+          const structureKey = [pageId, sectionName || "section", uiRole, tag, classPattern || selectorPattern, screenState].join("|");
+          const hasStableControlId = Boolean(dataButtonId) || (Boolean(dataQa) && !/(content|banner|card|item|product|goods)/i.test(dataQa));
+          const patternKey = hasStableControlId
+            ? [structureKey, targetId || "na"].join("|")
+            : structureKey;
           return {
             key,
             pattern_key: patternKey,
+            structure_key: structureKey,
             text,
             href,
             target_id: targetId || selector,
@@ -997,6 +1005,7 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                 "reason": click_reason,
                 "key": str(selected_meta.get("key", "")).strip(),
                 "pattern_key": str(selected_meta.get("pattern_key", "")).strip(),
+                "structure_key": str(selected_meta.get("structure_key", "")).strip(),
                 "text": str(selected_meta.get("text", "")).strip(),
                 "href": str(selected_meta.get("href", "")).strip(),
                 "target_id": str(selected_meta.get("target_id", "")).strip(),
