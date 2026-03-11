@@ -22,6 +22,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
+from openpyxl.styles import Font
 
 from src.debug_runtime import (
     get_debug_session_snapshot,
@@ -64,6 +67,7 @@ CIRCLED_NUMBERS = {
     1: "①", 2: "②", 3: "③", 4: "④", 5: "⑤", 6: "⑥", 7: "⑦", 8: "⑧", 9: "⑨", 10: "⑩",
     11: "⑪", 12: "⑫", 13: "⑬", 14: "⑭", 15: "⑮", 16: "⑯", 17: "⑰", 18: "⑱", 19: "⑲", 20: "⑳",
 }
+ILLEGAL_EXCEL_CHAR_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 
 
 def _slugify_project_name(text: str) -> str:
@@ -75,6 +79,11 @@ def _slugify_project_name(text: str) -> str:
     normalized = re.sub(r"[-_]{2,}", "-", normalized)
     slug = normalized.strip("-_")
     return slug or DEFAULT_PROJECT_SLUG
+
+
+def to_excel_safe_text(value: object) -> str:
+    text = str(value if value is not None else "")
+    return ILLEGAL_EXCEL_CHAR_RE.sub("", text)
 
 
 def to_circled_number(n: int) -> str:
@@ -179,6 +188,52 @@ def get_active_test_log_db_path() -> Path:
 
 def get_active_action_map_path() -> Path:
     return get_active_project_paths()["action_map_file"]
+
+
+def get_definition_validation_cache_path(project_slug: str | None = None) -> Path:
+    slug = _slugify_project_name(project_slug or get_active_project_slug())
+    return ensure_project_structure(slug)["artifacts_dir"] / "definition_validation_cache.json"
+
+
+def save_definition_validation_cache(payload: Dict[str, object], project_slug: str | None = None) -> None:
+    path = get_definition_validation_cache_path(project_slug)
+    data = dict(payload)
+    data["saved_at"] = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_definition_validation_cache(project_slug: str | None = None) -> Dict[str, object]:
+    path = get_definition_validation_cache_path(project_slug)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def restore_definition_validation_cache_if_needed() -> None:
+    if st.session_state.get("qa_uploaded_definition_schemas"):
+        return
+    cached = load_definition_validation_cache()
+    schemas = cached.get("schemas", {})
+    if not isinstance(schemas, dict) or not schemas:
+        return
+    st.session_state["qa_mode"] = str(cached.get("qa_mode", "정의서 검증")).strip() or "정의서 검증"
+    st.session_state["qa_definition_validation_file_name"] = str(cached.get("file_name", "")).strip()
+    st.session_state["qa_definition_validation_error"] = ""
+    st.session_state["qa_uploaded_definition_schemas"] = schemas
+    summary = cached.get("summary", [])
+    st.session_state["qa_uploaded_definition_summary"] = summary if isinstance(summary, list) else []
+    debug = cached.get("debug", {})
+    st.session_state["qa_definition_validation_debug"] = debug if isinstance(debug, dict) else {}
+    st.session_state["qa_definition_validation_loaded_key"] = str(cached.get("loaded_key", "")).strip()
+    st.session_state["qa_definition_validation_target_mode"] = str(cached.get("target_mode", "선택하세요")).strip() or "선택하세요"
+    st.session_state["qa_definition_validation_target_mode_prev"] = st.session_state["qa_definition_validation_target_mode"]
+    st.session_state["qa_definition_validation_execution_mode"] = str(cached.get("execution_mode", "")).strip()
+    st.session_state["qa_definition_validation_execution_session_id"] = str(cached.get("execution_session_id", "")).strip()
 
 
 def _normalize_action_map_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -484,6 +539,1159 @@ def save_event_schemas(schemas: Dict[str, Dict[str, object]], path: Path | None 
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _is_required_flag(value: object) -> bool:
+    return str(value or "").strip().lower() in {"y", "yes", "true", "1", "req", "required", "필수"}
+
+
+def _clean_definition_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value).replace("\ufeff", "").replace("\xa0", " ").strip()
+
+
+def _normalize_definition_header(value: object) -> str:
+    text = _clean_definition_cell(value)
+    if not text:
+        return ""
+    text = normalize_param_name(text).strip().lower()
+    alias_map = {
+        "event_name": "event_name",
+        "이벤트명": "event_name",
+        "영역순서": "no",
+        "no": "no",
+        "action": "action",
+        "object": "object",
+        "description": "description",
+        "설명작성란": "description",
+        "state": "state",
+        "로그상태": "state",
+        "poc": "poc",
+        "구분": "poc",
+        "event_적합_검사": "event_fit",
+        "event적합검사": "event_fit",
+        "적합검사": "event_fit",
+        "ecommerce": "ecommerce",
+        "영역에대한actionobject선택란": "",
+        "event_설정정보": "",
+    }
+    return alias_map.get(text, text)
+
+
+class DefinitionUploadError(ValueError):
+    def __init__(self, message: str, debug_info: Dict[str, object] | None = None):
+        super().__init__(message)
+        self.debug_info = debug_info or {}
+
+
+def _analyze_definition_matrix(raw_df: pd.DataFrame) -> Dict[str, object]:
+    analysis: Dict[str, object] = {
+        "raw_rows": int(len(raw_df)) if isinstance(raw_df, pd.DataFrame) else 0,
+        "raw_cols": int(len(raw_df.columns)) if isinstance(raw_df, pd.DataFrame) else 0,
+        "event_header_row_index": None,
+        "param_header_row_index": None,
+        "event_row_count": 0,
+        "sample_event_names": [],
+        "validation_reason": "",
+        "schemas": {},
+    }
+    if raw_df.empty:
+        analysis["validation_reason"] = "헤더 탐지 실패: raw DataFrame이 비어 있습니다."
+        return analysis
+
+    normalized_rows: List[List[str]] = []
+    for _, row in raw_df.iterrows():
+        normalized_rows.append([_normalize_definition_header(value) for value in row.tolist()])
+
+    event_header_idx = -1
+    param_header_idx = -1
+    best_event_score = -1
+    for idx, row in enumerate(normalized_rows):
+        row_set = {cell for cell in row if cell}
+        event_score = 0
+        if "event_name" in row_set:
+            event_score += 4
+        for hint in ["action", "object", "no", "description", "event_fit", "ecommerce", "state", "poc"]:
+            if hint in row_set:
+                event_score += 1
+        if event_score > best_event_score:
+            best_event_score = event_score
+            event_header_idx = idx if "event_name" in row_set else event_header_idx
+        if idx <= event_header_idx:
+            continue
+        param_key_hits = len(
+            [
+                cell
+                for cell in row_set
+                if cell
+                in {
+                    "section_name",
+                    "section_index",
+                    "section_title",
+                    "store_type",
+                    "index",
+                    "ab_bucket",
+                    "ab_props",
+                    "ds_uri",
+                    "brand_id",
+                    "content_id",
+                    "content_name",
+                    "content_type",
+                    "content_no",
+                    "banner_id",
+                    "popup_title",
+                    "button_id",
+                    "button_name",
+                    "category_id",
+                    "category_name",
+                    "filter_type",
+                    "filter_value",
+                    "liked_item_id",
+                    "item_list_name",
+                    "item_ab_bucket",
+                    "item_ab_props",
+                    "item_ds_uri",
+                    "item_extra_info",
+                    "item_used_grade",
+                    "spc_code",
+                    "ab_probs",
+                    "landing_url",
+                    "page_id",
+                    "page_link",
+                    "extra_info",
+                }
+            ]
+        )
+        if event_header_idx >= 0 and param_key_hits >= 2 and param_header_idx < 0:
+            param_header_idx = idx
+            break
+
+    analysis["event_header_row_index"] = event_header_idx if event_header_idx >= 0 else None
+    analysis["param_header_row_index"] = param_header_idx if param_header_idx >= 0 else None
+
+    if event_header_idx < 0:
+        analysis["validation_reason"] = "헤더 탐지 실패: event_name 컬럼이 있는 이벤트 헤더 행을 찾지 못했습니다."
+        return analysis
+    if param_header_idx < 0 or param_header_idx <= event_header_idx:
+        analysis["validation_reason"] = "헤더 탐지 실패: 이벤트 헤더 아래에서 매개변수 매트릭스 헤더를 찾지 못했습니다."
+        return analysis
+
+    event_header_map: Dict[str, int] = {}
+    for col_idx, cell in enumerate(normalized_rows[event_header_idx]):
+        if cell and cell not in event_header_map:
+            event_header_map[cell] = col_idx
+    if "event_name" not in event_header_map:
+        analysis["validation_reason"] = "헤더 탐지 실패: 선택된 이벤트 헤더 행에 event_name 컬럼이 없습니다."
+        return analysis
+
+    event_rows: List[Dict[str, str]] = []
+    for row_idx in range(event_header_idx + 1, param_header_idx):
+        row_values = raw_df.iloc[row_idx].tolist()
+        event_name = _clean_definition_cell(row_values[event_header_map["event_name"]]) if event_header_map["event_name"] < len(row_values) else ""
+        if not event_name:
+            continue
+        event_rows.append(
+            {
+                "event_name": event_name,
+                "raw_row_index": str(row_idx),
+                "no": _clean_definition_cell(row_values[event_header_map["no"]]) if "no" in event_header_map and event_header_map["no"] < len(row_values) else "",
+                "action": _clean_definition_cell(row_values[event_header_map["action"]]) if "action" in event_header_map and event_header_map["action"] < len(row_values) else "",
+                "object": _clean_definition_cell(row_values[event_header_map["object"]]) if "object" in event_header_map and event_header_map["object"] < len(row_values) else "",
+                "description": _clean_definition_cell(row_values[event_header_map["description"]]) if "description" in event_header_map and event_header_map["description"] < len(row_values) else "",
+                "state": _clean_definition_cell(row_values[event_header_map["state"]]) if "state" in event_header_map and event_header_map["state"] < len(row_values) else "",
+                "poc": _clean_definition_cell(row_values[event_header_map["poc"]]) if "poc" in event_header_map and event_header_map["poc"] < len(row_values) else "",
+                "event_fit": _clean_definition_cell(row_values[event_header_map["event_fit"]]) if "event_fit" in event_header_map and event_header_map["event_fit"] < len(row_values) else "",
+                "ecommerce": _clean_definition_cell(row_values[event_header_map["ecommerce"]]) if "ecommerce" in event_header_map and event_header_map["ecommerce"] < len(row_values) else "",
+            }
+        )
+    analysis["event_row_count"] = len(event_rows)
+    analysis["sample_event_names"] = [row["event_name"] for row in event_rows[:5]]
+    if not event_rows:
+        analysis["validation_reason"] = "이벤트 행 추출 실패: event_name 아래에서 실제 이벤트 값을 1개도 찾지 못했습니다."
+        return analysis
+
+    param_headers = normalized_rows[param_header_idx]
+    param_rows: List[List[object]] = []
+    for row_idx in range(param_header_idx + 1, len(raw_df)):
+        row_values = raw_df.iloc[row_idx].tolist()
+        if not any(_clean_definition_cell(value) for value in row_values):
+            continue
+        param_rows.append(row_values)
+
+    out: Dict[str, Dict[str, object]] = {}
+    now_iso = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    for idx, event_row in enumerate(event_rows):
+        event_name = event_row["event_name"]
+        param_values = param_rows[idx] if idx < len(param_rows) else []
+        required_params: List[str] = []
+        param_value_map: Dict[str, str] = {}
+        for col_idx, header_name in enumerate(param_headers):
+            if not header_name:
+                continue
+            if col_idx >= len(param_values):
+                continue
+            cell_text = _clean_definition_cell(param_values[col_idx])
+            if not cell_text:
+                continue
+            param_name = normalize_param_name(header_name)
+            if not param_name or param_name in required_params:
+                continue
+            required_params.append(param_name)
+            param_value_map[param_name] = cell_text
+        event_meta = dict(event_row)
+        event_meta["param_values"] = param_value_map
+        _merge_definition_schema_entry(
+            out,
+            event_name,
+            required_params,
+            [],
+            list(required_params),
+            event_meta,
+            now_iso,
+        )
+    analysis["schemas"] = out
+    if not out:
+        analysis["validation_reason"] = "validation 실패: 이벤트 스키마를 1개도 만들지 못했습니다."
+        return analysis
+    analysis["validation_reason"] = "ok"
+    return analysis
+
+
+def _extract_definition_matrix_schemas(raw_df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    return _analyze_definition_matrix(raw_df).get("schemas", {}) if isinstance(raw_df, pd.DataFrame) else {}
+
+
+def _merge_definition_schema_entry(
+    out: Dict[str, Dict[str, object]],
+    event_name: str,
+    required: List[str],
+    optional: List[str],
+    parameter_columns: List[str],
+    meta: Dict[str, object],
+    updated_at: str,
+) -> None:
+    key = str(event_name).strip()
+    if not key:
+        return
+    entry = out.setdefault(
+        key,
+        {
+            "required": [],
+            "optional": [],
+            "parameter_columns": [],
+            "updated_at": updated_at,
+            "meta": dict(meta),
+            "cases": [],
+        },
+    )
+    for bucket_name, values in {
+        "required": required,
+        "optional": optional,
+        "parameter_columns": parameter_columns,
+    }.items():
+        bucket = entry.setdefault(bucket_name, [])
+        for value in values:
+            value_text = str(value).strip()
+            if value_text and value_text not in bucket:
+                bucket.append(value_text)
+    entry["updated_at"] = updated_at
+    entry.setdefault("meta", dict(meta))
+    cases = entry.setdefault("cases", [])
+    case_no = str(meta.get("no", "")).strip()
+    case_desc = str(meta.get("description", "")).strip()
+    raw_row_index = str(meta.get("raw_row_index", "")).strip()
+    case_id = f"{key}::{case_no or raw_row_index or len(cases) + 1}::{case_desc or '-'}"
+    case_entry = next((case for case in cases if str(case.get("case_id", "")).strip() == case_id), None)
+    if not isinstance(case_entry, dict):
+        case_entry = {
+            "case_id": case_id,
+            "required": [],
+            "optional": [],
+            "parameter_columns": [],
+            "meta": dict(meta),
+        }
+        cases.append(case_entry)
+    for bucket_name, values in {
+        "required": required,
+        "optional": optional,
+        "parameter_columns": parameter_columns,
+    }.items():
+        bucket = case_entry.setdefault(bucket_name, [])
+        for value in values:
+            value_text = str(value).strip()
+            if value_text and value_text not in bucket:
+                bucket.append(value_text)
+    if not isinstance(case_entry.get("meta"), dict) or not case_entry.get("meta"):
+        case_entry["meta"] = dict(meta)
+
+
+def _parse_definition_schemas_with_fallback(
+    structured_df: pd.DataFrame | None = None,
+    raw_df: pd.DataFrame | None = None,
+) -> Tuple[Dict[str, Dict[str, object]], Dict[str, object]]:
+    debug_info: Dict[str, object] = {
+        "file_read_stage": "ok",
+        "structured_rows": int(len(structured_df)) if isinstance(structured_df, pd.DataFrame) else 0,
+        "structured_cols": int(len(structured_df.columns)) if isinstance(structured_df, pd.DataFrame) else 0,
+        "raw_rows": int(len(raw_df)) if isinstance(raw_df, pd.DataFrame) else 0,
+        "raw_cols": int(len(raw_df.columns)) if isinstance(raw_df, pd.DataFrame) else 0,
+        "fallback_used": False,
+        "event_header_row_index": None,
+        "param_header_row_index": None,
+        "parsed_event_count": 0,
+        "sample_event_names": [],
+        "failure_stage": "",
+        "final_validation_reason": "",
+    }
+    schemas: Dict[str, Dict[str, object]] = {}
+    if isinstance(structured_df, pd.DataFrame) and not structured_df.empty:
+        try:
+            schemas = parse_uploaded_definition_schemas(structured_df)
+        except Exception:
+            schemas = {}
+    if schemas:
+        debug_info["parsed_event_count"] = len(schemas)
+        debug_info["sample_event_names"] = list(schemas.keys())[:5]
+        debug_info["final_validation_reason"] = "ok"
+        return schemas, debug_info
+    debug_info["fallback_used"] = True
+    if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+        analysis = _analyze_definition_matrix(raw_df)
+        debug_info["event_header_row_index"] = analysis.get("event_header_row_index")
+        debug_info["param_header_row_index"] = analysis.get("param_header_row_index")
+        debug_info["parsed_event_count"] = len(analysis.get("schemas", {}))
+        debug_info["sample_event_names"] = analysis.get("sample_event_names", [])
+        debug_info["final_validation_reason"] = str(analysis.get("validation_reason", "")).strip()
+        if analysis.get("schemas"):
+            return analysis.get("schemas", {}), debug_info
+        debug_info["failure_stage"] = (
+            "헤더 탐지 실패"
+            if "헤더 탐지 실패" in debug_info["final_validation_reason"]
+            else "이벤트 행 추출 실패"
+            if "이벤트 행 추출 실패" in debug_info["final_validation_reason"]
+            else "validation 실패"
+        )
+        return {}, debug_info
+    debug_info["failure_stage"] = "파일 읽기 실패"
+    debug_info["final_validation_reason"] = "raw DataFrame을 만들지 못했습니다."
+    return {}, debug_info
+
+
+def build_schema_catalog_df(schemas: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    for event_name, schema in sorted((schemas or {}).items()):
+        if not isinstance(schema, dict):
+            continue
+        cases = schema.get("cases", []) if isinstance(schema.get("cases", []), list) else []
+        if not cases:
+            cases = [
+                {
+                    "case_id": f"{str(event_name).strip()}::default",
+                    "required": [str(v).strip() for v in schema.get("required", []) if str(v).strip()],
+                    "optional": [str(v).strip() for v in schema.get("optional", []) if str(v).strip()],
+                    "parameter_columns": [str(v).strip() for v in schema.get("parameter_columns", []) if str(v).strip()],
+                    "meta": schema.get("meta", {}) if isinstance(schema.get("meta", {}), dict) else {},
+                }
+            ]
+        for case in cases:
+            meta = case.get("meta", {}) if isinstance(case.get("meta", {}), dict) else {}
+            required = [str(v).strip() for v in case.get("required", []) if str(v).strip()]
+            optional = [str(v).strip() for v in case.get("optional", []) if str(v).strip()]
+            parameter_columns = [str(v).strip() for v in case.get("parameter_columns", []) if str(v).strip()]
+            rows.append(
+                {
+                    "case_id": str(case.get("case_id", "")).strip(),
+                    "event_name": str(event_name).strip(),
+                    "no": str(meta.get("no", "")).strip(),
+                    "action": str(meta.get("action", "")).strip(),
+                    "object": str(meta.get("object", "")).strip(),
+                    "description": str(meta.get("description", "")).strip(),
+                    "required_count": len(required),
+                    "optional_count": len(optional),
+                    "parameter_count": len(parameter_columns),
+                    "required": ", ".join(required),
+                    "optional": ", ".join(optional),
+                    "parameter_columns": ", ".join(parameter_columns),
+                    "updated_at": str(schema.get("updated_at", "")).strip(),
+                }
+            )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "case_id",
+            "event_name",
+            "no",
+            "action",
+            "object",
+            "description",
+            "required_count",
+            "optional_count",
+            "parameter_count",
+            "required",
+            "optional",
+            "parameter_columns",
+            "updated_at",
+        ],
+    )
+
+
+def build_definition_template_rows() -> List[List[str]]:
+    event_headers = ["state", "POC", "no", "action", "object", "event_name", "description", "event 적합 검사", "ecommerce"]
+    param_headers = [
+        "section_name",
+        "section_index",
+        "section_title",
+        "store_type",
+        "index",
+        "ab_bucket",
+        "ab_props",
+        "ds_uri",
+        "brand_id",
+        "content_id",
+        "content_name",
+        "content_type",
+        "content_no",
+        "banner_id",
+        "popup_title",
+        "button_id",
+        "button_name",
+        "category_id",
+        "category_name",
+        "filter_type",
+        "filter_value",
+        "liked_item_id",
+        "item_list_name",
+        "item_ab_bucket",
+        "item_ab_props",
+        "item_ds_uri",
+        "item_extra_info",
+        "item_used_grade",
+        "spc_code",
+        "ab_probs",
+        "landing_url",
+        "page_id",
+        "page_link",
+        "extra_info",
+    ]
+    width = max(len(event_headers), len(param_headers))
+
+    def pad(values: List[str]) -> List[str]:
+        return values + [""] * (width - len(values))
+
+    rows: List[List[str]] = [
+        pad(["EVENT - 설정정보"]),
+        pad(["로그 상태", "POC 구분", "영역 순서", "action", "object", "이벤트명", "설명", "적합검사", "ecommerce 유무"]),
+        pad(event_headers),
+        pad(["상용", "APP(Android, iOS) / MW", "1", "click", "content", "click_content", "스토어홈 > 추천판 > 빅배너 클릭", "Y", "N"]),
+        pad(["상용", "APP(Android, iOS) / MW", "2", "impression", "content", "impression_content", "스토어홈 > 추천판 > 빅배너 노출", "Y", "N"]),
+        pad(["상용", "APP(Android, iOS) / MW", "3", "click", "button", "click_button", "스토어홈 > 추천판 > 전체보기 버튼 클릭", "Y", "N"]),
+        pad([]),
+        pad(["PARAMETER - 매개변수 매트릭스"]),
+        pad(param_headers),
+        pad([
+            "main_display_big_banner", "{index}", "{title}", "musinsa", "{index}", "{ab_bucket}", "{ab_props}", "{ds_uri}", "",
+            "1234", "{image}", "banner", "", "{banner_id}", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "{ab_probs}",
+            "{{landing_url}}", "/main/musinsa/recommend", "{{page_link}}", ""
+        ]),
+        pad([
+            "main_display_big_banner", "{index}", "{title}", "musinsa", "{index}", "{ab_bucket}", "{ab_props}", "{ds_uri}", "",
+            "1234", "{image}", "banner", "", "{banner_id}", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "{ab_probs}",
+            "{{landing_url}}", "/main/musinsa/recommend", "{{page_link}}", ""
+        ]),
+        pad([
+            "main_display_big_banner", "{index}", "", "musinsa", "", "", "", "", "", "", "", "", "", "", "", "all", "전체보기 버튼",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "{{landing_url}}", "/main/musinsa/recommend", "{{page_link}}", ""
+        ]),
+    ]
+    return rows
+
+
+def build_definition_template_csv_bytes() -> bytes:
+    rows = build_definition_template_rows()
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False, header=False).encode("utf-8-sig")
+
+
+def build_definition_template_xlsx_bytes() -> bytes:
+    rows = build_definition_template_rows()
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(writer, index=False, header=False, sheet_name="definition_template")
+    return out.getvalue()
+
+
+DEFINITION_MATCH_HINT_PRIORITY = [
+    "button_id",
+    "button_name",
+    "section_name",
+    "section_title",
+    "content_id",
+    "content_name",
+    "content_type",
+    "banner_id",
+    "category_id",
+    "category_name",
+    "filter_type",
+    "filter_value",
+    "page_id",
+]
+
+
+def _is_definition_placeholder_value(value: object) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if "{" in text or "}" in text:
+        return True
+    lowered = text.lower()
+    return lowered in {"-", "na", "n/a", "null", "none"}
+
+
+def _build_definition_identification_from_values(values: Dict[str, object]) -> str:
+    if not isinstance(values, dict):
+        return "-"
+    bits: List[str] = []
+    for key in DEFINITION_MATCH_HINT_PRIORITY:
+        value_text = str(values.get(key, "")).strip()
+        if not value_text or _is_definition_placeholder_value(value_text):
+            continue
+        if key == "filter_value" and any(bit.startswith("filter_type=") for bit in bits):
+            bits.append(f"{key}={value_text}")
+            continue
+        bits.append(f"{key}={value_text}")
+        if len(bits) >= 3:
+            break
+    return ", ".join(bits) if bits else "-"
+
+
+def _iter_definition_cases(schemas: Dict[str, Dict[str, object]]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for event_name, schema in (schemas or {}).items():
+        if not isinstance(schema, dict):
+            continue
+        cases = schema.get("cases", []) if isinstance(schema.get("cases", []), list) else []
+        if not cases:
+            cases = [
+                {
+                    "case_id": f"{str(event_name).strip()}::default",
+                    "required": [str(v).strip() for v in schema.get("required", []) if str(v).strip()],
+                    "optional": [str(v).strip() for v in schema.get("optional", []) if str(v).strip()],
+                    "parameter_columns": [str(v).strip() for v in schema.get("parameter_columns", []) if str(v).strip()],
+                    "meta": schema.get("meta", {}) if isinstance(schema.get("meta", {}), dict) else {},
+                }
+            ]
+        for idx, case in enumerate(cases, start=1):
+            meta = case.get("meta", {}) if isinstance(case.get("meta", {}), dict) else {}
+            param_values = meta.get("param_values", {}) if isinstance(meta.get("param_values", {}), dict) else {}
+            rows.append(
+                {
+                    "definition_row_id": str(case.get("case_id", "")).strip() or f"{str(event_name).strip()}::{idx}",
+                    "event_name": str(event_name).strip(),
+                    "no": str(meta.get("no", "")).strip(),
+                    "action": str(meta.get("action", "")).strip(),
+                    "object": str(meta.get("object", "")).strip(),
+                    "description": str(meta.get("description", "")).strip(),
+                    "required": [str(v).strip() for v in case.get("required", []) if str(v).strip()],
+                    "optional": [str(v).strip() for v in case.get("optional", []) if str(v).strip()],
+                    "parameter_columns": [str(v).strip() for v in case.get("parameter_columns", []) if str(v).strip()],
+                    "param_values": {str(k).strip(): str(v).strip() for k, v in param_values.items() if str(k).strip() and str(v).strip()},
+                }
+            )
+    return rows
+
+
+def _tokenize_match_text(text: object) -> set[str]:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return set()
+    tokens = re.split(r"[^0-9a-zA-Z가-힣]+", raw)
+    return {token for token in tokens if token and len(token) > 1}
+
+
+def _build_rt_event_identification(row: Dict[str, object]) -> str:
+    values = {}
+    params = row.get("전체 파라미터", {})
+    if isinstance(params, dict):
+        values.update({str(k).strip(): _to_text_value(v) for k, v in params.items()})
+    for key in ["target_id", "section_name", "page_id"]:
+        value_text = str(row.get(key, "")).strip()
+        if value_text and key not in values:
+            values[key] = value_text
+    return _build_definition_identification_from_values(values)
+
+
+def _normalize_match_value(value: object) -> str:
+    text = _to_text_value(value)
+    return "" if _is_missing_like_value(text) else text
+
+
+def _is_auxiliary_common_key_value(key: str, value: object) -> bool:
+    key_text = str(key or "").strip().lower()
+    value_text = str(value or "").strip().lower()
+    return (
+        key_text in {"button_id", "button_name"}
+        and value_text in {"more", "더보기"}
+    )
+
+
+def _build_definition_case_match_hints(case: Dict[str, object]) -> Dict[str, str]:
+    param_values = case.get("param_values", {}) if isinstance(case.get("param_values", {}), dict) else {}
+    hints: Dict[str, str] = {}
+    for key in DEFINITION_MATCH_HINT_PRIORITY:
+        value_text = str(param_values.get(key, "")).strip()
+        if not value_text or _is_definition_placeholder_value(value_text):
+            continue
+        hints[key] = value_text
+    return hints
+
+
+def _build_rt_row_match_values(row: Dict[str, object]) -> Dict[str, str]:
+    params = row.get("전체 파라미터", {})
+    params = params if isinstance(params, dict) else {}
+    row_values: Dict[str, str] = {str(k).strip(): _to_text_value(v) for k, v in params.items()}
+    event_name = str(row.get("이벤트", "")).strip()
+    action, obj = _infer_action_object(event_name)
+    row_values.setdefault("action", action)
+    row_values.setdefault("object", obj)
+    for key in ["target_id", "section_name", "page_id"]:
+        value_text = str(row.get(key, "")).strip()
+        if value_text:
+            row_values.setdefault(key, value_text)
+    row_values.setdefault("description_context", " ".join(
+        [
+            str(row.get("target_id", "")).strip(),
+            str(row.get("section_name", "")).strip(),
+            str(row.get("page_id", "")).strip(),
+            str(row.get("custom_parameters", "")).strip(),
+            str(row.get("selector", "")).strip(),
+        ]
+    ).strip())
+    return row_values
+
+
+def _score_definition_case_match(case: Dict[str, object], row: Dict[str, object], duplicate_case_count: int) -> Dict[str, object]:
+    row_values = _build_rt_row_match_values(row)
+    hints = _build_definition_case_match_hints(case)
+    expected_page_id = _normalize_match_value((case.get("param_values", {}) or {}).get("page_id", "") or case.get("page_id", ""))
+    expected_section_name = _normalize_match_value((case.get("param_values", {}) or {}).get("section_name", "") or case.get("section_name", ""))
+    actual_page_id = _normalize_match_value(row_values.get("page_id", ""))
+    actual_section_name = _normalize_match_value(row_values.get("section_name", ""))
+    if not expected_page_id or not expected_section_name:
+        return {
+            "accepted": False,
+            "score": -999.0,
+            "exact_matches": 0,
+            "description_overlap": 0,
+            "reason": "wrong_row_match",
+        }
+    if actual_page_id != expected_page_id or actual_section_name != expected_section_name:
+        return {
+            "accepted": False,
+            "score": -999.0,
+            "exact_matches": 0,
+            "description_overlap": 0,
+            "reason": "wrong_row_match",
+        }
+    exact_matches = 2
+    mismatch_count = 0
+    score = 10.0
+    for key, weight in {
+        "section_index": 4.0,
+        "action": 2.0,
+        "object": 2.0,
+    }.items():
+        expected = _normalize_match_value(str(case.get(key, "")).strip() or str((case.get("param_values", {}) or {}).get(key, "")).strip())
+        if not expected or _is_definition_placeholder_value(expected):
+            continue
+        actual = _normalize_match_value(row_values.get(key, ""))
+        if actual and actual == expected:
+            exact_matches += 1
+            score += weight
+        elif actual:
+            mismatch_count += 1
+            score -= weight
+    for key, expected in hints.items():
+        expected = _normalize_match_value(expected)
+        actual = _normalize_match_value(row_values.get(key, ""))
+        if _is_auxiliary_common_key_value(key, expected):
+            if actual and actual == expected:
+                score += 0.5
+            continue
+        if actual and actual == expected:
+            exact_matches += 1
+            score += 4.0
+        elif actual:
+            mismatch_count += 1
+            score -= 4.0
+    desc_tokens = _tokenize_match_text(case.get("description", ""))
+    row_tokens = _tokenize_match_text(row_values.get("description_context", ""))
+    overlap = len(desc_tokens & row_tokens)
+    if overlap:
+        score += min(3.0, float(overlap))
+    accepted = True
+    reason = "ok"
+    if duplicate_case_count > 1 and exact_matches <= 2 and overlap == 0:
+        accepted = False
+        reason = "wrong_row_match"
+    elif mismatch_count > 0 and score <= 0:
+        accepted = False
+        reason = "wrong_row_match"
+    return {
+        "accepted": accepted,
+        "score": score,
+        "exact_matches": exact_matches,
+        "description_overlap": overlap,
+        "reason": reason,
+    }
+
+
+def validate_definition_case_params(case: Dict[str, object], params: Dict[str, object]) -> Dict[str, object]:
+    param_map = params if isinstance(params, dict) else {}
+    required = [str(v).strip() for v in case.get("required", []) if str(v).strip()]
+    optional = [str(v).strip() for v in case.get("optional", []) if str(v).strip()]
+    parameter_columns = [str(v).strip() for v in case.get("parameter_columns", []) if str(v).strip()]
+    expected_keys = list(dict.fromkeys(required + optional + parameter_columns))
+    missing = []
+    for key in (required or parameter_columns):
+        value_text = _normalize_match_value(param_map.get(key, ""))
+        if key not in param_map or not value_text:
+            missing.append(key)
+    value_mismatch = []
+    param_values = case.get("param_values", {}) if isinstance(case.get("param_values", {}), dict) else {}
+    for key, expected_raw in param_values.items():
+        expected = _normalize_match_value(expected_raw)
+        if not expected or _is_definition_placeholder_value(expected) or _is_auxiliary_common_key_value(key, expected):
+            continue
+        actual = _normalize_match_value(param_map.get(key, ""))
+        if actual and actual != expected:
+            value_mismatch.append(f"{key}={expected}")
+    extra = []
+    for key, value in param_map.items():
+        key_text = str(key).strip()
+        if not key_text or _is_hidden_default_param_key(key_text):
+            continue
+        if expected_keys and key_text not in expected_keys:
+            extra.append(key_text)
+    if missing:
+        return {
+            "status": "FAIL",
+            "failure_type": "missing_parameter",
+            "message": f"missing_parameter: 필수 누락 {len(missing)}개",
+            "missing_parameters": ", ".join(missing),
+            "extra_parameters": ", ".join(extra),
+        }
+    if value_mismatch:
+        return {
+            "status": "FAIL",
+            "failure_type": "value_mismatch",
+            "message": f"value_mismatch: 기대값 불일치 {len(value_mismatch)}개",
+            "missing_parameters": "-",
+            "extra_parameters": ", ".join(extra),
+        }
+    if extra:
+        return {
+            "status": "WARN",
+            "failure_type": "extra_parameter",
+            "message": f"정의서 외 파라미터 {len(extra)}개",
+            "missing_parameters": "-",
+            "extra_parameters": ", ".join(extra),
+        }
+    return {
+        "status": "PASS",
+        "failure_type": "ok",
+        "message": "정의서 row 충족",
+        "missing_parameters": "-",
+        "extra_parameters": "-",
+    }
+
+
+def build_definition_validation_frames(
+    rt_events: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    summary_cols = [
+        "definition_row_id",
+        "no",
+        "event_name",
+        "description",
+        "page_id",
+        "section_name",
+        "expected_identification",
+        "matched_capture_count",
+        "result",
+        "failure_type",
+        "failure_reason",
+        "missing_parameters",
+        "extra_parameters",
+    ]
+    matches_cols = [
+        "definition_row_id",
+        "no",
+        "event_name",
+        "description",
+        "matched_at",
+        "target_id",
+        "section_name",
+        "page_id",
+        "matched_identification",
+        "match_score",
+        "result",
+        "failure_type",
+        "failure_reason",
+        "missing_parameters",
+        "extra_parameters",
+    ]
+    unmatched_cols = [
+        "event_name",
+        "captured_at",
+        "target_id",
+        "section_name",
+        "page_id",
+        "matched_identification",
+        "failure_type",
+        "reason",
+    ]
+    cases = _iter_definition_cases(schemas)
+    if not cases:
+        return (
+            pd.DataFrame(columns=summary_cols),
+            pd.DataFrame(columns=matches_cols),
+            pd.DataFrame(columns=unmatched_cols),
+        )
+    cases_by_event: Dict[str, List[Dict[str, object]]] = {}
+    for case in cases:
+        cases_by_event.setdefault(str(case.get("event_name", "")).strip(), []).append(case)
+    event_rows = rt_events.to_dict("records") if isinstance(rt_events, pd.DataFrame) and not rt_events.empty else []
+    match_rows: List[Dict[str, object]] = []
+    unmatched_rows: List[Dict[str, object]] = []
+    for row in event_rows:
+        event_name = str(row.get("이벤트", "")).strip()
+        candidates = cases_by_event.get(event_name, [])
+        if not candidates:
+            unmatched_rows.append(
+                {
+                    "event_name": event_name,
+                    "captured_at": str(row.get("시간", "-")).strip() or "-",
+                    "target_id": str(row.get("target_id", "-")).strip() or "-",
+                    "section_name": str(row.get("section_name", "-")).strip() or "-",
+                    "page_id": str(row.get("page_id", "-")).strip() or "-",
+                    "matched_identification": _build_rt_event_identification(row),
+                    "failure_type": "wrong_row_match",
+                    "reason": "정의서에 동일 event_name 없음",
+                }
+            )
+            continue
+        scored = [
+            (
+                case,
+                _score_definition_case_match(case, row, len(candidates)),
+            )
+            for case in candidates
+        ]
+        scored.sort(key=lambda item: (float(item[1].get("score", 0.0)), int(item[1].get("exact_matches", 0))), reverse=True)
+        best_case, best_score = scored[0]
+        if not bool(best_score.get("accepted", False)):
+            unmatched_rows.append(
+                {
+                    "event_name": event_name,
+                    "captured_at": str(row.get("시간", "-")).strip() or "-",
+                    "target_id": str(row.get("target_id", "-")).strip() or "-",
+                    "section_name": str(row.get("section_name", "-")).strip() or "-",
+                    "page_id": str(row.get("page_id", "-")).strip() or "-",
+                    "matched_identification": _build_rt_event_identification(row),
+                    "failure_type": str(best_score.get("reason", "wrong_row_match")).strip() or "wrong_row_match",
+                    "reason": "정의서 내 동일 이벤트명은 있으나 위치/맥락 매칭 실패",
+                }
+            )
+            continue
+        params = row.get("전체 파라미터", {})
+        params = params if isinstance(params, dict) else {}
+        validation = validate_definition_case_params(best_case, params)
+        match_rows.append(
+            {
+                "definition_row_id": str(best_case.get("definition_row_id", "")).strip(),
+                "no": str(best_case.get("no", "")).strip(),
+                "event_name": event_name,
+                "description": str(best_case.get("description", "")).strip(),
+                "matched_at": str(row.get("시간", "-")).strip() or "-",
+                "target_id": str(row.get("target_id", "-")).strip() or "-",
+                "section_name": str(row.get("section_name", "-")).strip() or "-",
+                "page_id": str(row.get("page_id", "-")).strip() or "-",
+                "matched_identification": _build_rt_event_identification(row),
+                "match_score": round(float(best_score.get("score", 0.0)), 2),
+                "result": str(validation.get("status", "WARN")).upper(),
+                "failure_type": str(validation.get("failure_type", "ok")).strip() or "ok",
+                "failure_reason": str(validation.get("message", "-")).strip() or "-",
+                "missing_parameters": str(validation.get("missing_parameters", "-")).strip() or "-",
+                "extra_parameters": str(validation.get("extra_parameters", "-")).strip() or "-",
+            }
+        )
+    matches_df = pd.DataFrame(match_rows, columns=matches_cols)
+    summary_rows: List[Dict[str, object]] = []
+    for case in cases:
+        definition_row_id = str(case.get("definition_row_id", "")).strip()
+        case_matches = matches_df[matches_df["definition_row_id"].astype(str) == definition_row_id].copy() if not matches_df.empty else pd.DataFrame()
+        expected_identification = _build_definition_identification_from_values(case.get("param_values", {}))
+        page_id = str((case.get("param_values", {}) or {}).get("page_id", "")).strip() or "-"
+        section_name = str((case.get("param_values", {}) or {}).get("section_name", "")).strip() or "-"
+        if case_matches.empty:
+            summary_rows.append(
+                {
+                    "definition_row_id": definition_row_id,
+                    "no": str(case.get("no", "")).strip(),
+                    "event_name": str(case.get("event_name", "")).strip(),
+                    "description": str(case.get("description", "")).strip(),
+                    "page_id": page_id,
+                    "section_name": section_name,
+                    "expected_identification": expected_identification,
+                    "matched_capture_count": 0,
+                    "result": "FAIL",
+                    "failure_type": "wrong_row_match",
+                    "failure_reason": "wrong_row_match: 정의서 row 미충족",
+                    "missing_parameters": ", ".join(case.get("required", []) or case.get("parameter_columns", [])) or "-",
+                    "extra_parameters": "-",
+                }
+            )
+            continue
+        ranked = {"PASS": 3, "WARN": 2, "FAIL": 1}
+        case_matches["rank"] = case_matches["result"].astype(str).map(ranked).fillna(0)
+        case_matches = case_matches.sort_values(by=["rank", "match_score"], ascending=[False, False])
+        best_match = case_matches.iloc[0].to_dict()
+        summary_rows.append(
+            {
+                "definition_row_id": definition_row_id,
+                "no": str(case.get("no", "")).strip(),
+                "event_name": str(case.get("event_name", "")).strip(),
+                "description": str(case.get("description", "")).strip(),
+                "page_id": page_id,
+                "section_name": section_name,
+                "expected_identification": expected_identification,
+                "matched_capture_count": int(len(case_matches)),
+                "result": str(best_match.get("result", "WARN")).upper(),
+                "failure_type": str(best_match.get("failure_type", "ok")).strip() or "ok",
+                "failure_reason": str(best_match.get("failure_reason", "-")).strip() or "-",
+                "missing_parameters": str(best_match.get("missing_parameters", "-")).strip() or "-",
+                "extra_parameters": str(best_match.get("extra_parameters", "-")).strip() or "-",
+            }
+        )
+    return (
+        pd.DataFrame(summary_rows, columns=summary_cols),
+        matches_df,
+        pd.DataFrame(unmatched_rows, columns=unmatched_cols),
+    )
+
+
+def build_definition_case_validation_df(rt_events: pd.DataFrame, schemas: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    summary_df, _, _ = build_definition_validation_frames(rt_events, schemas)
+    return summary_df
+
+
+def build_definition_runtime_hints(schemas: Dict[str, Dict[str, object]]) -> Dict[str, List[str]]:
+    hints = {
+        "target_ids": [],
+        "section_names": [],
+        "page_ids": [],
+        "text_hints": [],
+    }
+    seen = {key: set() for key in hints.keys()}
+    for case in _iter_definition_cases(schemas):
+        param_values = case.get("param_values", {}) if isinstance(case.get("param_values", {}), dict) else {}
+        for key in ["button_id", "banner_id", "content_id", "category_id", "filter_value"]:
+            value_text = str(param_values.get(key, "")).strip()
+            if value_text and not _is_definition_placeholder_value(value_text) and value_text not in seen["target_ids"]:
+                seen["target_ids"].add(value_text)
+                hints["target_ids"].append(value_text)
+        for key in ["section_name"]:
+            value_text = str(param_values.get(key, "")).strip()
+            if value_text and not _is_definition_placeholder_value(value_text) and value_text not in seen["section_names"]:
+                seen["section_names"].add(value_text)
+                hints["section_names"].append(value_text)
+        for key in ["page_id"]:
+            value_text = str(param_values.get(key, "")).strip()
+            if value_text and not _is_definition_placeholder_value(value_text) and value_text not in seen["page_ids"]:
+                seen["page_ids"].add(value_text)
+                hints["page_ids"].append(value_text)
+        for key in ["button_name", "content_name", "category_name", "section_title"]:
+            value_text = str(param_values.get(key, "")).strip()
+            if value_text and not _is_definition_placeholder_value(value_text) and value_text not in seen["text_hints"]:
+                seen["text_hints"].add(value_text)
+                hints["text_hints"].append(value_text)
+    return hints
+
+
+def parse_uploaded_definition_schemas(df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    if df.empty:
+        return {}
+
+    out: Dict[str, Dict[str, object]] = {}
+    now_iso = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    columns = {str(col).strip().lower(): col for col in df.columns}
+
+    if "event name" in columns and "params.key" in columns:
+        event_col = columns["event name"]
+        param_col = columns["params.key"]
+        req_col = columns.get("req")
+        current_event = ""
+        current_meta: Dict[str, object] = {}
+        for row_index, raw_row in enumerate(df.to_dict("records")):
+            event_name = str(raw_row.get(event_col, "")).strip()
+            if event_name:
+                current_event = event_name
+                current_meta = {"raw_row_index": str(row_index)}
+                _merge_definition_schema_entry(out, current_event, [], [], [], current_meta, now_iso)
+            if not current_event:
+                continue
+            param_name = normalize_param_name(str(raw_row.get(param_col, "")).strip())
+            if not param_name:
+                continue
+            bucket = "required" if _is_required_flag(raw_row.get(req_col, "")) else "optional"
+            _merge_definition_schema_entry(
+                out,
+                current_event,
+                [param_name] if bucket == "required" else [],
+                [param_name] if bucket == "optional" else [],
+                [param_name],
+                current_meta,
+                now_iso,
+            )
+        return out
+
+    if "event_name" in columns and ("required" in columns or "optional" in columns):
+        event_col = columns["event_name"]
+        required_col = columns.get("required")
+        optional_col = columns.get("optional")
+        for row_index, raw_row in enumerate(df.to_dict("records")):
+            event_name = str(raw_row.get(event_col, "")).strip()
+            if not event_name:
+                continue
+            required = [
+                normalize_param_name(v)
+                for v in parse_csv_list(str(raw_row.get(required_col, "")))
+            ] if required_col else []
+            optional = [
+                normalize_param_name(v)
+                for v in parse_csv_list(str(raw_row.get(optional_col, "")))
+            ] if optional_col else []
+            meta = {"raw_row_index": str(row_index)}
+            _merge_definition_schema_entry(
+                out,
+                event_name,
+                [v for v in required if v],
+                [v for v in optional if v and v not in required],
+                [v for v in list(dict.fromkeys([*required, *optional])) if v],
+                meta,
+                now_iso,
+            )
+        return out
+
+    if "event_name" in columns and "parameter" in columns:
+        event_col = columns["event_name"]
+        param_col = columns["parameter"]
+        req_col = columns.get("req") or columns.get("required")
+        for row_index, raw_row in enumerate(df.to_dict("records")):
+            event_name = str(raw_row.get(event_col, "")).strip()
+            param_name = normalize_param_name(str(raw_row.get(param_col, "")).strip())
+            if not event_name or not param_name:
+                continue
+            bucket = "required" if _is_required_flag(raw_row.get(req_col, "")) else "optional"
+            _merge_definition_schema_entry(
+                out,
+                event_name,
+                [param_name] if bucket == "required" else [],
+                [param_name] if bucket == "optional" else [],
+                [param_name],
+                {"raw_row_index": str(row_index)},
+                now_iso,
+            )
+        return out
+
+    raise ValueError("지원 형식이 아닙니다. event_definition.csv 또는 event_name/required/optional 컬럼 형식을 사용하세요.")
+
+
+def _read_uploaded_csv_candidates(raw_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
+    debug: Dict[str, object] = {"read_attempts": [], "selected_encoding": "", "failure_stage": "", "final_validation_reason": ""}
+    structured_df = pd.DataFrame()
+    raw_df = pd.DataFrame()
+    last_error = ""
+    for encoding in encodings:
+        try:
+            structured_df = pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding)
+            debug["read_attempts"].append(f"structured:{encoding}:ok")
+            debug["selected_encoding"] = encoding
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            debug["read_attempts"].append(f"structured:{encoding}:fail")
+    for encoding in encodings:
+        try:
+            raw_df = pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, header=None)
+            debug["read_attempts"].append(f"raw:{encoding}:ok")
+            if not debug["selected_encoding"]:
+                debug["selected_encoding"] = encoding
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            debug["read_attempts"].append(f"raw:{encoding}:fail")
+    if structured_df.empty and raw_df.empty and last_error:
+        debug["failure_stage"] = "파일 읽기 실패"
+        debug["final_validation_reason"] = f"CSV 읽기 실패: {last_error}"
+    return structured_df, raw_df, debug
+
+
+def load_uploaded_definition_schemas(uploaded_file) -> Tuple[Dict[str, Dict[str, object]], pd.DataFrame, Dict[str, object]]:
+    if uploaded_file is None:
+        return {}, pd.DataFrame(columns=["event_name", "no", "action", "object", "required_count", "optional_count", "required", "optional", "updated_at"]), {}
+    raw_bytes = uploaded_file.getvalue()
+    if not raw_bytes:
+        return {}, pd.DataFrame(columns=["event_name", "no", "action", "object", "required_count", "optional_count", "required", "optional", "updated_at"]), {
+            "failure_stage": "파일 읽기 실패",
+            "final_validation_reason": "업로드 파일이 비어 있습니다.",
+        }
+    suffix = Path(str(getattr(uploaded_file, "name", "") or "")).suffix.lower()
+    schemas: Dict[str, Dict[str, object]] = {}
+    debug_info: Dict[str, object] = {
+        "file_name": str(getattr(uploaded_file, "name", "")).strip(),
+        "file_type": suffix,
+        "fallback_used": False,
+        "failure_stage": "",
+        "final_validation_reason": "",
+    }
+    if suffix in {".xlsx", ".xls"}:
+        try:
+            excel = pd.ExcelFile(io.BytesIO(raw_bytes))
+        except Exception as exc:
+            debug_info["failure_stage"] = "파일 읽기 실패"
+            debug_info["final_validation_reason"] = f"엑셀 파일을 열지 못했습니다: {exc}"
+            return {}, pd.DataFrame(columns=["event_name", "no", "action", "object", "required_count", "optional_count", "required", "optional", "updated_at"]), debug_info
+        sheet_debugs: List[Dict[str, object]] = []
+        for sheet_name in excel.sheet_names:
+            source_df = pd.read_excel(excel, sheet_name=sheet_name)
+            raw_sheet_df = pd.read_excel(excel, sheet_name=sheet_name, header=None)
+            sheet_schemas, sheet_debug = _parse_definition_schemas_with_fallback(source_df, raw_sheet_df)
+            sheet_debug["sheet_name"] = sheet_name
+            sheet_debugs.append(sheet_debug)
+            if sheet_schemas:
+                schemas.update(sheet_schemas)
+                debug_info.update(sheet_debug)
+                break
+        debug_info["sheet_debugs"] = sheet_debugs
+    else:
+        source_df, raw_df, read_debug = _read_uploaded_csv_candidates(raw_bytes)
+        debug_info.update(read_debug)
+        schemas, parse_debug = _parse_definition_schemas_with_fallback(source_df, raw_df)
+        debug_info.update(parse_debug)
+    if not schemas:
+        failure_stage = str(debug_info.get("failure_stage", "")).strip() or "validation 실패"
+        final_reason = str(debug_info.get("final_validation_reason", "")).strip() or "유효한 이벤트 테이블을 만들지 못했습니다."
+        raise DefinitionUploadError(f"{failure_stage}: {final_reason}", debug_info=debug_info)
+    debug_info["parsed_event_count"] = len(schemas)
+    debug_info["sample_event_names"] = list(schemas.keys())[:5]
+    debug_info["final_validation_reason"] = "ok"
+    return schemas, build_schema_catalog_df(schemas), debug_info
+
+
 def infer_event_schema_from_rows(
     rt_events: pd.DataFrame,
     event_name: str,
@@ -540,6 +1748,9 @@ def validate_schema_for_event(
     schema = schemas.get(str(event_name).strip(), {})
     required = [str(v).strip() for v in schema.get("required", []) if str(v).strip()] if isinstance(schema, dict) else []
     optional = [str(v).strip() for v in schema.get("optional", []) if str(v).strip()] if isinstance(schema, dict) else []
+    parameter_columns = _schema_parameter_columns(event_name, schemas)
+    if not required and not optional and parameter_columns:
+        required = list(parameter_columns)
     checks: List[Dict[str, object]] = []
 
     if not required and not optional:
@@ -744,38 +1955,360 @@ def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
         return b""
 
 
+def _parse_pipe_kv_text(text: object) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for chunk in str(text or "").split(" | "):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key_text = str(key).strip()
+        value_text = str(value).strip()
+        if key_text and key_text not in out:
+            out[key_text] = value_text
+    return out
+
+
+def _build_event_definition_lookup(event_definition_df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    lookup: Dict[str, Dict[str, object]] = {}
+    current_event_no = ""
+    for row in event_definition_df.to_dict("records") if isinstance(event_definition_df, pd.DataFrame) and not event_definition_df.empty else []:
+        row_no = str(row.get("no", "")).strip()
+        if row_no:
+            current_event_no = row_no
+            lookup[current_event_no] = {
+                "event_name": str(row.get("event name", "")).strip(),
+                "action": str(row.get("action", "")).strip(),
+                "object": str(row.get("object", "")).strip(),
+                "rows": [],
+            }
+        if not current_event_no or current_event_no not in lookup:
+            continue
+        param_key = str(row.get("params.key", "")).strip()
+        if not param_key:
+            continue
+        lookup[current_event_no]["rows"].append(
+            {
+                "params.key": param_key,
+                "req": str(row.get("req", "")).strip(),
+                "params.value": str(row.get("params.value", "")).strip(),
+            }
+        )
+    return lookup
+
+
+def build_qa_review_excel_bytes(
+    event_definition_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+    definition_validation_summary_df: pd.DataFrame | None = None,
+    bundle_scope: str = "custom_event_review",
+) -> bytes:
+    wb = Workbook()
+    default_ws = wb.active
+    wb.remove(default_ws)
+    if str(bundle_scope or "").strip() == "definition_validation" and isinstance(definition_validation_summary_df, pd.DataFrame):
+        ws = wb.create_sheet("Definition Summary")
+        ws["A1"] = to_excel_safe_text("Definition Validation Summary")
+        ws["A1"].font = Font(bold=True, size=14)
+        if definition_validation_summary_df.empty:
+            ws["A3"] = to_excel_safe_text("데이터가 없습니다.")
+        else:
+            cols = [col for col in ["definition_row_id", "no", "event_name", "description", "section_name", "matched_capture_count", "result", "failure_reason", "missing_parameters", "extra_parameters"] if col in definition_validation_summary_df.columns]
+            for col_idx, col_name in enumerate(cols, start=1):
+                cell = ws.cell(row=3, column=col_idx, value=to_excel_safe_text(col_name))
+                cell.font = Font(bold=True)
+            for row_idx, (_, row) in enumerate(definition_validation_summary_df[cols].fillna("-").iterrows(), start=4):
+                for col_idx, col_name in enumerate(cols, start=1):
+                    ws.cell(row=row_idx, column=col_idx, value=to_excel_safe_text(row.get(col_name, "-")))
+    if event_detail_df.empty:
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
+
+    detail_lookup = _build_event_definition_lookup(event_definition_df)
+    work = event_detail_df.copy()
+    work["sheet_group"] = work["screenshot_file"].astype(str).replace("-", "").str.strip()
+    work.loc[work["sheet_group"] == "", "sheet_group"] = work["event no"].astype(str).radd("event_")
+    grouped = list(work.groupby("sheet_group", sort=False))
+    for sheet_index, (_, group_df) in enumerate(grouped, start=1):
+        first = group_df.iloc[0].to_dict()
+        event_label = str(first.get("custom_event", first.get("event_name", "review"))).strip() or "review"
+        sheet_name = f"{sheet_index:02d}_{event_label}"[:31]
+        ws = wb.create_sheet(sheet_name)
+        ws["A1"] = to_excel_safe_text("QA Review Sheet")
+        ws["A1"].font = Font(bold=True, size=14)
+        ws["A2"] = to_excel_safe_text(f"group={sheet_index} | event_count={len(group_df)}")
+        cursor = 4
+        screenshot_rel = str(first.get("screenshot_file", "")).strip()
+        screenshot_abs = BASE_DIR / screenshot_rel if screenshot_rel and screenshot_rel != "-" else None
+        if screenshot_abs and screenshot_abs.exists():
+            try:
+                img = OpenpyxlImage(str(screenshot_abs))
+                if getattr(img, "width", 0) and img.width > 900:
+                    ratio = 900.0 / float(img.width)
+                    img.width = int(img.width * ratio)
+                    img.height = int(img.height * ratio)
+                ws.add_image(img, f"A{cursor}")
+                cursor += 24
+            except Exception:
+                ws[f"A{cursor}"] = to_excel_safe_text(f"image load failed: {screenshot_rel}")
+                cursor += 2
+        else:
+            ws[f"A{cursor}"] = to_excel_safe_text("screenshot not available")
+            cursor += 2
+        for _, event_row in group_df.iterrows():
+            row_dict = event_row.to_dict()
+            event_no = str(row_dict.get("event no", "")).strip()
+            ws[f"A{cursor}"] = to_excel_safe_text(f"Event #{event_no or '-'}")
+            ws[f"A{cursor}"].font = Font(bold=True)
+            cursor += 1
+            summary_pairs = [
+                ("event_name", str(row_dict.get("custom_event", row_dict.get("event_name", "-"))).strip() or "-"),
+                ("target_id", str(row_dict.get("target_id", "-")).strip() or "-"),
+                ("section_name", str(row_dict.get("section_name", "-")).strip() or "-"),
+                ("page_id", str(row_dict.get("page_id", "-")).strip() or "-"),
+                ("status", str(row_dict.get("status", "-")).strip() or "-"),
+            ]
+            for key, value in summary_pairs:
+                ws.cell(row=cursor, column=1, value=to_excel_safe_text(key))
+                ws.cell(row=cursor, column=2, value=to_excel_safe_text(value))
+                cursor += 1
+            cursor += 1
+            headers = ["event definition", "parameter definition", "actual value", "class-attribute", "status"]
+            for col_idx, header in enumerate(headers, start=1):
+                cell = ws.cell(row=cursor, column=col_idx, value=to_excel_safe_text(header))
+                cell.font = Font(bold=True)
+            cursor += 1
+            actual_map = {}
+            actual_map.update(_parse_pipe_kv_text(row_dict.get("custom_parameters", "")))
+            actual_map.update(_parse_pipe_kv_text(row_dict.get("extra_custom_parameters", "")))
+            param_rows = detail_lookup.get(event_no, {}).get("rows", [])
+            if not param_rows:
+                param_rows = [{"params.key": key, "req": "", "params.value": ""} for key in actual_map.keys()]
+            for idx, param_row in enumerate(param_rows):
+                param_key = str(param_row.get("params.key", "")).strip()
+                actual_value = actual_map.get(param_key, "-")
+                param_status = "missing" if _is_missing_like_value(str(actual_value)) else str(row_dict.get("status", "-")).strip() or "-"
+                ws.cell(row=cursor, column=1, value=to_excel_safe_text(str(row_dict.get("custom_event", row_dict.get("event_name", "-"))) if idx == 0 else ""))
+                definition_text = f"{param_key} ({str(param_row.get('req', '')).strip() or 'N'})"
+                expected_text = str(param_row.get("params.value", "")).strip() or "-"
+                ws.cell(row=cursor, column=2, value=to_excel_safe_text(f"{definition_text} / expected={expected_text}"))
+                ws.cell(row=cursor, column=3, value=to_excel_safe_text(actual_value))
+                ws.cell(row=cursor, column=4, value=to_excel_safe_text(str(row_dict.get("class_attribute", "-")).strip() or "-"))
+                ws.cell(row=cursor, column=5, value=to_excel_safe_text(param_status))
+                cursor += 1
+            cursor += 2
+        ws.column_dimensions["A"].width = 26
+        ws.column_dimensions["B"].width = 46
+        ws.column_dimensions["C"].width = 32
+        ws.column_dimensions["D"].width = 24
+        ws.column_dimensions["E"].width = 18
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def build_log_definition_excel_bytes(
+    event_definition_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+) -> bytes:
+    wb = Workbook()
+    default_ws = wb.active
+    wb.remove(default_ws)
+    if event_definition_df.empty:
+        ws = wb.create_sheet("log_definition")
+        ws["A1"] = to_excel_safe_text("데이터가 없습니다.")
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
+
+    detail_map: Dict[str, Dict[str, object]] = {}
+    if isinstance(event_detail_df, pd.DataFrame) and not event_detail_df.empty:
+        for row in event_detail_df.to_dict("records"):
+            event_no = str(row.get("event no", "")).strip()
+            if event_no and event_no not in detail_map:
+                detail_map[event_no] = row
+
+    grouped_rows: List[Tuple[str, pd.DataFrame]] = []
+    work = event_definition_df.copy()
+    work["sheet_group"] = work["screenshot_file"].astype(str).replace("-", "").str.strip()
+    current_group = ""
+    group_keys: List[str] = []
+    for row in work.to_dict("records"):
+        row_no = str(row.get("no", "")).strip()
+        if row_no:
+            current_group = str(row.get("screenshot_file", "")).strip() or f"event_{row_no}"
+            if current_group not in group_keys:
+                group_keys.append(current_group)
+        row["sheet_group"] = current_group or str(row.get("screenshot_file", "")).strip() or "group"
+    work = pd.DataFrame(work.to_dict("records"))
+    for group_key in group_keys or sorted(work["sheet_group"].astype(str).unique().tolist()):
+        grouped_rows.append((group_key, work[work["sheet_group"].astype(str) == str(group_key)].copy()))
+
+    for idx, (group_key, group_df) in enumerate(grouped_rows, start=1):
+        event_start_rows = group_df[group_df["no"].astype(str).str.strip() != ""].copy()
+        first_no = str(event_start_rows.iloc[0]["no"]).strip() if not event_start_rows.empty else ""
+        detail = detail_map.get(first_no, {})
+        section_name = str(detail.get("section_name", "")).strip() or str(group_df.iloc[0].get("section_name", "")).strip() or "review"
+        sheet_name = to_excel_safe_text(f"{section_name}_{idx}")[:31] or f"review_{idx}"
+        ws = wb.create_sheet(sheet_name)
+        ws["A1"] = to_excel_safe_text("로그정의서 생성")
+        ws["A1"].font = Font(bold=True, size=14)
+        screenshot_rel = str(detail.get("screenshot_file", "")).strip() or str(group_df.iloc[0].get("screenshot_file", "")).strip()
+        cursor = 3
+        screenshot_abs = BASE_DIR / screenshot_rel if screenshot_rel and screenshot_rel != "-" else None
+        if screenshot_abs and screenshot_abs.exists():
+            try:
+                img = OpenpyxlImage(str(screenshot_abs))
+                if getattr(img, "width", 0) and img.width > 900:
+                    ratio = 900.0 / float(img.width)
+                    img.width = int(img.width * ratio)
+                    img.height = int(img.height * ratio)
+                ws.add_image(img, f"A{cursor}")
+                cursor += 24
+            except Exception:
+                ws[f"A{cursor}"] = to_excel_safe_text(f"image load failed: {screenshot_rel}")
+                cursor += 2
+        else:
+            ws[f"A{cursor}"] = to_excel_safe_text("screenshot not available")
+            cursor += 2
+        headers = [
+            "action",
+            "object",
+            "event name",
+            "params.key",
+            "req",
+            "params.value (as-is)",
+            "params.value",
+            "class-attribute",
+            "status",
+        ]
+        for col_idx, header in enumerate(headers, start=1):
+            cell = ws.cell(row=cursor, column=col_idx, value=to_excel_safe_text(header))
+            cell.font = Font(bold=True)
+        cursor += 1
+        for _, row in group_df.iterrows():
+            for col_idx, header in enumerate(headers, start=1):
+                ws.cell(row=cursor, column=col_idx, value=to_excel_safe_text(row.get(header, "")))
+            cursor += 1
+        ws.column_dimensions["A"].width = 18
+        ws.column_dimensions["B"].width = 18
+        ws.column_dimensions["C"].width = 28
+        ws.column_dimensions["D"].width = 24
+        ws.column_dimensions["E"].width = 8
+        ws.column_dimensions["F"].width = 28
+        ws.column_dimensions["G"].width = 28
+        ws.column_dimensions["H"].width = 22
+        ws.column_dimensions["I"].width = 14
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def build_qa_summary_export_df(
+    event_detail_df: pd.DataFrame,
+    definition_validation_summary_df: pd.DataFrame | None = None,
+    bundle_scope: str = "custom_event_review",
+) -> pd.DataFrame:
+    if str(bundle_scope or "").strip() == "definition_validation" and isinstance(definition_validation_summary_df, pd.DataFrame):
+        return definition_validation_summary_df.copy()
+    if event_detail_df.empty:
+        return pd.DataFrame(
+            columns=["event_no", "custom_event", "identification", "target_id", "section_name", "page_id", "status", "custom_parameters"]
+        )
+    rows: List[Dict[str, object]] = []
+    for row in event_detail_df.to_dict("records"):
+        rows.append(
+            {
+                "event_no": str(row.get("event no", "")).strip(),
+                "custom_event": str(row.get("custom_event", row.get("event_name", ""))).strip(),
+                "identification": str(row.get("identification", "-")).strip() or "-",
+                "target_id": str(row.get("target_id", "-")).strip() or "-",
+                "section_name": str(row.get("section_name", "-")).strip() or "-",
+                "page_id": str(row.get("page_id", "-")).strip() or "-",
+                "status": str(row.get("status", "-")).strip() or "-",
+                "custom_parameters": str(row.get("custom_parameters", "-")).strip() or "-",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_qa_debug_export_df(
+    event_detail_df: pd.DataFrame,
+    definition_validation_matches_df: pd.DataFrame | None = None,
+    definition_validation_unmatched_df: pd.DataFrame | None = None,
+    bundle_scope: str = "custom_event_review",
+) -> pd.DataFrame:
+    if str(bundle_scope or "").strip() == "definition_validation":
+        parts: List[pd.DataFrame] = []
+        if isinstance(definition_validation_matches_df, pd.DataFrame) and not definition_validation_matches_df.empty:
+            matches = definition_validation_matches_df.copy()
+            matches.insert(0, "record_type", "matched")
+            parts.append(matches)
+        if isinstance(definition_validation_unmatched_df, pd.DataFrame) and not definition_validation_unmatched_df.empty:
+            unmatched = definition_validation_unmatched_df.copy()
+            unmatched.insert(0, "record_type", "unmatched")
+            parts.append(unmatched)
+        if not parts:
+            return pd.DataFrame(columns=["record_type"])
+        return pd.concat(parts, ignore_index=True)
+    return event_detail_df.drop(columns=["raw_payload_json"], errors="ignore").copy() if isinstance(event_detail_df, pd.DataFrame) else pd.DataFrame()
+
+
+def build_zip_bytes(file_map: Dict[str, bytes]) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_name, payload in file_map.items():
+            if not payload:
+                continue
+            zf.writestr(str(file_name), payload)
+    return out.getvalue()
+
+
 def build_event_logs_export_df(rt_events: pd.DataFrame) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     if rt_events.empty:
-        return pd.DataFrame(columns=["timestamp", "custom_event", "page_id", "custom_parameter", "custom_value"])
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "custom_event",
+                "custom_parameter",
+                "target_id",
+                "selector",
+                "screen_name",
+                "screenshot_path",
+                "bounding_box",
+                "annotation_no",
+                "page_id",
+                "status",
+            ]
+        )
     for row in rt_events.to_dict("records"):
         event_name = str(row.get("custom_event", row.get("이벤트", ""))).strip()
         timestamp = str(row.get("시간", "-"))
         params = row.get("전체 파라미터", {})
-        if not isinstance(params, dict):
-            params = {}
-        page_id = _to_text_value(params.get("page_id", ""))
-        if not params:
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "custom_event": event_name,
-                    "page_id": page_id or "-",
-                    "custom_parameter": "-",
-                    "custom_value": "-",
-                }
-            )
-            continue
-        for key, value in params.items():
-            rows.append(
-                {
-                    "timestamp": timestamp,
-                    "custom_event": event_name,
-                    "page_id": page_id or "-",
-                    "custom_parameter": str(key),
-                    "custom_value": _to_text_value(value),
-                }
-            )
+        params = params if isinstance(params, dict) else {}
+        custom_parameter = str(row.get("custom_parameters", "")).strip() or "-"
+        bounding_box = {
+            "x": int(pd.to_numeric(row.get("bbox_x", 0), errors="coerce") or 0),
+            "y": int(pd.to_numeric(row.get("bbox_y", 0), errors="coerce") or 0),
+            "width": int(pd.to_numeric(row.get("bbox_width", 0), errors="coerce") or 0),
+            "height": int(pd.to_numeric(row.get("bbox_height", 0), errors="coerce") or 0),
+        }
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "custom_event": event_name,
+                "custom_parameter": custom_parameter,
+                "target_id": str(row.get("target_id", "-")).strip() or "-",
+                "selector": str(row.get("selector", "-")).strip() or "-",
+                "screen_name": str(row.get("screen_name", row.get("page_id", "-"))).strip() or "-",
+                "screenshot_path": str(row.get("screenshot_path", row.get("selector_screenshot", "-"))).strip() or "-",
+                "bounding_box": json.dumps(bounding_box, ensure_ascii=False),
+                "annotation_no": str(row.get("annotation_no", "")).strip() or "-",
+                "page_id": str(row.get("page_id", _to_text_value(params.get("page_id", ""))) or "-").strip() or "-",
+                "status": str(row.get("status", row.get("상태", "-"))).strip() or "-",
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -789,11 +2322,13 @@ def build_parameter_validation_export_df(rt_events: pd.DataFrame, schemas: Dict[
         check = validate_schema_for_event(event_name=event_name, params=params, schemas=schemas)
         schema_required = set()
         schema_optional = set()
+        schema_parameter_columns = set()
         schema_obj = schemas.get(event_name, {})
         if isinstance(schema_obj, dict):
             schema_required = {str(v).strip() for v in schema_obj.get("required", []) if str(v).strip()}
             schema_optional = {str(v).strip() for v in schema_obj.get("optional", []) if str(v).strip()}
-        known_schema_params = schema_required | schema_optional
+            schema_parameter_columns = {str(v).strip() for v in schema_obj.get("parameter_columns", []) if str(v).strip()}
+        known_schema_params = schema_required | schema_optional | schema_parameter_columns
 
         for item in check.get("checks", []) if isinstance(check.get("checks", []), list) else []:
             if not isinstance(item, dict):
@@ -1014,6 +2549,76 @@ def build_event_qa_report_export_df(
             }
         )
     return pd.DataFrame(rows).sort_values(by=["result", "test_count", "event_name"], ascending=[True, False, True])
+
+
+def build_definition_validation_issue_df(
+    rt_events: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+    issue_df: pd.DataFrame,
+) -> pd.DataFrame:
+    case_df = build_definition_case_validation_df(rt_events, schemas)
+    if case_df.empty:
+        return pd.DataFrame(columns=["no", "event_name", "description", "status", "reason", "count"])
+    issue_rows: List[Dict[str, object]] = []
+    for row in case_df.to_dict("records"):
+        result = str(row.get("result", "WARN")).upper()
+        if result == "PASS":
+            continue
+        issue_rows.append(
+            {
+                "no": str(row.get("no", "")).strip(),
+                "event_name": str(row.get("event_name", "")).strip(),
+                "description": str(row.get("description", "")).strip(),
+                "status": result,
+                "reason": str(row.get("failure_reason", "-")).strip() or "-",
+                "count": 1,
+            }
+        )
+    if not issue_rows:
+        return pd.DataFrame(columns=["no", "event_name", "description", "status", "reason", "count"])
+    return pd.DataFrame(issue_rows).sort_values(by=["status", "event_name", "no"], ascending=[True, True, True]).reset_index(drop=True)
+
+
+def build_definition_validation_report_df(
+    rt_events: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+    issue_df: pd.DataFrame,
+    parameter_validation_df: pd.DataFrame,
+    order_validation_df: pd.DataFrame,
+) -> pd.DataFrame:
+    case_df = build_definition_case_validation_df(rt_events, schemas)
+    if case_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "definition_row_id",
+                "no",
+                "event_name",
+                "description",
+                "expected_identification",
+                "page_id",
+                "section_name",
+                "schema_status",
+                "matched_capture_count",
+                "result",
+                "failure_reason",
+                "missing_parameters",
+                "extra_parameters",
+            ]
+        )
+    report_df = case_df.rename(columns={"result": "schema_status"}).copy()
+    report_df["result"] = report_df["schema_status"]
+    return report_df.sort_values(by=["result", "event_name", "no"], ascending=[True, True, True]).reset_index(drop=True)
+
+
+def summarize_event_qa_report(report_df: pd.DataFrame) -> Dict[str, int]:
+    out = {"PASS": 0, "WARN": 0, "FAIL": 0}
+    if report_df.empty or "result" not in report_df.columns:
+        return out
+    for value in report_df["result"].astype(str):
+        key = value.strip().upper()
+        if key in out:
+            out[key] += 1
+    return out
 
 
 def _infer_action_object(event_name: str) -> Tuple[str, str]:
@@ -1284,7 +2889,10 @@ def _build_event_meta(row: pd.Series, params: Dict[str, object], auto_ctx: Dict[
     )
     screenshot_file = (
         _to_text_value(params.get("qa_selector_screenshot", ""))
+        or _to_text_value(params.get("qa_screenshot_path", ""))
+        or _to_text_value(params.get("screenshot_path", ""))
         or _to_text_value(params.get("selector_screenshot", ""))
+        or _to_text_value(ctx.get("screenshot_path", ""))
         or _to_text_value(ctx.get("selector_screenshot", ""))
     )
     raw_screenshot_file = (
@@ -1292,14 +2900,29 @@ def _build_event_meta(row: pd.Series, params: Dict[str, object], auto_ctx: Dict[
         or _to_text_value(params.get("raw_screenshot_file", ""))
         or _to_text_value(ctx.get("raw_screenshot_file", ""))
     )
+    screen_name = (
+        _to_text_value(params.get("qa_screen_name", ""))
+        or _to_text_value(params.get("screen_name", ""))
+        or _to_text_value(ctx.get("screen_name", ""))
+        or page_id
+        or "default"
+    )
+    annotation_no = (
+        _to_text_value(params.get("qa_annotation_no", ""))
+        or _to_text_value(params.get("annotation_no", ""))
+        or _to_text_value(ctx.get("annotation_no", ""))
+    )
     return {
         "page_url": page_url,
         "page_id": page_id,
+        "screen_name": screen_name,
         "section_name": section_name,
         "target_id": target_id or "-",
         "selector": selector or "-",
         "class_attribute": class_attribute or "-",
         "screen_state": screen_state or "default",
+        "annotation_no": annotation_no or "-",
+        "screenshot_path": screenshot_file,
         "screenshot_file": screenshot_file,
         "raw_screenshot_file": raw_screenshot_file,
         "bbox_x": _to_text_value(params.get("qa_bbox_x", params.get("bbox_x", ctx.get("bbox_x", 0)))),
@@ -1887,10 +3510,12 @@ def build_event_definition_bundle_html(
       <h1>Event Definition Review Report</h1>
       <p>HTML 하나만 열어도 어느 위치를 테스트했는지, 어떤 custom event가 수집됐는지, 핵심 custom parameter가 무엇인지 빠르게 검수할 수 있도록 구성했습니다.</p>
       <p>project={html.escape(str(meta.get("project_slug", "-")))} | session={html.escape(str(meta.get("session_id", "-")))} | run_id={html.escape(str(meta.get("run_id", "-")))} | events={summary_count}</p>
+      <p>scope={html.escape(str(meta.get("bundle_scope", "custom_event_review")))} | definition={html.escape(str(meta.get("definition_file_name", "-") or "-"))} | definition_events={html.escape(str(meta.get("definition_event_count", 0)))}</p>
       <div class="file-links">
         <a href="event_definition.csv">1. 이벤트 정의 CSV</a>
         <a href="event_support.csv">2. annotation 지원 CSV</a>
         <a href="event_review_details.csv">3. 이벤트별 상세 검수 산출물</a>
+        <a href="qa_review.xlsx">4. QA Review Excel</a>
       </div>
     </section>
     <section class="layout">
@@ -2035,41 +3660,177 @@ def build_event_definition_bundle_html(
 """
 
 
+def _build_simple_html_table(df: pd.DataFrame, columns: List[str]) -> str:
+    if df.empty:
+        return "<p class='empty'>데이터가 없습니다.</p>"
+    head = "".join([f"<th>{html.escape(str(col))}</th>" for col in columns])
+    body_rows: List[str] = []
+    for _, row in df[columns].fillna("-").iterrows():
+        cells = "".join([f"<td>{html.escape(str(row.get(col, '-')))}</td>" for col in columns])
+        body_rows.append(f"<tr>{cells}</tr>")
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+
+
+def build_definition_validation_bundle_html(
+    meta: Dict[str, object],
+    summary_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    unmatched_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+) -> str:
+    pass_count = int((summary_df.get("result", pd.Series(dtype=str)).astype(str) == "PASS").sum()) if not summary_df.empty else 0
+    warn_count = int((summary_df.get("result", pd.Series(dtype=str)).astype(str) == "WARN").sum()) if not summary_df.empty else 0
+    fail_count = int((summary_df.get("result", pd.Series(dtype=str)).astype(str) == "FAIL").sum()) if not summary_df.empty else 0
+    matched_rows = int((pd.to_numeric(summary_df.get("matched_capture_count", 0), errors="coerce").fillna(0) > 0).sum()) if not summary_df.empty else 0
+    missing_rows = int((pd.to_numeric(summary_df.get("matched_capture_count", 0), errors="coerce").fillna(0) == 0).sum()) if not summary_df.empty else 0
+    summary_html = _build_simple_html_table(
+        summary_df,
+        [col for col in ["definition_row_id", "no", "event_name", "description", "section_name", "matched_capture_count", "result", "failure_reason", "missing_parameters", "extra_parameters"] if col in summary_df.columns],
+    )
+    matches_html = _build_simple_html_table(
+        matches_df,
+        [col for col in ["definition_row_id", "no", "event_name", "description", "matched_at", "matched_identification", "match_score", "result", "failure_reason"] if col in matches_df.columns],
+    )
+    unmatched_html = _build_simple_html_table(
+        unmatched_df,
+        [col for col in ["event_name", "captured_at", "matched_identification", "reason"] if col in unmatched_df.columns],
+    )
+    card_html = _build_simple_html_table(
+        event_detail_df.drop(columns=["raw_payload_json"], errors="ignore"),
+        [col for col in ["event no", "custom_event", "identification", "target_id", "section_name", "page_id", "status", "custom_parameters"] if col in event_detail_df.columns],
+    )
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Definition Validation Report</title>
+  <style>
+    body {{ margin: 0; background: #f5f1ea; color: #1f2937; font-family: Arial, sans-serif; }}
+    main {{ max-width: 1480px; margin: 0 auto; padding: 24px; }}
+    .hero, .panel {{ background: #fffdf8; border: 1px solid #d7d1c7; border-radius: 18px; padding: 20px; margin-bottom: 18px; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }}
+    .metric {{ background: #fff; border: 1px solid #e5dfd4; border-radius: 14px; padding: 12px; }}
+    .metric strong {{ display: block; font-size: 24px; margin-top: 6px; }}
+    .file-links {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }}
+    .file-links a {{ text-decoration: none; color: #0f766e; border-bottom: 1px solid currentColor; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+    th, td {{ border-bottom: 1px solid #ece5d9; padding: 10px 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #f8f4ec; }}
+    .empty {{ color: #6b7280; }}
+    @media (max-width: 1024px) {{ .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>Definition Validation Report</h1>
+      <p>정의서의 각 row가 이번 세션에서 충족됐는지를 기준으로 판정한 리포트입니다.</p>
+      <p>session id={html.escape(str(meta.get("session_id", "-")))} | definition file={html.escape(str(meta.get("definition_file_name", "-") or "-"))}</p>
+      <div class="metrics">
+        <div class="metric">definition rows<strong>{len(summary_df)}</strong></div>
+        <div class="metric">matched rows<strong>{matched_rows}</strong></div>
+        <div class="metric">missing rows<strong>{missing_rows}</strong></div>
+        <div class="metric">PASS<strong>{pass_count}</strong></div>
+        <div class="metric">WARN<strong>{warn_count}</strong></div>
+        <div class="metric">FAIL<strong>{fail_count}</strong></div>
+      </div>
+      <div class="file-links">
+        <a href="definition_validation_summary.csv">definition_validation_summary.csv</a>
+        <a href="definition_validation_matches.csv">definition_validation_matches.csv</a>
+        <a href="definition_validation_unmatched.csv">definition_validation_unmatched.csv</a>
+        <a href="qa_review.xlsx">qa_review.xlsx</a>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Definition Row Summary</h2>
+      {summary_html}
+    </section>
+    <section class="panel">
+      <h2>Definition Row Matches</h2>
+      {matches_html}
+    </section>
+    <section class="panel">
+      <h2>Unmatched Captures</h2>
+      {unmatched_html}
+    </section>
+    <section class="panel">
+      <h2>Captured Event Cards (Secondary)</h2>
+      {card_html}
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
 def save_event_definition_bundle(
     raw_debug_df: pd.DataFrame,
     schemas: Dict[str, Dict[str, object]],
     qa_report_xlsx: bytes,
     target_url: str,
     session_id: str,
-) -> Tuple[bytes, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
-    event_definition_df, event_support_df, asset_paths = build_event_definition_exports(raw_debug_df, schemas)
-    event_detail_df = build_event_review_detail_df(raw_debug_df, schemas)
+    scoped_event_names: set[str] | None = None,
+    definition_file_name: str = "",
+    bundle_scope: str = "custom_event_review",
+    persist_run: bool = True,
+) -> Tuple[bytes, bytes, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    scoped_debug_df = filter_debug_df_for_event_scope(raw_debug_df, scoped_event_names)
+    event_definition_df, event_support_df, asset_paths = build_event_definition_exports(scoped_debug_df, schemas)
+    event_detail_df = build_event_review_detail_df(scoped_debug_df, schemas)
+    definition_validation_summary_df, definition_validation_matches_df, definition_validation_unmatched_df = build_definition_validation_frames(
+        build_realtime_event_rows(
+            filter_debug_events_by_view(scoped_debug_df, "히트(collect)"),
+            allowed_events=list(scoped_event_names) if scoped_event_names else list(schemas.keys()),
+            unknown_event_policy="무시",
+            schemas=schemas,
+            scoped_event_names=scoped_event_names,
+        ) if str(bundle_scope or "").strip() == "definition_validation" else pd.DataFrame(),
+        schemas,
+    ) if str(bundle_scope or "").strip() == "definition_validation" else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
     event_detail_export_df = (
         event_detail_df.drop(columns=["raw_payload_json"], errors="ignore").copy()
         if not event_detail_df.empty
         else event_detail_df.copy()
     )
+    qa_review_xlsx = build_qa_review_excel_bytes(
+        event_definition_df=event_definition_df,
+        event_detail_df=event_detail_df,
+        definition_validation_summary_df=definition_validation_summary_df,
+        bundle_scope=bundle_scope,
+    )
+    log_definition_xlsx = build_log_definition_excel_bytes(
+        event_definition_df=event_definition_df,
+        event_detail_df=event_detail_df,
+    )
+    qa_summary_df = build_qa_summary_export_df(
+        event_detail_df=event_detail_df,
+        definition_validation_summary_df=definition_validation_summary_df,
+        bundle_scope=bundle_scope,
+    )
+    qa_debug_df = build_qa_debug_export_df(
+        event_detail_df=event_detail_df,
+        definition_validation_matches_df=definition_validation_matches_df,
+        definition_validation_unmatched_df=definition_validation_unmatched_df,
+        bundle_scope=bundle_scope,
+    )
+    qa_summary_csv = dataframe_to_csv_bytes(qa_summary_df)
+    qa_debug_csv = dataframe_to_csv_bytes(qa_debug_df)
     compare_key = _build_url_compare_key(target_url)
     url_hash = _build_url_hash(compare_key)
     run_id = datetime.now(tz=ZoneInfo("UTC")).strftime("%Y%m%d_%H%M%S_%f")
     exports_root = get_active_project_paths()["exports_dir"] / "event_definition_history" / url_hash
     run_dir = exports_root / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    event_definition_path = run_dir / "event_definition.csv"
-    event_support_path = run_dir / "event_support.csv"
-    event_detail_path = run_dir / "event_review_details.csv"
-    event_definition_df.to_csv(event_definition_path, index=False, encoding="utf-8-sig")
-    event_support_df.to_csv(event_support_path, index=False, encoding="utf-8-sig")
-    event_detail_export_df.to_csv(event_detail_path, index=False, encoding="utf-8-sig")
+    event_definition_csv = dataframe_to_csv_bytes(event_definition_df)
+    event_support_csv = dataframe_to_csv_bytes(event_support_df)
+    event_detail_csv = dataframe_to_csv_bytes(event_detail_export_df)
+    definition_validation_summary_csv = dataframe_to_csv_bytes(definition_validation_summary_df)
+    definition_validation_matches_csv = dataframe_to_csv_bytes(definition_validation_matches_df)
+    definition_validation_unmatched_csv = dataframe_to_csv_bytes(definition_validation_unmatched_df)
 
     baseline_path = exports_root / "baseline_run_id.txt"
     latest_path = exports_root / "latest_run_id.txt"
-    auto_baseline = False
-    if not baseline_path.exists():
-        baseline_path.write_text(run_id, encoding="utf-8")
-        auto_baseline = True
-    latest_path.write_text(run_id, encoding="utf-8")
+    auto_baseline = bool(persist_run and (not baseline_path.exists()))
 
     meta = {
         "project_slug": get_active_project_slug(),
@@ -2079,39 +3840,106 @@ def save_event_definition_bundle(
         "saved_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
         "run_id": run_id,
         "session_id": session_id,
-        "event_rows": int(len(event_definition_df)),
-        "event_count": int((event_definition_df["no"].astype(str).str.strip() != "").sum()) if not event_definition_df.empty else 0,
-        "support_rows": int(len(event_support_df)),
-        "detail_rows": int(len(event_detail_export_df)),
+        "event_rows": int(len(definition_validation_summary_df)) if str(bundle_scope or "").strip() == "definition_validation" else int(len(event_definition_df)),
+        "event_count": int(len(definition_validation_summary_df)) if str(bundle_scope or "").strip() == "definition_validation" else int((event_definition_df["no"].astype(str).str.strip() != "").sum()) if not event_definition_df.empty else 0,
+        "support_rows": int(len(definition_validation_matches_df)) if str(bundle_scope or "").strip() == "definition_validation" else int(len(event_support_df)),
+        "detail_rows": int(len(definition_validation_summary_df)) if str(bundle_scope or "").strip() == "definition_validation" else int(len(event_detail_export_df)),
+        "bundle_scope": str(bundle_scope or "custom_event_review").strip() or "custom_event_review",
+        "definition_file_name": str(definition_file_name or "").strip(),
+        "definition_event_count": int(len(scoped_event_names or [])) if scoped_event_names else 0,
+        "definition_row_count": int(len(definition_validation_summary_df)),
+        "matched_row_count": int((pd.to_numeric(definition_validation_summary_df.get("matched_capture_count", 0), errors="coerce").fillna(0) > 0).sum()) if not definition_validation_summary_df.empty else 0,
+        "missing_row_count": int((pd.to_numeric(definition_validation_summary_df.get("matched_capture_count", 0), errors="coerce").fillna(0) == 0).sum()) if not definition_validation_summary_df.empty else 0,
         "files": {
-            "event_definition": "event_definition.csv",
-            "event_support": "event_support.csv",
-            "event_review_details": "event_review_details.csv",
-            "html_index": "index.html",
+            "final_report": "qa_result.xlsx",
+            "log_definition_review": "log_definition_review.xlsx",
+            "summary_csv": "qa_summary.csv",
+            "debug_csv": "qa_debug_details.csv",
         },
         "auto_baseline": auto_baseline,
     }
-    meta_path = run_dir / "meta.json"
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    index_html = build_event_definition_bundle_html(meta, event_definition_df, event_support_df, event_detail_df)
-    index_path = run_dir / "index.html"
-    index_path.write_text(index_html, encoding="utf-8")
-
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("event_definition.csv", event_definition_path.read_bytes())
-        zf.writestr("event_review_details.csv", event_detail_path.read_bytes())
-        zf.writestr("event_support.csv", event_support_path.read_bytes())
-        zf.writestr("index.html", index_path.read_text(encoding="utf-8"))
-        zf.writestr("meta.json", meta_path.read_text(encoding="utf-8"))
-        if qa_report_xlsx:
-            zf.writestr("qa_report.xlsx", qa_report_xlsx)
+    if str(bundle_scope or "").strip() == "definition_validation":
+        meta["files"].update(
+            {
+                "definition_summary_source": "definition_validation_summary.csv",
+            }
+        )
+    index_html = (
+        build_definition_validation_bundle_html(
+            meta,
+            definition_validation_summary_df,
+            definition_validation_matches_df,
+            definition_validation_unmatched_df,
+            event_detail_df,
+        )
+        if str(bundle_scope or "").strip() == "definition_validation"
+        else build_event_definition_bundle_html(meta, event_definition_df, event_support_df, event_detail_df)
+    )
+    meta_json = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
+    basic_bundle_bytes = build_zip_bytes(
+        {
+            "qa_result.xlsx": qa_report_xlsx,
+            "log_definition_review.xlsx": log_definition_xlsx,
+            "qa_summary.csv": qa_summary_csv,
+            "qa_debug_details.csv": qa_debug_csv,
+        }
+    )
+    debug_file_map = {
+        "event_definition.csv": event_definition_csv,
+        "event_support.csv": event_support_csv,
+        "event_review_details.csv": event_detail_csv,
+        "meta.json": meta_json,
+        "index.html": index_html.encode("utf-8"),
+    }
+    if str(bundle_scope or "").strip() == "definition_validation":
+        debug_file_map.update(
+            {
+                "definition_validation_summary.csv": definition_validation_summary_csv,
+                "definition_validation_matches.csv": definition_validation_matches_csv,
+                "definition_validation_unmatched.csv": definition_validation_unmatched_csv,
+            }
+        )
+    if qa_report_xlsx:
+        debug_file_map["qa_report.xlsx"] = qa_report_xlsx
+    if qa_review_xlsx:
+        debug_file_map["qa_review.xlsx"] = qa_review_xlsx
+    if log_definition_xlsx:
+        debug_file_map["log_definition_review.xlsx"] = log_definition_xlsx
+    debug_bundle_out = io.BytesIO()
+    with zipfile.ZipFile(debug_bundle_out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_name, payload in debug_file_map.items():
+            if payload:
+                zf.writestr(file_name, payload)
         for rel_path in asset_paths:
             abs_path = BASE_DIR / rel_path
             if abs_path.exists() and abs_path.is_file():
                 zf.write(abs_path, arcname=rel_path)
+    debug_bundle_bytes = debug_bundle_out.getvalue()
 
-    return out.getvalue(), event_definition_df, event_support_df, meta
+    if persist_run:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "event_definition.csv").write_bytes(event_definition_csv)
+        (run_dir / "event_support.csv").write_bytes(event_support_csv)
+        (run_dir / "event_review_details.csv").write_bytes(event_detail_csv)
+        if qa_review_xlsx:
+            (run_dir / "qa_review.xlsx").write_bytes(qa_review_xlsx)
+        if log_definition_xlsx:
+            (run_dir / "log_definition_review.xlsx").write_bytes(log_definition_xlsx)
+        if qa_summary_csv:
+            (run_dir / "qa_summary.csv").write_bytes(qa_summary_csv)
+        if qa_debug_csv:
+            (run_dir / "qa_debug_details.csv").write_bytes(qa_debug_csv)
+        if str(bundle_scope or "").strip() == "definition_validation":
+            (run_dir / "definition_validation_summary.csv").write_bytes(definition_validation_summary_csv)
+            (run_dir / "definition_validation_matches.csv").write_bytes(definition_validation_matches_csv)
+            (run_dir / "definition_validation_unmatched.csv").write_bytes(definition_validation_unmatched_csv)
+        (run_dir / "meta.json").write_bytes(meta_json)
+        (run_dir / "index.html").write_text(index_html, encoding="utf-8")
+        if not baseline_path.exists():
+            baseline_path.write_text(run_id, encoding="utf-8")
+        latest_path.write_text(run_id, encoding="utf-8")
+
+    return basic_bundle_bytes, debug_bundle_bytes, event_definition_df, event_support_df, meta
 
 
 def get_event_definition_history_root(target_url: str) -> tuple[Path, str, str]:
@@ -2372,7 +4200,7 @@ def normalize_debug_target_url(raw_url: str) -> str:
     return ""
 
 
-QA_MODE_OPTIONS = ["전체 이벤트 테스트", "시나리오 테스트", "Tracking plan 검증"]
+QA_MODE_OPTIONS = ["전체 이벤트 테스트", "시나리오 테스트", "Tracking plan 검증", "정의서 검증"]
 QA_ENVIRONMENT_OPTIONS = ["prod", "staging", "custom"]
 QA_BROWSER_OPTIONS = ["Chrome", "Chromium"]
 QA_VIEWPORT_PRESETS = {
@@ -2407,6 +4235,7 @@ def build_debug_run_settings() -> Dict[str, object]:
     viewport = QA_VIEWPORT_PRESETS.get(viewport_key, QA_VIEWPORT_PRESETS["Desktop 1440 x 900"])
     browser_label = str(st.session_state.get("qa_browser_name", "Chrome")).strip()
     browser_name = "chromium" if browser_label == "Chromium" else "chrome"
+    uploaded_schemas = st.session_state.get("qa_uploaded_definition_schemas", {})
     return {
         "environment": st.session_state.get("qa_environment", "prod"),
         "browser_name": browser_name,
@@ -2423,6 +4252,9 @@ def build_debug_run_settings() -> Dict[str, object]:
         "single_page_only": bool(st.session_state.get("qa_single_page_only", True)),
         "qa_mode": st.session_state.get("qa_mode", "전체 이벤트 테스트"),
         "scenario_template": st.session_state.get("qa_scenario_template", ""),
+        "definition_file_name": st.session_state.get("qa_definition_validation_file_name", ""),
+        "definition_event_names": sorted(list(uploaded_schemas.keys())),
+        "definition_runtime_hints": build_definition_runtime_hints(uploaded_schemas if isinstance(uploaded_schemas, dict) else {}),
     }
 
 
@@ -3496,6 +5328,7 @@ MISSING_VALUE_TOKENS = {
     "",
     "(not set)",
     "not set",
+    "--omitted--",
     "null",
     "none",
     "undefined",
@@ -3503,6 +5336,7 @@ MISSING_VALUE_TOKENS = {
     "(none)",
     "n/a",
     "na",
+    "false",
 }
 
 PRIMARY_PARAM_PRIORITY = [
@@ -3555,6 +5389,25 @@ def _has_schema_definition(event_name: str, schemas: Dict[str, Dict[str, object]
     return name in schemas
 
 
+def _schema_parameter_columns(event_name: str, schemas: Dict[str, Dict[str, object]]) -> List[str]:
+    schema_obj = schemas.get(str(event_name or "").strip(), {})
+    if not isinstance(schema_obj, dict):
+        return []
+    ordered: List[str] = []
+    for key in (
+        list(schema_obj.get("required", []))
+        + list(schema_obj.get("optional", []))
+        + list(schema_obj.get("parameter_columns", []))
+    ):
+        key_text = str(key).strip()
+        if not key_text or key_text in ordered:
+            continue
+        if _is_hidden_default_param_key(key_text):
+            continue
+        ordered.append(key_text)
+    return ordered
+
+
 def _is_custom_event_name(event_name: str, schemas: Dict[str, Dict[str, object]]) -> bool:
     name = str(event_name or "").strip()
     if not name:
@@ -3565,18 +5418,7 @@ def _is_custom_event_name(event_name: str, schemas: Dict[str, Dict[str, object]]
 
 
 def _schema_custom_param_keys(event_name: str, schemas: Dict[str, Dict[str, object]]) -> List[str]:
-    schema_obj = schemas.get(str(event_name or "").strip(), {})
-    if not isinstance(schema_obj, dict):
-        return []
-    ordered: List[str] = []
-    for key in list(schema_obj.get("required", [])) + list(schema_obj.get("optional", [])):
-        key_text = str(key).strip()
-        if not key_text or key_text in ordered:
-            continue
-        if _is_hidden_default_param_key(key_text):
-            continue
-        ordered.append(key_text)
-    return ordered
+    return _schema_parameter_columns(event_name, schemas)
 
 
 def _sort_custom_param_keys(keys: List[str]) -> List[str]:
@@ -3668,6 +5510,22 @@ def extract_custom_event_payload(
     return normalized_event, custom_items
 
 
+def filter_debug_df_for_event_scope(
+    debug_df: pd.DataFrame,
+    scoped_event_names: set[str] | None = None,
+) -> pd.DataFrame:
+    if debug_df.empty or scoped_event_names is None:
+        return debug_df
+    scope = {str(v).strip() for v in scoped_event_names if str(v).strip()}
+    if not scope:
+        return debug_df.iloc[0:0].copy()
+    work = debug_df.copy()
+    source_series = work.get("source", pd.Series(index=work.index, dtype=str)).astype(str).str.strip()
+    event_series = work.get("event_name", pd.Series(index=work.index, dtype=str)).astype(str).str.strip()
+    keep_mask = (~source_series.eq("ga_hit")) | event_series.isin(scope)
+    return work[keep_mask].copy()
+
+
 def _to_text_value(value: object) -> str:
     if value is None:
         return ""
@@ -3751,6 +5609,41 @@ def build_suspicious_param_profile(debug_df: pd.DataFrame) -> Dict[str, str]:
         if reasons:
             profile[key] = " / ".join(dict.fromkeys(reasons))
     return profile
+
+
+def _collect_auto_context_rows(debug_df: pd.DataFrame) -> List[Dict[str, object]]:
+    if debug_df.empty:
+        return []
+    work = debug_df.copy()
+    if "captured_at" in work.columns:
+        work["captured_at"] = pd.to_datetime(work["captured_at"], errors="coerce")
+        work = work.sort_values("captured_at")
+    rows: List[Dict[str, object]] = []
+    src_series = work.get("source", pd.Series(index=work.index, dtype=str)).astype(str).str.strip()
+    for _, row in work[src_series.eq("auto_crawl")].iterrows():
+        params = row.get("params", {})
+        params = params if isinstance(params, dict) else {}
+        rows.append(
+            {
+                "captured_at": row.get("captured_at"),
+                "page_id": _extract_page_id(_to_text_value(row.get("page_url", "")), params),
+                "section_name": _to_text_value(params.get("section_name", "")),
+                "target_id": _to_text_value(params.get("target_id", "")),
+                "selector": _to_text_value(params.get("selector", "")),
+                "class_attribute": _to_text_value(params.get("class_attribute", "")),
+                "screen_state": _to_text_value(params.get("screen_state", params.get("screen_name", ""))),
+                "screen_name": _to_text_value(params.get("screen_name", params.get("page_id", ""))),
+                "selector_screenshot": _to_text_value(params.get("selector_screenshot", params.get("screenshot_path", ""))),
+                "screenshot_path": _to_text_value(params.get("screenshot_path", params.get("selector_screenshot", ""))),
+                "raw_screenshot_file": _to_text_value(params.get("raw_screenshot_file", "")),
+                "annotation_no": _to_text_value(params.get("annotation_no", params.get("auto_click_index", ""))),
+                "bbox_x": _to_text_value(params.get("bbox_x", 0)),
+                "bbox_y": _to_text_value(params.get("bbox_y", 0)),
+                "bbox_width": _to_text_value(params.get("bbox_width", 0)),
+                "bbox_height": _to_text_value(params.get("bbox_height", 0)),
+            }
+        )
+    return rows
 
 
 def debug_events_to_full_csv_bytes(debug_df: pd.DataFrame) -> bytes:
@@ -3930,6 +5823,7 @@ def build_realtime_event_rows(
     allowed_events: List[str] | None = None,
     unknown_event_policy: str = "정보",
     schemas: Dict[str, Dict[str, object]] | None = None,
+    scoped_event_names: set[str] | None = None,
 ) -> pd.DataFrame:
     cols = [
         "group_session_id",
@@ -3938,11 +5832,28 @@ def build_realtime_event_rows(
         "대표 파라미터",
         "대표 값",
         "상태",
+        "status",
         "정상 그룹",
         "값없음 그룹",
         "의심 그룹",
         "시스템 그룹",
         "전체 파라미터",
+        "custom_event",
+        "custom_parameters",
+        "target_id",
+        "selector",
+        "screen_name",
+        "page_id",
+        "section_name",
+        "screenshot_path",
+        "selector_screenshot",
+        "raw_screenshot_file",
+        "annotation_no",
+        "bbox_x",
+        "bbox_y",
+        "bbox_width",
+        "bbox_height",
+        "bounding_box",
         "captured_at",
     ]
     if debug_df.empty:
@@ -3955,6 +5866,8 @@ def build_realtime_event_rows(
 
     suspicious_profile = build_suspicious_param_profile(work)
     schema_store = schemas if isinstance(schemas, dict) else {}
+    event_scope = {str(v).strip() for v in scoped_event_names if str(v).strip()} if scoped_event_names else None
+    auto_ctx_rows = _collect_auto_context_rows(work)
 
     rows: List[Dict[str, object]] = []
     for _, row in work.iterrows():
@@ -3973,6 +5886,8 @@ def build_realtime_event_rows(
             all_params["client_id"] = client_id
         custom_event_name, custom_items = extract_custom_event_payload(event_name, all_params, schema_store)
         if not custom_event_name:
+            continue
+        if event_scope is not None and custom_event_name not in event_scope:
             continue
         custom_params = {key: value for key, value in custom_items}
 
@@ -4031,6 +5946,15 @@ def build_realtime_event_rows(
             allowed_events=allowed_events,
             unknown_event_policy=unknown_event_policy,
         )
+        page_id = _extract_page_id(_to_text_value(row.get("page_url", "")), all_params)
+        auto_ctx = _find_nearest_auto_context(auto_ctx_rows, row.get("captured_at"), page_id)
+        meta = _build_event_meta(row, all_params, auto_ctx=auto_ctx)
+        bounding_box = {
+            "x": int(pd.to_numeric(meta.get("bbox_x", 0), errors="coerce") or 0),
+            "y": int(pd.to_numeric(meta.get("bbox_y", 0), errors="coerce") or 0),
+            "width": int(pd.to_numeric(meta.get("bbox_width", 0), errors="coerce") or 0),
+            "height": int(pd.to_numeric(meta.get("bbox_height", 0), errors="coerce") or 0),
+        }
 
         rows.append(
             {
@@ -4040,6 +5964,7 @@ def build_realtime_event_rows(
                 "대표 파라미터": primary_key,
                 "대표 값": primary_value,
                 "상태": status,
+                "status": status,
                 "정상 그룹": normal_group,
                 "값없음 그룹": missing_group,
                 "의심 그룹": suspicious_group,
@@ -4048,6 +5973,20 @@ def build_realtime_event_rows(
                 "원본 payload": all_params,
                 "custom_event": custom_event_name,
                 "custom_parameters": " | ".join([f"{key}={value}" for key, value in custom_items]) if custom_items else "-",
+                "target_id": str(meta.get("target_id", "-")).strip() or "-",
+                "selector": str(meta.get("selector", "-")).strip() or "-",
+                "screen_name": str(meta.get("screen_name", meta.get("page_id", "-"))).strip() or "-",
+                "page_id": str(meta.get("page_id", "-")).strip() or "-",
+                "section_name": str(meta.get("section_name", "-")).strip() or "-",
+                "screenshot_path": str(meta.get("screenshot_path", meta.get("screenshot_file", ""))).strip() or "-",
+                "selector_screenshot": str(meta.get("screenshot_file", "")).strip() or "-",
+                "raw_screenshot_file": str(meta.get("raw_screenshot_file", "")).strip() or "-",
+                "annotation_no": str(meta.get("annotation_no", "-")).strip() or "-",
+                "bbox_x": bounding_box["x"],
+                "bbox_y": bounding_box["y"],
+                "bbox_width": bounding_box["width"],
+                "bbox_height": bounding_box["height"],
+                "bounding_box": json.dumps(bounding_box, ensure_ascii=False),
                 "captured_at": row.get("captured_at"),
             }
         )
@@ -4529,6 +6468,26 @@ if "qa_viewport_preset" not in st.session_state:
     st.session_state["qa_viewport_preset"] = "Desktop 1440 x 900"
 if "qa_mode" not in st.session_state:
     st.session_state["qa_mode"] = "전체 이벤트 테스트"
+if "qa_definition_validation_file_name" not in st.session_state:
+    st.session_state["qa_definition_validation_file_name"] = ""
+if "qa_definition_validation_error" not in st.session_state:
+    st.session_state["qa_definition_validation_error"] = ""
+if "qa_uploaded_definition_schemas" not in st.session_state:
+    st.session_state["qa_uploaded_definition_schemas"] = {}
+if "qa_uploaded_definition_summary" not in st.session_state:
+    st.session_state["qa_uploaded_definition_summary"] = []
+if "qa_definition_validation_debug" not in st.session_state:
+    st.session_state["qa_definition_validation_debug"] = {}
+if "qa_definition_validation_loaded_key" not in st.session_state:
+    st.session_state["qa_definition_validation_loaded_key"] = ""
+if "qa_definition_validation_target_mode" not in st.session_state:
+    st.session_state["qa_definition_validation_target_mode"] = "선택하세요"
+if "qa_definition_validation_target_mode_prev" not in st.session_state:
+    st.session_state["qa_definition_validation_target_mode_prev"] = "선택하세요"
+if "qa_definition_validation_execution_mode" not in st.session_state:
+    st.session_state["qa_definition_validation_execution_mode"] = ""
+if "qa_definition_validation_execution_session_id" not in st.session_state:
+    st.session_state["qa_definition_validation_execution_session_id"] = ""
 if "qa_scenario_template" not in st.session_state:
     st.session_state["qa_scenario_template"] = "상품 구매 흐름"
 if "qa_auto_crawl_max_clicks" not in st.session_state:
@@ -4549,6 +6508,7 @@ if "qa_template_seed" not in st.session_state:
     st.session_state["qa_template_seed"] = ""
 
 ensure_project_structure(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
+restore_definition_validation_cache_if_needed()
 
 enforce_access_gate()
 
@@ -4642,10 +6602,13 @@ with st.sidebar:
         st.caption("Project / Environment / URL만 입력하면 자동수집 중심으로 실행됩니다.")
 
     with st.expander("2) QA Mode / Scenario", expanded=True):
+        current_mode = str(st.session_state.get("qa_mode", "전체 이벤트 테스트")).strip()
+        if current_mode not in QA_MODE_OPTIONS:
+            current_mode = "전체 이벤트 테스트"
         selected_mode = st.radio(
             "QA Mode",
             options=QA_MODE_OPTIONS,
-            index=QA_MODE_OPTIONS.index(st.session_state.get("qa_mode", "전체 이벤트 테스트")),
+            index=QA_MODE_OPTIONS.index(current_mode),
             key="qa_mode",
         )
         st.caption("이벤트 수집 방식은 기본적으로 Auto Crawl입니다.")
@@ -4679,6 +6642,177 @@ with st.sidebar:
             scenario_key_value = ""
             st.session_state["qa_template_seed"] = selected_mode
             st.caption("자동수집 후 Tracking Plan / Event Definition Export를 바로 비교하는 모드입니다.")
+        elif selected_mode == "정의서 검증":
+            scenario_enabled = False
+            scenario_steps_text = ""
+            required_event_text = ""
+            funnel_text = default_funnel_steps
+            scenario_key_mode_label = "qa_debug_session_id 기준"
+            scenario_key_field = scenario_key_modes[scenario_key_mode_label]
+            scenario_key_value = ""
+            st.session_state["qa_template_seed"] = selected_mode
+            tpl1, tpl2 = st.columns(2)
+            with tpl1:
+                st.download_button(
+                    "양식 다운로드 (XLSX)",
+                    data=build_definition_template_xlsx_bytes(),
+                    file_name="event_definition_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="현재 정의서 검증 파서가 바로 읽을 수 있는 업로드 양식입니다.",
+                )
+            with tpl2:
+                st.download_button(
+                    "양식 다운로드 (CSV)",
+                    data=build_definition_template_csv_bytes(),
+                    file_name="event_definition_template.csv",
+                    mime="text/csv",
+                    help="간단 편집용 CSV 양식입니다.",
+                )
+            st.caption("양식은 상단 이벤트 목록 + 하단 매개변수 매트릭스 구조입니다.")
+            st.markdown("**1단계: 정의서 업로드**")
+            definition_file = st.file_uploader(
+                "이벤트 정의서 업로드",
+                type=["csv", "xlsx", "xls"],
+                key="qa_definition_validation_file",
+                accept_multiple_files=False,
+                help="event_definition.csv 또는 event_name/required/optional 형식의 파일을 올리면 그 기준으로만 PASS/FAIL 검증합니다.",
+            )
+            has_cached_definition = bool(st.session_state.get("qa_uploaded_definition_schemas", {}))
+            if definition_file is None and not has_cached_definition:
+                st.session_state["qa_definition_validation_file_name"] = ""
+                st.session_state["qa_definition_validation_error"] = ""
+                st.session_state["qa_uploaded_definition_schemas"] = {}
+                st.session_state["qa_uploaded_definition_summary"] = []
+                st.session_state["qa_definition_validation_debug"] = {}
+                st.session_state["qa_definition_validation_loaded_key"] = ""
+                st.session_state["qa_definition_validation_target_mode"] = "선택하세요"
+                st.session_state["qa_definition_validation_target_mode_prev"] = "선택하세요"
+                st.session_state["qa_definition_validation_execution_mode"] = ""
+                st.session_state["qa_definition_validation_execution_session_id"] = ""
+                st.info("정의서 파일을 업로드하면 그 파일의 이벤트/매개변수만 검증합니다.")
+            else:
+                uploaded_schemas: Dict[str, Dict[str, object]] = st.session_state.get("qa_uploaded_definition_schemas", {})
+                uploaded_summary_df = pd.DataFrame(st.session_state.get("qa_uploaded_definition_summary", []))
+                if definition_file is None and uploaded_schemas:
+                    loaded_file_name = str(st.session_state.get("qa_definition_validation_file_name", "")).strip()
+                    if loaded_file_name:
+                        st.caption(f"현재 로드된 정의서: {loaded_file_name}")
+                if definition_file is not None:
+                    try:
+                        uploaded_schemas, uploaded_summary_df, upload_debug = load_uploaded_definition_schemas(definition_file)
+                        loaded_key = (
+                            f"{str(definition_file.name).strip()}|"
+                            f"{len(uploaded_schemas)}|"
+                            f"{','.join(sorted(list(uploaded_schemas.keys()))[:5])}"
+                        )
+                        if st.session_state.get("qa_definition_validation_loaded_key", "") != loaded_key:
+                            st.session_state["qa_definition_validation_target_mode"] = "선택하세요"
+                            st.session_state["qa_definition_validation_target_mode_prev"] = "선택하세요"
+                            st.session_state["qa_definition_validation_execution_mode"] = ""
+                            st.session_state["qa_definition_validation_execution_session_id"] = ""
+                        st.session_state["qa_definition_validation_file_name"] = str(definition_file.name).strip()
+                        st.session_state["qa_definition_validation_error"] = ""
+                        st.session_state["qa_uploaded_definition_schemas"] = uploaded_schemas
+                        st.session_state["qa_uploaded_definition_summary"] = uploaded_summary_df.to_dict("records")
+                        st.session_state["qa_definition_validation_debug"] = upload_debug
+                        st.session_state["qa_definition_validation_loaded_key"] = loaded_key
+                        save_definition_validation_cache(
+                            {
+                                "qa_mode": "정의서 검증",
+                                "file_name": str(definition_file.name).strip(),
+                                "schemas": uploaded_schemas,
+                                "summary": uploaded_summary_df.to_dict("records"),
+                                "debug": upload_debug,
+                                "loaded_key": loaded_key,
+                                "target_mode": st.session_state.get("qa_definition_validation_target_mode", "선택하세요"),
+                                "execution_mode": "",
+                                "execution_session_id": "",
+                            }
+                        )
+                    except Exception as exc:
+                        st.session_state["qa_definition_validation_file_name"] = str(definition_file.name).strip()
+                        st.session_state["qa_definition_validation_error"] = to_user_error_message(exc)
+                        st.session_state["qa_uploaded_definition_schemas"] = {}
+                        st.session_state["qa_uploaded_definition_summary"] = []
+                        st.session_state["qa_definition_validation_debug"] = getattr(exc, "debug_info", {}) or {}
+                        st.session_state["qa_definition_validation_execution_mode"] = ""
+                        st.session_state["qa_definition_validation_execution_session_id"] = ""
+                        st.error(f"정의서 업로드 실패: {to_user_error_message(exc)}")
+                uploaded_schemas = st.session_state.get("qa_uploaded_definition_schemas", {})
+                uploaded_summary_df = pd.DataFrame(st.session_state.get("qa_uploaded_definition_summary", []))
+                if uploaded_schemas:
+                    schema_param_keys: set[str] = set()
+                    for schema_obj in uploaded_schemas.values():
+                        if isinstance(schema_obj, dict):
+                            for key in list(schema_obj.get("parameter_columns", [])) + list(schema_obj.get("required", [])) + list(schema_obj.get("optional", [])):
+                                key_text = str(key).strip()
+                                if key_text:
+                                    schema_param_keys.add(key_text)
+                    sample_events = list(uploaded_schemas.keys())[:5]
+                    st.success("검증 준비 완료")
+                    u1, u2, u3, u4 = st.columns(4)
+                    u1.metric("파일명", str(st.session_state.get("qa_definition_validation_file_name", "")).strip() or "-")
+                    u2.metric("파싱 상태", "성공")
+                    u3.metric("인식 이벤트 수", int(len(uploaded_summary_df)))
+                    u4.metric("인식 파라미터 수", int(len(schema_param_keys)))
+                    if sample_events:
+                        st.caption(f"샘플 이벤트명: {', '.join(sample_events)}")
+                debug_view = st.session_state.get("qa_definition_validation_debug", {})
+                if debug_view:
+                    with st.expander("업로드 진단 정보", expanded=bool(st.session_state.get("qa_definition_validation_error", ""))):
+                        d1, d2, d3 = st.columns(3)
+                        d1.metric("raw rows", int(debug_view.get("raw_rows", 0)))
+                        d2.metric("raw cols", int(debug_view.get("raw_cols", 0)))
+                        d3.metric("parsed events", int(debug_view.get("parsed_event_count", 0)))
+                        st.caption(
+                            f"detected event header row: {debug_view.get('event_header_row_index', '-')}, "
+                            f"param header row: {debug_view.get('param_header_row_index', '-')}, "
+                            f"fallback used: {debug_view.get('fallback_used', False)}"
+                        )
+                        sample_names = debug_view.get("sample_event_names", [])
+                        if sample_names:
+                            st.caption(f"sample event_name: {', '.join([str(v) for v in sample_names[:5]])}")
+                        failure_stage = str(debug_view.get("failure_stage", "")).strip()
+                        final_reason = str(debug_view.get("final_validation_reason", "")).strip()
+                        if failure_stage or final_reason:
+                            st.caption(f"final validation: {failure_stage or 'ok'} | {final_reason or 'ok'}")
+                        read_attempts = debug_view.get("read_attempts", [])
+                        if read_attempts:
+                            st.caption(f"read attempts: {', '.join([str(v) for v in read_attempts])}")
+                        sheet_debugs = debug_view.get("sheet_debugs", [])
+                        if sheet_debugs:
+                            st.dataframe(pd.DataFrame(sheet_debugs), use_container_width=True, height=200)
+                if uploaded_schemas:
+                    st.markdown("**2단계: 검증 대상 선택**")
+                    target_mode = st.selectbox(
+                        "검증 대상",
+                        options=["선택하세요", "기존 세션으로 검증", "새 Run QA Test 실행 후 검증"],
+                        key="qa_definition_validation_target_mode",
+                    )
+                    if st.session_state.get("qa_definition_validation_target_mode_prev", "선택하세요") != target_mode:
+                        st.session_state["qa_definition_validation_execution_mode"] = ""
+                        st.session_state["qa_definition_validation_execution_session_id"] = ""
+                        st.session_state["qa_definition_validation_target_mode_prev"] = target_mode
+                        save_definition_validation_cache(
+                            {
+                                "qa_mode": "정의서 검증",
+                                "file_name": str(st.session_state.get("qa_definition_validation_file_name", "")).strip(),
+                                "schemas": st.session_state.get("qa_uploaded_definition_schemas", {}),
+                                "summary": st.session_state.get("qa_uploaded_definition_summary", []),
+                                "debug": st.session_state.get("qa_definition_validation_debug", {}),
+                                "loaded_key": st.session_state.get("qa_definition_validation_loaded_key", ""),
+                                "target_mode": target_mode,
+                                "execution_mode": "",
+                                "execution_session_id": "",
+                            }
+                        )
+                    if target_mode == "기존 세션으로 검증":
+                        st.caption("현재 불러온 세션이 있으면 그 세션을 정의서 기준으로 재검증합니다.")
+                    elif target_mode == "새 Run QA Test 실행 후 검증":
+                        st.caption("3단계에서 새 Run QA Test를 실행하면 정의서 기준으로 새 세션 수집 후 검증합니다.")
+                    else:
+                        st.caption("다음 단계로 가려면 검증 대상을 먼저 선택하세요.")
+            st.caption("업로드한 정의서에 있는 custom event / custom parameter만 검증합니다.")
         else:
             scenario_enabled = False
             scenario_steps_text = ""
@@ -4692,11 +6826,40 @@ with st.sidebar:
 
     with st.expander("3) Run Test", expanded=True):
         st.caption("1. URL 입력  2. QA Mode 선택  3. Run QA Test  4. 결과 확인")
+        definition_target_mode = str(st.session_state.get("qa_definition_validation_target_mode", "선택하세요")).strip()
+        definition_file_ready = bool(st.session_state.get("qa_uploaded_definition_schemas", {}))
+        run_button_label = "Run QA Test"
+        run_button_help = None
+        run_button_disabled = False
+        if selected_mode == "정의서 검증":
+            if not definition_file_ready:
+                run_button_disabled = True
+                run_button_help = "1단계에서 정의서 업로드를 완료해야 합니다."
+            elif definition_target_mode != "새 Run QA Test 실행 후 검증":
+                run_button_disabled = True
+                run_button_help = "2단계에서 '새 Run QA Test 실행 후 검증'을 선택해야 합니다."
+            else:
+                run_button_label = "정의서 기준으로 새 세션 수집 후 검증"
+                run_button_help = "업로드한 정의서 기준으로 새 세션을 수집한 뒤 PASS / FAIL 검증을 수행합니다."
         dc1, dc2 = st.columns(2)
         with dc1:
-            realtime_debug_start_clicked = st.button("Run QA Test", type="primary")
+            realtime_debug_start_clicked = st.button(
+                run_button_label,
+                type="primary",
+                disabled=run_button_disabled,
+                help=run_button_help,
+            )
         with dc2:
             realtime_debug_stop_clicked = st.button("Stop Test")
+        if selected_mode == "정의서 검증":
+            if not definition_file_ready:
+                st.caption("정의서 업로드 후 검증 대상을 선택하면 실행할 수 있습니다.")
+            elif definition_target_mode == "기존 세션으로 검증":
+                st.caption("기존 세션 재검증이 선택되어 있습니다. 새 테스트 실행 없이 현재 세션을 정의서 기준으로 검증합니다.")
+            elif definition_target_mode == "새 Run QA Test 실행 후 검증":
+                st.caption("버튼을 누르면 정의서 기준으로 새 세션 수집 후 검증합니다.")
+            else:
+                st.caption("검증 대상을 먼저 선택하세요.")
         active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
         debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
         resolved_output_path = resolve_debug_output_file(
@@ -4764,8 +6927,19 @@ with st.sidebar:
         param_text = st.text_area("조회할 param (쉼표 구분)", value=default_params)
         st.caption("예: transaction_id,value,currency,qa_debug_session_id")
         required_event_default = required_event_text if selected_mode == "시나리오 테스트" else default_required_events
-        required_event_text = st.text_area("필수 이벤트", value=required_event_default, key="required_event_text_input")
-        st.caption("비워두면 필수 이벤트 체크를 생략합니다. 필요할 때만 입력하세요.")
+        if selected_mode == "정의서 검증":
+            definition_summary_rows = st.session_state.get("qa_uploaded_definition_summary", [])
+            definition_events = [str(row.get("event_name", "")).strip() for row in definition_summary_rows if str(row.get("event_name", "")).strip()]
+            st.text_area(
+                "검증 대상 이벤트",
+                value=", ".join(definition_events),
+                height=90,
+                disabled=True,
+            )
+            st.caption("정의서 검증 모드에서는 업로드한 파일의 이벤트 목록만 검증합니다.")
+        else:
+            required_event_text = st.text_area("필수 이벤트", value=required_event_default, key="required_event_text_input")
+            st.caption("비워두면 필수 이벤트 체크를 생략합니다. 필요할 때만 입력하세요.")
         unknown_event_policy = st.selectbox(
             "실시간 미정의 이벤트 처리",
             options=["정보", "경고", "무시"],
@@ -4889,11 +7063,34 @@ if realtime_debug_start_clicked:
         st.session_state["qa_debug_output_file"] = str(debug_file)
         st.session_state["qa_debug_started_at"] = str(snapshot.get("started_at", "")).strip()
         st.session_state["realtime_panel_auto_refresh"] = True
+        definition_target_names = run_settings.get("definition_event_names", [])
+        if (
+            st.session_state.get("qa_mode", "전체 이벤트 테스트") == "정의서 검증"
+            and str(st.session_state.get("qa_definition_validation_target_mode", "")).strip() == "새 Run QA Test 실행 후 검증"
+        ):
+            st.session_state["qa_definition_validation_execution_mode"] = "새 테스트 실행 후 검증"
+            st.session_state["qa_definition_validation_execution_session_id"] = debug_session_id
+            save_definition_validation_cache(
+                {
+                    "qa_mode": "정의서 검증",
+                    "file_name": str(st.session_state.get("qa_definition_validation_file_name", "")).strip(),
+                    "schemas": st.session_state.get("qa_uploaded_definition_schemas", {}),
+                    "summary": st.session_state.get("qa_uploaded_definition_summary", []),
+                    "debug": st.session_state.get("qa_definition_validation_debug", {}),
+                    "loaded_key": st.session_state.get("qa_definition_validation_loaded_key", ""),
+                    "target_mode": st.session_state.get("qa_definition_validation_target_mode", "선택하세요"),
+                    "execution_mode": "새 테스트 실행 후 검증",
+                    "execution_session_id": debug_session_id,
+                }
+            )
         log_ui_action("debug_start_success", {"session_id": debug_session_id})
-        st.success(
+        success_message = (
             f"QA Test 시작: qa_debug_session_id={debug_session_id} "
             f"(모드: {run_settings.get('qa_mode', '-')}, 수집: Auto Crawl)"
         )
+        if isinstance(definition_target_names, list) and definition_target_names:
+            success_message += f" | 정의서 이벤트 {len(definition_target_names)}개 감지 시 조기 종료"
+        st.success(success_message)
         if (
             st.session_state.get("qa_access_role", "guest") == "admin"
             and is_truthy(get_config_value("QA_OPEN_NOVNC_ON_START", "1"))
@@ -4998,14 +7195,76 @@ with realtime_tab:
     else:
         st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
 
-    schema_store = load_event_schemas()
-    allowed_events_rt = parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
-    if not timeline_df.empty:
+    selected_mode = str(st.session_state.get("qa_mode", "전체 이벤트 테스트")).strip()
+    persisted_schema_store = load_event_schemas()
+    uploaded_definition_schemas = st.session_state.get("qa_uploaded_definition_schemas", {})
+    uploaded_definition_summary_df = pd.DataFrame(st.session_state.get("qa_uploaded_definition_summary", []))
+    definition_upload_error = str(st.session_state.get("qa_definition_validation_error", "")).strip()
+    definition_mode_active = selected_mode == "정의서 검증"
+    definition_mode_ready = (
+        definition_mode_active
+        and isinstance(uploaded_definition_schemas, dict)
+        and bool(uploaded_definition_schemas)
+    )
+    definition_target_mode = str(st.session_state.get("qa_definition_validation_target_mode", "선택하세요")).strip()
+    definition_session_available = bool(debug_snapshot or recovered_from_file)
+    definition_existing_session_ready = definition_mode_ready and definition_target_mode == "기존 세션으로 검증" and definition_session_available
+    definition_new_run_ready = (
+        definition_mode_ready
+        and definition_target_mode == "새 Run QA Test 실행 후 검증"
+        and definition_session_available
+        and str(st.session_state.get("qa_definition_validation_execution_mode", "")).strip() == "새 테스트 실행 후 검증"
+        and str(st.session_state.get("qa_definition_validation_execution_session_id", "")).strip() == str(active_debug_session_id or sid_for_view).strip()
+    )
+    definition_validation_active = (
+        (not definition_mode_active)
+        or definition_existing_session_ready
+        or definition_new_run_ready
+    )
+    definition_validation_method = (
+        "기존 세션 재검증"
+        if definition_existing_session_ready
+        else "새 테스트 실행 후 검증"
+        if definition_new_run_ready
+        else ""
+    )
+    schema_store = uploaded_definition_schemas if definition_mode_ready else ({} if definition_mode_active else persisted_schema_store)
+    scoped_event_names = set(schema_store.keys()) if definition_mode_ready else None
+    timeline_df_active_for_validation = (
+        filter_debug_df_for_event_scope(timeline_df_active, scoped_event_names)
+        if definition_mode_ready and definition_validation_active
+        else timeline_df_active
+    )
+    timeline_df_for_validation = (
+        filter_debug_events_by_view(timeline_df_active_for_validation, "히트(collect)")
+        if definition_mode_ready and definition_validation_active
+        else timeline_df
+    )
+    allowed_events_rt = (
+        list(schema_store.keys())
+        if definition_mode_ready
+        else parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
+    )
+    if definition_mode_ready and uploaded_definition_summary_df.empty:
+        uploaded_definition_summary_df = build_schema_catalog_df(schema_store)
+    if definition_mode_active and not definition_validation_active:
+        timeline_df_active_for_validation = pd.DataFrame()
+        timeline_df_for_validation = pd.DataFrame()
+    if not definition_mode_active and not timeline_df_for_validation.empty:
         rt_events = build_realtime_event_rows(
-            timeline_df,
+            timeline_df_for_validation,
             allowed_events=allowed_events_rt,
             unknown_event_policy=st.session_state.get("unknown_event_policy", "정보"),
             schemas=schema_store,
+            scoped_event_names=scoped_event_names,
+        )
+    elif definition_mode_ready and definition_validation_active and not timeline_df_for_validation.empty:
+        rt_events = build_realtime_event_rows(
+            timeline_df_for_validation,
+            allowed_events=allowed_events_rt,
+            unknown_event_policy="무시",
+            schemas=schema_store,
+            scoped_event_names=scoped_event_names,
         )
     if not rt_events.empty:
         st.session_state["schema_rt_events_cache"] = rt_events.to_dict("records")
@@ -5015,16 +7274,37 @@ with realtime_tab:
     rt_summary = summarize_realtime_quality(rt_events)
     parameter_validation_df_all = build_parameter_validation_export_df(rt_events, schema_store)
     order_validation_df_all = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
+    if definition_mode_ready:
+        issue_df = build_definition_validation_issue_df(rt_events, schema_store, issue_df)
+    event_schema_qa_all = (
+        build_definition_validation_report_df(
+            rt_events=rt_events,
+            schemas=schema_store,
+            issue_df=issue_df,
+            parameter_validation_df=parameter_validation_df_all,
+            order_validation_df=order_validation_df_all,
+        )
+        if definition_mode_ready
+        else build_event_qa_report_export_df(
+            rt_events=rt_events,
+            issue_df=issue_df,
+            schemas=schema_store,
+            parameter_validation_df=parameter_validation_df_all,
+            order_validation_df=order_validation_df_all,
+        )
+    )
+    schema_summary_view = summarize_event_qa_report(event_schema_qa_all) if definition_mode_ready else schema_summary
 
     event_names_seen = (
         sorted(rt_events["이벤트"].astype(str).str.strip().unique().tolist()) if not rt_events.empty else []
     )
     missing_schema_count = 0
-    for ev in event_names_seen:
-        schema_obj = schema_store.get(ev, {})
-        has_schema = isinstance(schema_obj, dict) and bool(schema_obj.get("required", []) or schema_obj.get("optional", []))
-        if not has_schema:
-            missing_schema_count += 1
+    if not definition_mode_ready:
+        for ev in event_names_seen:
+            schema_obj = schema_store.get(ev, {})
+            has_schema = isinstance(schema_obj, dict) and bool(schema_obj.get("required", []) or schema_obj.get("optional", []))
+            if not has_schema:
+                missing_schema_count += 1
     missing_parameter_count = 0
     if not parameter_validation_df_all.empty:
         pwork = parameter_validation_df_all.copy()
@@ -5041,6 +7321,23 @@ with realtime_tab:
         owork = order_validation_df_all.copy()
         owork["status"] = owork["status"].astype(str)
         flow_issue_count = int((owork["status"].isin(["FAIL", "WARN"])).sum())
+    definition_missing_event_count = 0
+    if definition_mode_ready and not event_schema_qa_all.empty:
+        qwork = event_schema_qa_all.copy()
+        qwork["matched_capture_count"] = pd.to_numeric(qwork.get("matched_capture_count", 0), errors="coerce").fillna(0).astype(int)
+        qwork["result"] = qwork.get("result", pd.Series(dtype=str)).astype(str).str.upper()
+        definition_missing_event_count = int(((qwork["matched_capture_count"] == 0) & qwork["result"].eq("FAIL")).sum())
+    definition_param_count = 0
+    if definition_mode_ready:
+        schema_param_keys: set[str] = set()
+        for schema_obj in schema_store.values():
+            if not isinstance(schema_obj, dict):
+                continue
+            for key in list(schema_obj.get("required", [])) + list(schema_obj.get("optional", [])) + list(schema_obj.get("parameter_columns", [])):
+                key_text = str(key).strip()
+                if key_text:
+                    schema_param_keys.add(key_text)
+        definition_param_count = len(schema_param_keys)
 
     section_overview, section_issues, section_detail, section_export = st.tabs(
         ["1. QA Overview", "2. Issues (문제 이벤트)", "3. Event Detail", "4. Export / Event Definition"]
@@ -5050,125 +7347,171 @@ with realtime_tab:
         st.caption(
             f"세션: {sid_for_view} | 상태: {status_for_view} | 캡처: {captured_for_view}건 | 시간대: {DISPLAY_TZ_NAME}"
         )
+        if definition_mode_active:
+            definition_file_name = str(st.session_state.get("qa_definition_validation_file_name", "")).strip()
+            if definition_file_name:
+                st.caption(f"정의서 검증 파일: {definition_file_name}")
+            if definition_upload_error:
+                st.error(f"정의서 로드 오류: {definition_upload_error}")
+            elif not definition_mode_ready:
+                st.warning("정의서 검증 모드입니다. QA Mode에서 정의서 파일을 업로드해야 PASS / FAIL 검증을 시작할 수 있습니다.")
+            elif definition_target_mode == "선택하세요":
+                st.info("1단계 정의서 업로드가 완료되었습니다. 2단계에서 '기존 세션으로 검증' 또는 '새 Run QA Test 실행 후 검증'을 선택하세요.")
+            elif definition_target_mode == "기존 세션으로 검증" and not definition_session_available:
+                st.info("기존 세션으로 검증이 선택되었습니다. 먼저 불러올 세션을 선택하거나 새 세션을 준비하세요.")
+            elif definition_target_mode == "새 Run QA Test 실행 후 검증" and not definition_new_run_ready:
+                st.info("정의서 기준 새 테스트 실행 전입니다. 3단계에서 '정의서 기준으로 새 세션 수집 후 검증' 버튼을 눌러주세요.")
+            elif not uploaded_definition_summary_df.empty:
+                st.caption(f"정의서 기준 이벤트 {len(uploaded_definition_summary_df)}개 | 파라미터 {definition_param_count}개")
         if raw_captured_for_view:
             st.caption(
                 f"원본 로그 {raw_captured_for_view}건 | GA hit {ga_hit_count_for_view}건 | auto crawl {auto_crawl_count_for_view}건"
             )
         if rt_events.empty:
-            if raw_captured_for_view > 0 and ga_hit_count_for_view == 0:
+            if definition_mode_active and not definition_mode_ready:
+                st.info("정의서 업로드 전에는 업로드 파일 기준 검증 결과를 계산하지 않습니다.")
+            elif definition_mode_active and not definition_validation_active:
+                st.info("정의서 검증 준비 완료 상태입니다. 검증 대상 선택 및 실행 후 결과가 표시됩니다.")
+            elif raw_captured_for_view > 0 and ga_hit_count_for_view == 0:
                 st.warning("자동수집 로그는 있지만 아직 GA hit(collect)가 없습니다. 브라우저/수집기 연결 상태를 확인하세요.")
             elif raw_captured_for_view > 0:
-                st.info("GA4 hit는 있지만 기본/기술 이벤트를 제외하고 나면 표시할 custom event가 없습니다.")
+                if definition_mode_ready:
+                    st.info("GA4 hit는 있었지만 업로드한 정의서 기준 custom event는 아직 수집되지 않았습니다.")
+                else:
+                    st.info("GA4 hit는 있지만 기본/기술 이벤트를 제외하고 나면 표시할 custom event가 없습니다.")
             else:
                 st.info("아직 캡처된 이벤트가 없습니다.")
         else:
             st.subheader("QA Summary")
+            if definition_mode_active and definition_validation_active:
+                st.info(
+                    " | ".join(
+                        [
+                            f"기준 정의서: {str(st.session_state.get('qa_definition_validation_file_name', '-') or '-')}",
+                            f"검증 대상 세션: {sid_for_view}",
+                            f"검증 방식: {definition_validation_method or '-'}",
+                            f"수집 건수: {len(rt_events)}",
+                            f"정의서 이벤트 수: {len(schema_store)}",
+                            f"정의서 파라미터 수: {definition_param_count}",
+                        ]
+                    )
+                )
             m0, m1, m2, m3, m4, m5 = st.columns(6)
-            m0.metric("Events captured", int(captured_for_view))
+            if definition_mode_ready:
+                m0.metric("Definition events", int(len(event_schema_qa_all)))
+            else:
+                m0.metric("Events captured", int(captured_for_view))
             m1.metric("실시간 품질 점수", f"{rt_summary['score']} / 100")
             m2.metric("🔴 치명 오류", int(rt_summary["critical"]))
             m3.metric("🟡 주의 필요", int(rt_summary["caution"]))
             m4.metric("⚪ 참고 정보", int(rt_summary["info"]))
             m5.metric("🟢 정상", int(rt_summary["ok"]))
             st.caption(
-                f"기준표 QA 상태 | PASS {schema_summary['PASS']} · WARN {schema_summary['WARN']} · FAIL {schema_summary['FAIL']}"
+                f"기준표 QA 상태 | PASS {schema_summary_view['PASS']} · WARN {schema_summary_view['WARN']} · FAIL {schema_summary_view['FAIL']}"
             )
             q1, q2, q3 = st.columns(3)
-            q1.metric("Missing schema", int(missing_schema_count))
+            if definition_mode_ready:
+                q1.metric("Missing rows", int(definition_missing_event_count))
+            else:
+                q1.metric("Missing schema", int(missing_schema_count))
             q2.metric("Missing parameter", int(missing_parameter_count))
             q3.metric("Flow issues", int(flow_issue_count))
-            st.caption(
-                f"대상 이벤트 {rt_summary['event_count']}건 기준 | {rt_summary['message']}"
-            )
-
-            quick_cols = ["시간", "이벤트", "대표 파라미터", "대표 값", "상태"]
-            st.dataframe(rt_events[quick_cols].head(30), use_container_width=True, height=320)
+            if definition_mode_ready:
+                st.caption(f"업로드 정의서 이벤트 {len(event_schema_qa_all)}건 기준 PASS / FAIL 요약입니다.")
+                show_cols = ["no", "event_name", "description", "expected_identification", "matched_identification", "result", "test_count", "parameter_issue"]
+                keep_cols = [c for c in show_cols if c in event_schema_qa_all.columns]
+                st.dataframe(event_schema_qa_all[keep_cols], use_container_width=True, height=320)
+            else:
+                st.caption(
+                    f"대상 이벤트 {rt_summary['event_count']}건 기준 | {rt_summary['message']}"
+                )
+                quick_cols = ["시간", "이벤트", "대표 파라미터", "대표 값", "상태"]
+                st.dataframe(rt_events[quick_cols].head(30), use_container_width=True, height=320)
 
     with section_issues:
-        st.caption("문제가 있는 이벤트를 확인하고 여기서 바로 이벤트 기준표를 만들 수 있습니다.")
+        if definition_mode_ready:
+            st.caption("업로드한 정의서를 기준으로 PASS / FAIL이 아닌 이벤트만 모아 보여줍니다.")
+        else:
+            st.caption("문제가 있는 이벤트를 확인하고 여기서 바로 이벤트 기준표를 만들 수 있습니다.")
         if issue_df.empty:
             st.success("현재 문제 이벤트가 없습니다.")
         else:
             issue_event_names = sorted(issue_df["event_name"].astype(str).unique().tolist())
-            st.markdown("**이벤트 기준표 만들기 (문제 이벤트 기준)**")
-            include_system_params_for_schema = st.checkbox(
-                "기술 파라미터까지 포함해서 기준표 만들기",
-                value=False,
-                key="issue_include_system_params",
-                help="기본은 measurement_id/client_id 같은 시스템 파라미터를 제외합니다.",
-            )
-            selected_issue_events = st.multiselect(
-                "기준표 생성 대상 이벤트",
-                options=issue_event_names,
-                default=issue_event_names,
-                key="issue_schema_targets",
-            )
-            ia1, ia2 = st.columns([1.2, 1.2])
-            with ia1:
-                if st.button("선택 이벤트 기준표 생성", key="issue_generate_selected"):
-                    generated = 0
-                    total_excluded = 0
-                    for event_name in selected_issue_events:
-                        inferred = infer_event_schema_from_rows(
-                            rt_events,
-                            event_name,
-                            include_system_params=include_system_params_for_schema,
-                        )
-                        if int(inferred.get("sample_size", 0)) <= 0:
-                            continue
-                        schema_store[event_name] = {
-                            "required": list(inferred.get("required", [])),
-                            "optional": list(inferred.get("optional", [])),
-                            "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
-                        }
-                        generated += 1
-                        total_excluded += int(inferred.get("excluded_system_params", 0))
-                    save_event_schemas(schema_store)
-                    st.success(f"선택 이벤트 기준표 {generated}개 생성 완료")
-                    if not include_system_params_for_schema:
-                        st.info(f"시스템/기술 파라미터 제외: {total_excluded}건")
-                    st.rerun()
-            with ia2:
-                if st.button("문제 이벤트 전체 기준표 생성", key="issue_generate_all"):
-                    generated = 0
-                    total_excluded = 0
-                    for event_name in issue_event_names:
-                        inferred = infer_event_schema_from_rows(
-                            rt_events,
-                            event_name,
-                            include_system_params=include_system_params_for_schema,
-                        )
-                        if int(inferred.get("sample_size", 0)) <= 0:
-                            continue
-                        schema_store[event_name] = {
-                            "required": list(inferred.get("required", [])),
-                            "optional": list(inferred.get("optional", [])),
-                            "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
-                        }
-                        generated += 1
-                        total_excluded += int(inferred.get("excluded_system_params", 0))
-                    save_event_schemas(schema_store)
-                    st.success(f"문제 이벤트 전체 기준표 {generated}개 생성 완료")
-                    if not include_system_params_for_schema:
-                        st.info(f"시스템/기술 파라미터 제외: {total_excluded}건")
-                    st.rerun()
+            if not definition_mode_ready:
+                st.markdown("**이벤트 기준표 만들기 (문제 이벤트 기준)**")
+                include_system_params_for_schema = st.checkbox(
+                    "기술 파라미터까지 포함해서 기준표 만들기",
+                    value=False,
+                    key="issue_include_system_params",
+                    help="기본은 measurement_id/client_id 같은 시스템 파라미터를 제외합니다.",
+                )
+                selected_issue_events = st.multiselect(
+                    "기준표 생성 대상 이벤트",
+                    options=issue_event_names,
+                    default=issue_event_names,
+                    key="issue_schema_targets",
+                )
+                ia1, ia2 = st.columns([1.2, 1.2])
+                with ia1:
+                    if st.button("선택 이벤트 기준표 생성", key="issue_generate_selected"):
+                        generated = 0
+                        total_excluded = 0
+                        for event_name in selected_issue_events:
+                            inferred = infer_event_schema_from_rows(
+                                rt_events,
+                                event_name,
+                                include_system_params=include_system_params_for_schema,
+                            )
+                            if int(inferred.get("sample_size", 0)) <= 0:
+                                continue
+                            schema_store[event_name] = {
+                                "required": list(inferred.get("required", [])),
+                                "optional": list(inferred.get("optional", [])),
+                                "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                            }
+                            generated += 1
+                            total_excluded += int(inferred.get("excluded_system_params", 0))
+                        save_event_schemas(schema_store)
+                        st.success(f"선택 이벤트 기준표 {generated}개 생성 완료")
+                        if not include_system_params_for_schema:
+                            st.info(f"시스템/기술 파라미터 제외: {total_excluded}건")
+                        st.rerun()
+                with ia2:
+                    if st.button("문제 이벤트 전체 기준표 생성", key="issue_generate_all"):
+                        generated = 0
+                        total_excluded = 0
+                        for event_name in issue_event_names:
+                            inferred = infer_event_schema_from_rows(
+                                rt_events,
+                                event_name,
+                                include_system_params=include_system_params_for_schema,
+                            )
+                            if int(inferred.get("sample_size", 0)) <= 0:
+                                continue
+                            schema_store[event_name] = {
+                                "required": list(inferred.get("required", [])),
+                                "optional": list(inferred.get("optional", [])),
+                                "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+                            }
+                            generated += 1
+                            total_excluded += int(inferred.get("excluded_system_params", 0))
+                        save_event_schemas(schema_store)
+                        st.success(f"문제 이벤트 전체 기준표 {generated}개 생성 완료")
+                        if not include_system_params_for_schema:
+                            st.info(f"시스템/기술 파라미터 제외: {total_excluded}건")
+                        st.rerun()
 
             st.dataframe(issue_df, use_container_width=True, height=320)
             st.markdown("**기준표 비교 QA 결과 (이벤트별)**")
-            issue_param_validation = build_parameter_validation_export_df(rt_events, schema_store)
-            issue_order_validation = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
-            event_schema_qa = build_event_qa_report_export_df(
-                rt_events=rt_events,
-                issue_df=issue_df,
-                schemas=schema_store,
-                parameter_validation_df=issue_param_validation,
-                order_validation_df=issue_order_validation,
-            )
-            if event_schema_qa.empty:
+            if event_schema_qa_all.empty:
                 st.info("비교할 데이터가 없습니다.")
             else:
                 show_cols = [
+                    "no",
                     "event_name",
+                    "description",
+                    "expected_identification",
+                    "matched_identification",
                     "schema_status",
                     "parameter_issue",
                     "test_count",
@@ -5177,8 +7520,8 @@ with realtime_tab:
                     "order_fail_count",
                     "order_warn_count",
                 ]
-                keep_cols = [c for c in show_cols if c in event_schema_qa.columns]
-                st.dataframe(event_schema_qa[keep_cols], use_container_width=True, height=240)
+                keep_cols = [c for c in show_cols if c in event_schema_qa_all.columns]
+                st.dataframe(event_schema_qa_all[keep_cols], use_container_width=True, height=240)
 
     with section_detail:
         st.caption("이벤트를 선택해 payload 확인 → schema 검증 순서로 점검하세요.")
@@ -5255,13 +7598,15 @@ with realtime_tab:
 
     with section_export:
         st.caption("Export는 QA 문서, 이벤트 로그, event definition bundle 형태로 제공합니다.")
-        if timeline_df_active.empty:
+        if definition_mode_active and not definition_mode_ready:
+            st.info("정의서 파일을 업로드하면 그 파일 기준의 QA Report / Bundle을 생성할 수 있습니다.")
+        elif timeline_df_active_for_validation.empty:
             st.info("내보낼 실시간 데이터가 없습니다.")
         else:
             browser_timeline = build_realtime_timeline_view(
-                timeline_df,
+                timeline_df_for_validation,
                 allowed_events=allowed_events_rt,
-                unknown_event_policy=st.session_state.get("unknown_event_policy", "정보"),
+                unknown_event_policy="무시" if definition_mode_ready else st.session_state.get("unknown_event_policy", "정보"),
             )
             browser_errors_df = (
                 browser_timeline[browser_timeline["상태"].isin(["WARN", "ERROR"])].copy()
@@ -5271,13 +7616,7 @@ with realtime_tab:
             event_logs_df = build_event_logs_export_df(rt_events)
             parameter_validation_df = build_parameter_validation_export_df(rt_events, schema_store)
             order_validation_df = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
-            event_qa_result_df = build_event_qa_report_export_df(
-                rt_events=rt_events,
-                issue_df=issue_df,
-                schemas=schema_store,
-                parameter_validation_df=parameter_validation_df,
-                order_validation_df=order_validation_df,
-            )
+            event_qa_result_df = event_schema_qa_all.copy()
             qa_report_xlsx = dataframes_to_excel_bytes(
                 {
                     "Event QA Result": event_qa_result_df,
@@ -5288,90 +7627,150 @@ with realtime_tab:
             )
             event_logs_csv = dataframe_to_csv_bytes(event_logs_df)
             event_definition_preview_df, event_support_preview_df, _ = build_event_definition_exports(
-                timeline_df_active,
+                timeline_df_active_for_validation,
                 schema_store,
             )
-            event_detail_preview_df = build_event_review_detail_df(timeline_df_active, schema_store).drop(
+            event_detail_preview_df = build_event_review_detail_df(timeline_df_active_for_validation, schema_store).drop(
                 columns=["raw_payload_json"],
                 errors="ignore",
+            )
+            definition_validation_summary_preview_df, _, _ = (
+                build_definition_validation_frames(rt_events, schema_store)
+                if definition_mode_ready
+                else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+            )
+            qa_review_xlsx = build_qa_review_excel_bytes(
+                event_definition_df=event_definition_preview_df,
+                event_detail_df=build_event_review_detail_df(timeline_df_active_for_validation, schema_store),
+                definition_validation_summary_df=definition_validation_summary_preview_df,
+                bundle_scope="definition_validation" if definition_mode_ready else "custom_event_review",
+            )
+            log_definition_xlsx = build_log_definition_excel_bytes(
+                event_definition_df=event_definition_preview_df,
+                event_detail_df=build_event_review_detail_df(timeline_df_active_for_validation, schema_store),
             )
             target_url_for_bundle = (
                 str(st.session_state.get("qa_debug_target_url", "")).strip()
                 or str(debug_snapshot.get("target_url", "")).strip()
                 or (
-                    str(timeline_df_active.iloc[-1].get("page_url", "")).strip()
-                    if not timeline_df_active.empty
+                    str(timeline_df_active_for_validation.iloc[-1].get("page_url", "")).strip()
+                    if not timeline_df_active_for_validation.empty
                     else ""
                 )
             )
             bundle_cache_key = (
-                f"{sid_for_view}|{len(timeline_df_active)}|"
-                f"{str(timeline_df_active['captured_at'].max()) if 'captured_at' in timeline_df_active.columns and not timeline_df_active.empty else ''}"
+                f"{sid_for_view}|{len(timeline_df_active_for_validation)}|"
+                f"{str(timeline_df_active_for_validation['captured_at'].max()) if 'captured_at' in timeline_df_active_for_validation.columns and not timeline_df_active_for_validation.empty else ''}|"
+                f"{selected_mode}|{definition_target_mode}|"
+                f"{str(st.session_state.get('qa_definition_validation_file_name', '')).strip()}|"
+                f"{','.join(sorted(list(scoped_event_names or set())))}"
             )
             if st.session_state.get("qa_event_definition_bundle_cache_key", "") != bundle_cache_key:
                 st.session_state["qa_event_definition_bundle_cache_key"] = bundle_cache_key
-                st.session_state["qa_event_definition_bundle_bytes"] = b""
-                st.session_state["qa_event_definition_bundle_meta"] = {}
+                basic_bundle_bytes, debug_bundle_bytes, _, _, preview_bundle_meta = save_event_definition_bundle(
+                    raw_debug_df=timeline_df_active_for_validation,
+                    schemas=schema_store,
+                    qa_report_xlsx=qa_report_xlsx,
+                    target_url=target_url_for_bundle,
+                    session_id=active_debug_session_id or sid_for_view,
+                    scoped_event_names=scoped_event_names if definition_mode_ready else None,
+                    definition_file_name=str(st.session_state.get("qa_definition_validation_file_name", "")).strip(),
+                    bundle_scope="definition_validation" if definition_mode_ready else "custom_event_review",
+                    persist_run=False,
+                )
+                st.session_state["qa_event_definition_bundle_bytes"] = basic_bundle_bytes
+                st.session_state["qa_event_definition_debug_bundle_bytes"] = debug_bundle_bytes
+                st.session_state["qa_event_definition_bundle_meta"] = preview_bundle_meta
+            if "qa_event_definition_debug_bundle_bytes" not in st.session_state:
+                st.session_state["qa_event_definition_debug_bundle_bytes"] = b""
 
             st.markdown("### Export")
-            st.caption("QA 상태 기준: FAIL(필수/타입/순서 오류), WARN(기준표 없음/추가 파라미터/순서 경고), PASS(그 외)")
-            b1, b2, b3 = st.columns(3)
+            st.caption("기본 사용자는 QA 결과와 로그정의서 생성 파일만 확인하면 됩니다.")
+            b1, b2 = st.columns(2)
             with b1:
                 st.download_button(
-                    "[1] QA Report",
+                    "QA 결과 파일",
                     data=qa_report_xlsx,
-                    file_name="qa_report.xlsx",
+                    file_name="qa_result.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     disabled=not bool(qa_report_xlsx),
-                    help="이벤트 QA 결과 문서",
+                    help="사람이 QA 상태만 확인하는 결과 엑셀",
                 )
-                st.caption("이벤트 QA 결과 문서")
+                st.caption("QA 상태 확인용 결과 엑셀")
             with b2:
                 st.download_button(
-                    "[2] Event Logs",
-                    data=event_logs_csv,
-                    file_name="event_logs.csv",
-                    mime="text/csv",
-                    disabled=not bool(event_logs_csv),
-                    help="테스트 중 수집된 이벤트 로그",
+                    "로그정의서 생성",
+                    data=log_definition_xlsx,
+                    file_name="log_definition_review.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    disabled=not bool(log_definition_xlsx),
+                    help="캡처 이미지와 이벤트 정의/매개변수 표가 함께 들어간 리뷰용 엑셀",
                 )
-                st.caption("테스트 중 수집된 이벤트 로그")
-            with b3:
-                save_snapshot_clicked = st.button(
-                    "[3-1] 저장본 저장",
-                    key="generate_event_definition_bundle",
-                    disabled=event_definition_preview_df.empty,
-                    help="현재 이벤트 테스트 결과를 Run 저장본으로 저장하고 bundle을 생성합니다.",
-                )
-                if save_snapshot_clicked:
-                    bundle_bytes, _, _, bundle_meta = save_event_definition_bundle(
-                        raw_debug_df=timeline_df_active,
-                        schemas=schema_store,
-                        qa_report_xlsx=qa_report_xlsx,
-                        target_url=target_url_for_bundle,
-                        session_id=active_debug_session_id or sid_for_view,
+                st.caption("캡처 이미지 + 이벤트 정의 표가 들어간 리뷰 엑셀")
+
+            with st.expander("고급 Export", expanded=False):
+                st.caption("디버그 로그와 번들은 필요할 때만 사용하세요.")
+                g1, g2, g3, g4 = st.columns(4)
+                with g1:
+                    st.download_button(
+                        "Event Logs",
+                        data=event_logs_csv,
+                        file_name="event_logs.csv",
+                        mime="text/csv",
+                        disabled=not bool(event_logs_csv),
+                        help="테스트 중 수집된 이벤트 로그",
                     )
-                    st.session_state["qa_event_definition_bundle_bytes"] = bundle_bytes
-                    st.session_state["qa_event_definition_bundle_meta"] = bundle_meta
-                    st.success(f"저장본 저장 완료: {bundle_meta.get('run_id', '-')}")
-                bundle_bytes = st.session_state.get("qa_event_definition_bundle_bytes", b"")
-                st.download_button(
-                    "[3-2] Bundle 다운로드",
-                    data=bundle_bytes,
-                    file_name="event_definition_bundle.zip",
-                    mime="application/zip",
-                    disabled=not bool(bundle_bytes),
-                    help="event_definition.csv + event_review_details.csv + index.html + screenshot bundle",
-                )
+                with g2:
+                    bundle_bytes = st.session_state.get("qa_event_definition_bundle_bytes", b"")
+                    st.download_button(
+                        "Result Bundle",
+                        data=bundle_bytes,
+                        file_name="qa_result_bundle.zip",
+                        mime="application/zip",
+                        disabled=not bool(bundle_bytes),
+                        help="최종 리포트 + 요약 CSV + 상세 디버그 CSV만 포함한 기본 번들",
+                    )
+                with g3:
+                    debug_bundle_bytes = st.session_state.get("qa_event_definition_debug_bundle_bytes", b"")
+                    st.download_button(
+                        "Debug Bundle",
+                        data=debug_bundle_bytes,
+                        file_name="qa_debug_bundle.zip",
+                        mime="application/zip",
+                        disabled=not bool(debug_bundle_bytes),
+                        help="중간 산출물과 메타데이터까지 포함한 디버그 번들",
+                    )
+                with g4:
+                    save_snapshot_clicked = st.button(
+                        "저장본 저장",
+                        key="generate_event_definition_bundle",
+                        disabled=event_definition_preview_df.empty,
+                        help="현재 결과를 Run 저장본으로 보관합니다.",
+                    )
+                    if save_snapshot_clicked:
+                        bundle_bytes, debug_bundle_bytes, _, _, bundle_meta = save_event_definition_bundle(
+                            raw_debug_df=timeline_df_active_for_validation,
+                            schemas=schema_store,
+                            qa_report_xlsx=qa_report_xlsx,
+                            target_url=target_url_for_bundle,
+                            session_id=active_debug_session_id or sid_for_view,
+                            scoped_event_names=scoped_event_names if definition_mode_ready else None,
+                            definition_file_name=str(st.session_state.get("qa_definition_validation_file_name", "")).strip(),
+                            bundle_scope="definition_validation" if definition_mode_ready else "custom_event_review",
+                            persist_run=True,
+                        )
+                        st.session_state["qa_event_definition_bundle_bytes"] = bundle_bytes
+                        st.session_state["qa_event_definition_debug_bundle_bytes"] = debug_bundle_bytes
+                        st.session_state["qa_event_definition_bundle_meta"] = bundle_meta
+                        st.success(f"저장본 저장 완료: {bundle_meta.get('run_id', '-')}")
                 bundle_meta = st.session_state.get("qa_event_definition_bundle_meta", {})
                 if bundle_meta:
                     st.caption(
                         f"run_id={bundle_meta.get('run_id', '-')} | "
-                        f"events={bundle_meta.get('event_count', 0)} | "
+                        f"rows={bundle_meta.get('definition_row_count', bundle_meta.get('event_count', 0))} | "
+                        f"scope={bundle_meta.get('bundle_scope', '-')} | "
                         f"auto_baseline={bundle_meta.get('auto_baseline', False)}"
                     )
-                else:
-                    st.caption("먼저 저장본 저장 버튼을 눌러 Run을 만든 뒤 다운로드하세요.")
 
             st.markdown("**Event Definition 미리보기**")
             if event_definition_preview_df.empty:

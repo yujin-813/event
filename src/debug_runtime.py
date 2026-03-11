@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
@@ -33,6 +33,7 @@ class DebugSession:
     run_settings: Dict[str, object]
     stop_event: threading.Event
     thread: threading.Thread | None
+    matched_definition_events: set[str] = field(default_factory=set)
 
 
 _SESSIONS: Dict[str, DebugSession] = {}
@@ -297,6 +298,30 @@ def _normalize_run_settings(run_settings: Optional[Dict[str, object]] = None) ->
     browser_name = str(raw.get("browser_name", "chrome") or "chrome").strip().lower()
     if browser_name not in {"chrome", "chromium"}:
         browser_name = "chrome"
+    definition_event_names: List[str] = []
+    raw_definition_events = raw.get("definition_event_names", [])
+    if isinstance(raw_definition_events, (list, tuple, set)):
+        for item in raw_definition_events:
+            name = str(item or "").strip()
+            if name and name not in definition_event_names:
+                definition_event_names.append(name)
+    elif str(raw_definition_events or "").strip():
+        definition_event_names.append(str(raw_definition_events).strip())
+    raw_definition_hints = raw.get("definition_runtime_hints", {})
+    definition_runtime_hints = {
+        "target_ids": [],
+        "section_names": [],
+        "page_ids": [],
+        "text_hints": [],
+    }
+    if isinstance(raw_definition_hints, dict):
+        for key in definition_runtime_hints.keys():
+            raw_values = raw_definition_hints.get(key, [])
+            if isinstance(raw_values, (list, tuple, set)):
+                for item in raw_values:
+                    value_text = str(item or "").strip()
+                    if value_text and value_text not in definition_runtime_hints[key]:
+                        definition_runtime_hints[key].append(value_text)
     settings = {
         "environment": str(raw.get("environment", "prod") or "prod").strip() or "prod",
         "browser_name": browser_name,
@@ -332,8 +357,95 @@ def _normalize_run_settings(run_settings: Optional[Dict[str, object]] = None) ->
         "mobile_device": str(raw.get("mobile_device", "iPhone 13") or "iPhone 13").strip() or "iPhone 13",
         "qa_mode": str(raw.get("qa_mode", "전체 이벤트 테스트") or "전체 이벤트 테스트").strip(),
         "scenario_template": str(raw.get("scenario_template", "") or "").strip(),
+        "definition_event_names": definition_event_names,
+        "definition_runtime_hints": definition_runtime_hints,
     }
     return settings
+
+
+def _get_definition_event_targets(run_settings: Optional[Dict[str, object]] = None) -> List[str]:
+    raw_settings = _normalize_run_settings(run_settings)
+    values = raw_settings.get("definition_event_names", [])
+    if not isinstance(values, list):
+        return []
+    return [str(name).strip() for name in values if str(name).strip()]
+
+
+def _get_definition_runtime_hints(run_settings: Optional[Dict[str, object]] = None) -> Dict[str, List[str]]:
+    raw_settings = _normalize_run_settings(run_settings)
+    hints = raw_settings.get("definition_runtime_hints", {})
+    if not isinstance(hints, dict):
+        return {"target_ids": [], "section_names": [], "page_ids": [], "text_hints": []}
+    out = {"target_ids": [], "section_names": [], "page_ids": [], "text_hints": []}
+    for key in out.keys():
+        raw_values = hints.get(key, [])
+        if isinstance(raw_values, list):
+            out[key] = [str(v).strip() for v in raw_values if str(v).strip()]
+    return out
+
+
+def _candidate_matches_definition(meta: Dict[str, object], hints: Dict[str, List[str]]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    target_ids = {str(v).strip() for v in hints.get("target_ids", []) if str(v).strip()}
+    section_names = {str(v).strip() for v in hints.get("section_names", []) if str(v).strip()}
+    page_ids = {str(v).strip() for v in hints.get("page_ids", []) if str(v).strip()}
+    text_hints = [str(v).strip().lower() for v in hints.get("text_hints", []) if str(v).strip()]
+    strong_hint_exists = bool(target_ids or section_names or text_hints)
+    target_id = str(meta.get("target_id", "")).strip()
+    section_name = str(meta.get("section_name", "")).strip()
+    page_id = str(meta.get("page_id", "")).strip()
+    text = str(meta.get("text", "")).strip().lower()
+    if page_ids and page_id and page_id not in page_ids:
+        return False
+    if target_ids and target_id in target_ids:
+        return True
+    if section_names and section_name in section_names:
+        return True
+    if text_hints and text:
+        for hint in text_hints:
+            if hint and hint in text:
+                return True
+    return not strong_hint_exists
+
+
+def _mark_definition_hits(session_id: str, hits: List[Dict[str, object]]) -> List[str]:
+    sid = str(session_id or "").strip()
+    if not sid or not hits:
+        return []
+    with _LOCK:
+        session = _SESSIONS.get(sid)
+        if not session:
+            return []
+        target_names = set(_get_definition_event_targets(session.run_settings))
+        if not target_names:
+            return []
+        for payload in hits:
+            event_name = str(
+                payload.get("event_name")
+                or payload.get("event")
+                or payload.get("en")
+                or ""
+            ).strip()
+            if event_name and event_name in target_names:
+                session.matched_definition_events.add(event_name)
+        return sorted(session.matched_definition_events)
+
+
+def _get_definition_progress(session_id: str, run_settings: Optional[Dict[str, object]] = None) -> tuple[List[str], List[str], bool]:
+    sid = str(session_id or "").strip()
+    target_names = _get_definition_event_targets(run_settings)
+    matched_names: List[str] = []
+    with _LOCK:
+        session = _SESSIONS.get(sid)
+        if session:
+            if not target_names:
+                target_names = _get_definition_event_targets(session.run_settings)
+            matched_names = sorted(session.matched_definition_events)
+    target_set = set(target_names)
+    matched = [name for name in matched_names if name in target_set] if target_set else []
+    completed = bool(target_set and target_set.issubset(set(matched)))
+    return sorted(target_set), matched, completed
 
 
 def _launch_browser(playwright):
@@ -748,11 +860,12 @@ def _capture_annotated_screenshot(page, screenshot_path: Path, bbox: Dict[str, i
     }
     try:
         from io import BytesIO
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageDraw, ImageFont
 
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
         img_width, img_height = image.size
         draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default()
         x1 = int(min(max(0, normalized_bbox.get("bbox_x", 0)), max(0, img_width - 1)))
         y1 = int(min(max(0, normalized_bbox.get("bbox_y", 0)), max(0, img_height - 1)))
         x2 = int(min(max(x1, x1 + normalized_bbox.get("bbox_width", 0)), max(0, img_width - 1)))
@@ -764,10 +877,32 @@ def _capture_annotated_screenshot(page, screenshot_path: Path, bbox: Dict[str, i
             "bbox_height": max(0, y2 - y1),
         }
         draw.rectangle([x1, y1, x2, y2], outline=(220, 38, 38), width=4)
-        circle_x = max(22, x1 + 18)
-        circle_y = max(22, y1 + 18)
-        draw.ellipse([circle_x - 18, circle_y - 18, circle_x + 18, circle_y + 18], fill=(30, 64, 175))
-        draw.text((circle_x - 6, circle_y - 10), str(marker_index), fill=(255, 255, 255))
+        marker_text = str(marker_index)
+        text_bbox = draw.textbbox((0, 0), marker_text, font=font)
+        text_width = int(text_bbox[2] - text_bbox[0])
+        text_height = int(text_bbox[3] - text_bbox[1])
+        label_padding_x = 8
+        label_padding_y = 5
+        label_width = text_width + (label_padding_x * 2)
+        label_height = text_height + (label_padding_y * 2)
+        label_x = x2 + 8
+        if label_x + label_width > img_width:
+            label_x = max(0, x1 - label_width - 8)
+        label_y = max(0, y1)
+        if label_y + label_height > img_height:
+            label_y = max(0, img_height - label_height)
+        draw.rectangle(
+            [label_x, label_y, label_x + label_width, label_y + label_height],
+            fill=(220, 38, 38),
+            outline=(220, 38, 38),
+            width=2,
+        )
+        draw.text(
+            (label_x + label_padding_x, label_y + label_padding_y),
+            marker_text,
+            fill=(255, 255, 255),
+            font=font,
+        )
         image.save(screenshot_path, format="PNG")
     except Exception:
         screenshot_path.write_bytes(image_bytes)
@@ -874,6 +1009,8 @@ def _emit_auto_crawl_event(session_id: str, event_name: str, page_url: str, para
 
 def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop_event: threading.Event) -> None:
     settings = _normalize_run_settings(run_settings)
+    definition_targets = _get_definition_event_targets(settings)
+    definition_hints = _get_definition_runtime_hints(settings)
     max_auto_clicks = int(settings.get("max_auto_clicks", 80))
     wait_after_click_ms = int(settings.get("wait_after_click_ms", 1200))
     click_interval_ms = int(settings.get("click_interval_ms", 1200))
@@ -898,6 +1035,20 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
     clicked_count = 0
 
     while not stop_event.is_set() and clicked_count < max_auto_clicks:
+        target_names, matched_names, definition_done = _get_definition_progress(session_id, settings)
+        if definition_done:
+            _emit_auto_crawl_event(
+                session_id,
+                "definition_targets_reached",
+                page.url,
+                {
+                    "reason": "all_definition_events_captured",
+                    "matched_definition_events": matched_names,
+                    "definition_event_names": target_names,
+                    "run_mode": "Auto Crawl",
+                },
+            )
+            break
         try:
             page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:
@@ -917,6 +1068,8 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                         continue
                     meta = _extract_candidate_metadata(handle)
                     if not meta:
+                        continue
+                    if definition_targets and not _candidate_matches_definition(meta, definition_hints):
                         continue
                     text = str(meta.get("text", "")).strip()
                     if not text and str(meta.get("tag", "")) not in {"button", "input"}:
@@ -1019,10 +1172,19 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                 "navigation_blocked": navigation_blocked,
                 "url": current_url,
                 "auto_click_index": clicked_count,
+                "annotation_no": clicked_count,
                 "max_auto_clicks": max_auto_clicks,
                 "run_mode": "Auto Crawl",
+                "screen_name": str(selected_meta.get("page_id", "")).strip() or "/",
+                "screenshot_path": screenshot_file,
                 "selector_screenshot": screenshot_file,
                 "raw_screenshot_file": raw_screenshot_file,
+                "bounding_box": {
+                    "x": int(selected_bbox.get("bbox_x", 0)),
+                    "y": int(selected_bbox.get("bbox_y", 0)),
+                    "width": int(selected_bbox.get("bbox_width", 0)),
+                    "height": int(selected_bbox.get("bbox_height", 0)),
+                },
                 **selected_bbox,
             },
         )
@@ -1032,6 +1194,23 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
             page.wait_for_load_state("networkidle", timeout=2500)
         except Exception:
             pass
+
+        if definition_targets:
+            target_names, matched_names, definition_done = _get_definition_progress(session_id, settings)
+            if definition_done:
+                _emit_auto_crawl_event(
+                    session_id,
+                    "definition_targets_reached",
+                    page.url,
+                    {
+                        "reason": "all_definition_events_captured",
+                        "matched_definition_events": matched_names,
+                        "definition_event_names": target_names,
+                        "run_mode": "Auto Crawl",
+                        "auto_click_index": clicked_count,
+                    },
+                )
+                break
 
         if single_page_only and _build_compare_key(page.url) != start_compare_key:
             try:
@@ -1230,11 +1409,27 @@ def ingest_collect_request(
         post_data=request_body or "",
         session_id=sid,
     )
+    if hits:
+        with _LOCK:
+            current = _SESSIONS.get(sid)
+            target_names = set(_get_definition_event_targets(current.run_settings if current else None))
+        if target_names:
+            hits = [
+                payload
+                for payload in hits
+                if str(
+                    payload.get("event_name")
+                    or payload.get("event")
+                    or payload.get("en")
+                    or ""
+                ).strip() in target_names
+            ]
     if not hits:
         return 0
 
     for payload in hits:
         _append_event_with_db(output_path, payload, db_path)
+    _mark_definition_hits(sid, hits)
 
     with _LOCK:
         current = _SESSIONS.get(sid)
@@ -1292,6 +1487,7 @@ def start_debug_session(
             db_path=effective_db_path,
             launch_browser=bool(launch_browser),
             run_settings=_normalize_run_settings(run_settings),
+            matched_definition_events=set(),
             stop_event=stop_event,
             thread=None,
         )
