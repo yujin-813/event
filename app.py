@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import hashlib
+import html
 import json
 import os
 import io
@@ -746,22 +747,22 @@ def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
 def build_event_logs_export_df(rt_events: pd.DataFrame) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     if rt_events.empty:
-        return pd.DataFrame(columns=["timestamp", "event_name", "page_url", "parameter", "value"])
+        return pd.DataFrame(columns=["timestamp", "custom_event", "page_id", "custom_parameter", "custom_value"])
     for row in rt_events.to_dict("records"):
-        event_name = str(row.get("이벤트", "")).strip()
+        event_name = str(row.get("custom_event", row.get("이벤트", ""))).strip()
         timestamp = str(row.get("시간", "-"))
         params = row.get("전체 파라미터", {})
         if not isinstance(params, dict):
             params = {}
-        page_url = _to_text_value(params.get("page_location", params.get("page_url", "")))
+        page_id = _to_text_value(params.get("page_id", ""))
         if not params:
             rows.append(
                 {
                     "timestamp": timestamp,
-                    "event_name": event_name,
-                    "page_url": page_url,
-                    "parameter": "-",
-                    "value": "-",
+                    "custom_event": event_name,
+                    "page_id": page_id or "-",
+                    "custom_parameter": "-",
+                    "custom_value": "-",
                 }
             )
             continue
@@ -769,10 +770,10 @@ def build_event_logs_export_df(rt_events: pd.DataFrame) -> pd.DataFrame:
             rows.append(
                 {
                     "timestamp": timestamp,
-                    "event_name": event_name,
-                    "page_url": page_url,
-                    "parameter": str(key),
-                    "value": _to_text_value(value),
+                    "custom_event": event_name,
+                    "page_id": page_id or "-",
+                    "custom_parameter": str(key),
+                    "custom_value": _to_text_value(value),
                 }
             )
     return pd.DataFrame(rows)
@@ -1181,6 +1182,1094 @@ def build_screen_marked_png_bytes(screen_definition_df: pd.DataFrame) -> bytes:
     return out.getvalue()
 
 
+EVENT_DEFINITION_PARAM_PRIORITY = [
+    "button_id",
+    "button_name",
+    "section_name",
+    "section_index",
+    "section_title",
+    "index",
+    "content_id",
+    "content_name",
+    "content_type",
+    "banner_id",
+    "category_id",
+    "category_name",
+    "filter_type",
+    "filter_value",
+    "applied_tab",
+    "page_id",
+    "page_link",
+    "extra_info",
+]
+EVENT_DEFINITION_HIDDEN_KEYS = {
+    "gtm",
+    "gcd",
+    "uaa",
+    "uab",
+    "uafvl",
+    "uap",
+    "uapv",
+    "uaw",
+    "up.client_id",
+    "page_hostname",
+}
+
+
+def _status_to_ko(status: str) -> str:
+    normalized = str(status or "").strip().upper()
+    return {"OK": "정상", "WARN": "경고", "ERROR": "오류", "INFO": "정보"}.get(normalized, "정상")
+
+
+def _build_url_compare_key(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc or ""
+    path = parsed.path or "/"
+    return f"{scheme}://{host}{path}"
+
+
+def _build_url_hash(url_compare_key: str) -> str:
+    return hashlib.sha256(str(url_compare_key).encode("utf-8")).hexdigest()[:16]
+
+
+def _extract_page_id(page_url: str, params: Dict[str, object]) -> str:
+    page_id = _to_text_value(params.get("page_id", ""))
+    if page_id:
+        return page_id
+    location_url = _to_text_value(params.get("page_location", page_url))
+    try:
+        parsed = urlparse(location_url)
+        return parsed.path or "/"
+    except Exception:
+        return "/"
+
+
+def _build_event_meta(row: pd.Series, params: Dict[str, object], auto_ctx: Dict[str, object] | None = None) -> Dict[str, object]:
+    ctx = auto_ctx or {}
+    page_url = _to_text_value(row.get("page_url", "")) or _to_text_value(params.get("page_location", ""))
+    page_id = _extract_page_id(page_url, params)
+    section_name = (
+        _to_text_value(params.get("section_name", ""))
+        or _to_text_value(params.get("qa_section_name", ""))
+        or _to_text_value(ctx.get("section_name", ""))
+        or "global"
+    )
+    target_id = (
+        _to_text_value(params.get("qa_target_id", ""))
+        or _to_text_value(params.get("target_id", ""))
+        or _to_text_value(ctx.get("target_id", ""))
+    )
+    if not target_id:
+        button_id = _to_text_value(params.get("button_id", ""))
+        if button_id:
+            target_id = f"button_id:{button_id}"
+    if not target_id and section_name:
+        target_id = f"data-section-name:{section_name}"
+    selector = (
+        _to_text_value(params.get("qa_selector", ""))
+        or _to_text_value(params.get("selector", ""))
+        or _to_text_value(ctx.get("selector", ""))
+    )
+    class_attribute = (
+        _to_text_value(params.get("qa_class_attribute", ""))
+        or _to_text_value(params.get("class_attribute", ""))
+        or _to_text_value(ctx.get("class_attribute", ""))
+    )
+    screen_state = (
+        _to_text_value(params.get("qa_screen_state", ""))
+        or _to_text_value(params.get("screen_state", ""))
+        or _to_text_value(ctx.get("screen_state", ""))
+        or "default"
+    )
+    screenshot_file = (
+        _to_text_value(params.get("qa_selector_screenshot", ""))
+        or _to_text_value(params.get("selector_screenshot", ""))
+        or _to_text_value(ctx.get("selector_screenshot", ""))
+    )
+    raw_screenshot_file = (
+        _to_text_value(params.get("qa_raw_screenshot_file", ""))
+        or _to_text_value(params.get("raw_screenshot_file", ""))
+        or _to_text_value(ctx.get("raw_screenshot_file", ""))
+    )
+    return {
+        "page_url": page_url,
+        "page_id": page_id,
+        "section_name": section_name,
+        "target_id": target_id or "-",
+        "selector": selector or "-",
+        "class_attribute": class_attribute or "-",
+        "screen_state": screen_state or "default",
+        "screenshot_file": screenshot_file,
+        "raw_screenshot_file": raw_screenshot_file,
+        "bbox_x": _to_text_value(params.get("qa_bbox_x", params.get("bbox_x", ctx.get("bbox_x", 0)))),
+        "bbox_y": _to_text_value(params.get("qa_bbox_y", params.get("bbox_y", ctx.get("bbox_y", 0)))),
+        "bbox_width": _to_text_value(params.get("qa_bbox_width", params.get("bbox_width", ctx.get("bbox_width", 0)))),
+        "bbox_height": _to_text_value(params.get("qa_bbox_height", params.get("bbox_height", ctx.get("bbox_height", 0)))),
+    }
+
+
+def _choose_export_params(params: Dict[str, object], schema_obj: Dict[str, object]) -> List[Tuple[str, str]]:
+    required = {str(v).strip() for v in schema_obj.get("required", []) if str(v).strip()} if isinstance(schema_obj, dict) else set()
+    visible_keys = _sort_custom_param_keys(
+        [key for key in list(required) + list(params.keys()) if not _is_hidden_default_param_key(str(key))]
+    )
+    rows: List[Tuple[str, str]] = []
+    for key in visible_keys:
+        if key in params:
+            rows.append((key, "Y" if key in required else "N"))
+    return rows
+
+
+def _build_event_identity(event_name: str, params: Dict[str, object], meta: Dict[str, object]) -> Tuple[str, ...]:
+    return (
+        str(meta.get("page_id", "")).strip(),
+        str(event_name).strip(),
+        _to_text_value(params.get("section_name", meta.get("section_name", ""))),
+        _to_text_value(params.get("button_id", "")),
+        _to_text_value(params.get("filter_type", "")),
+        _to_text_value(params.get("filter_value", "")),
+        _to_text_value(meta.get("target_id", "")),
+        _to_text_value(meta.get("selector", "")),
+        _to_text_value(meta.get("screen_state", "")),
+    )
+
+
+def _find_nearest_auto_context(auto_rows: List[Dict[str, object]], captured_at: pd.Timestamp, page_id: str) -> Dict[str, object]:
+    if pd.isna(captured_at):
+        return {}
+    for item in reversed(auto_rows):
+        item_ts = item.get("captured_at")
+        if pd.isna(item_ts):
+            continue
+        delta = abs((captured_at - item_ts).total_seconds())
+        if delta > 8:
+            continue
+        if str(item.get("page_id", "")).strip() and str(item.get("page_id", "")).strip() != str(page_id).strip():
+            continue
+        return item
+    return {}
+
+
+def _build_short_selector(selector: str) -> str:
+    raw = str(selector or "").strip()
+    if not raw:
+        return "-"
+    parts = [part.strip() for part in raw.split(">") if part.strip()]
+    short_parts = parts[-2:] if len(parts) >= 2 else parts
+    short_selector = " > ".join(short_parts)
+    return short_selector[:160] if len(short_selector) > 160 else short_selector
+
+
+def _build_identification_summary(custom_params: Dict[str, str], meta: Dict[str, object]) -> str:
+    def has_value(key: str) -> bool:
+        return bool(str(custom_params.get(key, "")).strip())
+
+    if has_value("button_id"):
+        return f"button_id={custom_params['button_id']}"
+    if has_value("button_name"):
+        return f"button_name={custom_params['button_name']}"
+    if has_value("filter_type") and has_value("filter_value"):
+        return f"filter_type={custom_params['filter_type']}, filter_value={custom_params['filter_value']}"
+    if has_value("content_id") and has_value("content_name"):
+        return f"content_id={custom_params['content_id']}, content_name={custom_params['content_name']}"
+    if has_value("banner_id"):
+        return f"banner_id={custom_params['banner_id']}"
+    short_selector = _build_short_selector(str(meta.get("selector", "")))
+    if short_selector != "-":
+        return f"selector={short_selector}"
+    return "식별 조건 보완 필요"
+
+
+def _evaluate_inspection_status(meta: Dict[str, object], custom_items: List[Tuple[str, str]]) -> str:
+    target_id = str(meta.get("target_id", "")).strip().lower()
+    if not target_id or target_id in {"-", "(not set)", "not set", "none", "null"}:
+        return "식별자 보완 필요"
+    if not custom_items:
+        return "확인 필요"
+    bbox_values = [
+        str(meta.get("bbox_x", "0")).strip(),
+        str(meta.get("bbox_y", "0")).strip(),
+        str(meta.get("bbox_width", "0")).strip(),
+        str(meta.get("bbox_height", "0")).strip(),
+    ]
+    has_bbox = False
+    try:
+        has_bbox = float(bbox_values[2]) > 0 and float(bbox_values[3]) > 0
+    except Exception:
+        has_bbox = False
+    screenshot_file = str(meta.get("screenshot_file", "")).strip()
+    selector = str(meta.get("selector", "")).strip()
+    if not screenshot_file or not selector or not has_bbox:
+        return "매핑 오류 의심"
+    return "정상"
+
+
+def build_event_definition_exports(
+    raw_debug_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    event_def_columns = [
+        "no",
+        "action",
+        "object",
+        "event name",
+        "params.key",
+        "req",
+        "params.value (as-is)",
+        "params.value",
+        "class-attribute",
+        "status",
+        "page_id",
+        "section_name",
+        "target_id",
+        "selector",
+        "screen_state",
+        "annotation_no",
+        "screenshot_file",
+    ]
+    support_columns = [
+        "page_id",
+        "section_name",
+        "event no",
+        "annotation_no",
+        "target_id",
+        "selector",
+        "screenshot_file",
+        "raw_screenshot_file",
+        "bbox_x",
+        "bbox_y",
+        "bbox_width",
+        "bbox_height",
+        "screen_state",
+        "note",
+    ]
+    if raw_debug_df.empty:
+        return pd.DataFrame(columns=event_def_columns), pd.DataFrame(columns=support_columns), []
+
+    work = raw_debug_df.copy()
+    work["captured_at"] = pd.to_datetime(work["captured_at"], errors="coerce")
+    work = work.sort_values("captured_at")
+
+    auto_rows: List[Dict[str, object]] = []
+    for _, row in work[work["source"].astype(str) == "auto_crawl"].iterrows():
+        params = row.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        auto_rows.append(
+            {
+                "captured_at": row.get("captured_at"),
+                "page_id": _extract_page_id(_to_text_value(row.get("page_url", "")), params),
+                "section_name": _to_text_value(params.get("section_name", "")),
+                "target_id": _to_text_value(params.get("target_id", "")),
+                "selector": _to_text_value(params.get("selector", "")),
+                "class_attribute": _to_text_value(params.get("class_attribute", "")),
+                "screen_state": _to_text_value(params.get("screen_state", "")),
+                "selector_screenshot": _to_text_value(params.get("selector_screenshot", "")),
+                "raw_screenshot_file": _to_text_value(params.get("raw_screenshot_file", "")),
+                "bbox_x": _to_text_value(params.get("bbox_x", 0)),
+                "bbox_y": _to_text_value(params.get("bbox_y", 0)),
+                "bbox_width": _to_text_value(params.get("bbox_width", 0)),
+                "bbox_height": _to_text_value(params.get("bbox_height", 0)),
+            }
+        )
+
+    event_rows: List[Dict[str, object]] = []
+    support_rows: List[Dict[str, object]] = []
+    asset_paths: List[str] = []
+    seen_identities: set[Tuple[str, ...]] = set()
+    event_no = 0
+
+    ga_rows = work[work["source"].astype(str) == "ga_hit"]
+    for _, row in ga_rows.iterrows():
+        event_name = str(row.get("event_name", "")).strip()
+        if not event_name:
+            continue
+        params = row.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        custom_event_name, custom_items = extract_custom_event_payload(event_name, params, schemas)
+        if not custom_event_name:
+            continue
+        top_custom_items, _ = split_custom_param_items(custom_items)
+        page_id = _extract_page_id(_to_text_value(row.get("page_url", "")), params)
+        auto_ctx = _find_nearest_auto_context(auto_rows, row.get("captured_at"), page_id)
+        meta = _build_event_meta(row, params, auto_ctx=auto_ctx)
+        custom_param_map = {key: value for key, value in top_custom_items}
+        identity = _build_event_identity(custom_event_name, custom_param_map, meta)
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        event_no += 1
+
+        status = _evaluate_inspection_status(meta, top_custom_items)
+        action, obj = _infer_action_object(custom_event_name)
+        schema_obj = schemas.get(event_name, {})
+        export_params = [(key, "Y" if key in {str(v).strip() for v in schema_obj.get("required", []) if str(v).strip()} else "N") for key, _ in top_custom_items]
+        annotation_no = str(event_no) if str(meta.get("screenshot_file", "")).strip() else ""
+        screenshot_file = str(meta.get("screenshot_file", "")).strip()
+        raw_screenshot_file = str(meta.get("raw_screenshot_file", "")).strip()
+        if screenshot_file:
+            asset_paths.append(screenshot_file)
+        if raw_screenshot_file:
+            asset_paths.append(raw_screenshot_file)
+
+        event_rows.append(
+            {
+                "no": event_no,
+                "action": action,
+                "object": obj,
+                "event name": custom_event_name,
+                "params.key": "",
+                "req": "",
+                "params.value (as-is)": "",
+                "params.value": "",
+                "class-attribute": meta["class_attribute"],
+                "status": status,
+                "page_id": meta["page_id"],
+                "section_name": meta["section_name"],
+                "target_id": meta["target_id"],
+                "selector": meta["selector"],
+                "screen_state": meta["screen_state"],
+                "annotation_no": annotation_no,
+                "screenshot_file": screenshot_file,
+            }
+        )
+        for param_key, req_flag in export_params:
+            value_text = custom_param_map.get(param_key, "")
+            event_rows.append(
+                {
+                    "no": "",
+                    "action": "",
+                    "object": "",
+                    "event name": "",
+                    "params.key": param_key,
+                    "req": req_flag,
+                    "params.value (as-is)": value_text,
+                    "params.value": value_text,
+                    "class-attribute": meta["class_attribute"],
+                    "status": status,
+                    "page_id": meta["page_id"],
+                    "section_name": meta["section_name"],
+                    "target_id": meta["target_id"],
+                    "selector": meta["selector"],
+                    "screen_state": meta["screen_state"],
+                    "annotation_no": annotation_no,
+                    "screenshot_file": screenshot_file,
+                }
+            )
+
+        support_rows.append(
+            {
+                "page_id": meta["page_id"],
+                "section_name": meta["section_name"],
+                "event no": event_no,
+                "annotation_no": annotation_no,
+                "target_id": meta["target_id"],
+                "selector": meta["selector"],
+                "screenshot_file": screenshot_file or "-",
+                "raw_screenshot_file": raw_screenshot_file or "-",
+                "bbox_x": meta["bbox_x"] or 0,
+                "bbox_y": meta["bbox_y"] or 0,
+                "bbox_width": meta["bbox_width"] or 0,
+                "bbox_height": meta["bbox_height"] or 0,
+                "screen_state": meta["screen_state"],
+                "note": status if status != "정상" else "-",
+            }
+        )
+
+    return (
+        pd.DataFrame(event_rows, columns=event_def_columns),
+        pd.DataFrame(support_rows, columns=support_columns),
+        sorted(dict.fromkeys([p for p in asset_paths if str(p).strip()])),
+    )
+
+
+def build_event_review_detail_df(
+    raw_debug_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+) -> pd.DataFrame:
+    detail_columns = [
+        "event no",
+        "annotation_no",
+        "custom_event",
+        "custom_parameters",
+        "extra_custom_parameters",
+        "event_name",
+        "action",
+        "object",
+        "status",
+        "page_id",
+        "section_name",
+        "target_id",
+        "selector",
+        "screen_state",
+        "class_attribute",
+        "identification",
+        "short_selector",
+        "key_params",
+        "screenshot_file",
+        "raw_screenshot_file",
+        "bbox_x",
+        "bbox_y",
+        "bbox_width",
+        "bbox_height",
+        "raw_payload_json",
+    ]
+    if raw_debug_df.empty:
+        return pd.DataFrame(columns=detail_columns)
+
+    work = raw_debug_df.copy()
+    work["captured_at"] = pd.to_datetime(work["captured_at"], errors="coerce")
+    work = work.sort_values("captured_at")
+
+    auto_rows: List[Dict[str, object]] = []
+    for _, row in work[work["source"].astype(str) == "auto_crawl"].iterrows():
+        params = row.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        auto_rows.append(
+            {
+                "captured_at": row.get("captured_at"),
+                "page_id": _extract_page_id(_to_text_value(row.get("page_url", "")), params),
+                "section_name": _to_text_value(params.get("section_name", "")),
+                "target_id": _to_text_value(params.get("target_id", "")),
+                "selector": _to_text_value(params.get("selector", "")),
+                "class_attribute": _to_text_value(params.get("class_attribute", "")),
+                "screen_state": _to_text_value(params.get("screen_state", "")),
+                "selector_screenshot": _to_text_value(params.get("selector_screenshot", "")),
+                "raw_screenshot_file": _to_text_value(params.get("raw_screenshot_file", "")),
+                "bbox_x": _to_text_value(params.get("bbox_x", 0)),
+                "bbox_y": _to_text_value(params.get("bbox_y", 0)),
+                "bbox_width": _to_text_value(params.get("bbox_width", 0)),
+                "bbox_height": _to_text_value(params.get("bbox_height", 0)),
+            }
+        )
+
+    rows: List[Dict[str, object]] = []
+    seen_identities: set[Tuple[str, ...]] = set()
+    event_no = 0
+    ga_rows = work[work["source"].astype(str) == "ga_hit"]
+    for _, row in ga_rows.iterrows():
+        event_name = str(row.get("event_name", "")).strip()
+        if not event_name:
+            continue
+        params = row.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        custom_event_name, custom_items = extract_custom_event_payload(event_name, params, schemas)
+        if not custom_event_name:
+            continue
+        top_custom_items, extra_custom_items = split_custom_param_items(custom_items)
+        page_id = _extract_page_id(_to_text_value(row.get("page_url", "")), params)
+        auto_ctx = _find_nearest_auto_context(auto_rows, row.get("captured_at"), page_id)
+        meta = _build_event_meta(row, params, auto_ctx=auto_ctx)
+        custom_param_map = {key: value for key, value in top_custom_items}
+        identity = _build_event_identity(custom_event_name, custom_param_map, meta)
+        if identity in seen_identities:
+            continue
+        seen_identities.add(identity)
+        event_no += 1
+
+        status = _evaluate_inspection_status(meta, top_custom_items)
+        action, obj = _infer_action_object(custom_event_name)
+        key_params = [f"{param_key}={value_text}" for param_key, value_text in top_custom_items if value_text]
+        extra_params = [f"{param_key}={value_text}" for param_key, value_text in extra_custom_items if value_text]
+        identification_text = _build_identification_summary(custom_param_map, meta)
+        rows.append(
+            {
+                "event no": event_no,
+                "annotation_no": str(event_no) if str(meta.get("screenshot_file", "")).strip() else "",
+                "custom_event": custom_event_name,
+                "custom_parameters": " | ".join(key_params) if key_params else "-",
+                "extra_custom_parameters": " | ".join(extra_params) if extra_params else "-",
+                "event_name": custom_event_name,
+                "action": action,
+                "object": obj,
+                "status": status,
+                "page_id": meta["page_id"],
+                "section_name": meta["section_name"],
+                "target_id": meta["target_id"],
+                "selector": meta["selector"],
+                "screen_state": meta["screen_state"],
+                "class_attribute": meta["class_attribute"],
+                "identification": identification_text,
+                "short_selector": _build_short_selector(meta["selector"]),
+                "key_params": " | ".join(key_params) if key_params else "-",
+                "custom_parameters": " | ".join(key_params) if key_params else "-",
+                "screenshot_file": str(meta.get("screenshot_file", "")).strip() or "-",
+                "raw_screenshot_file": str(meta.get("raw_screenshot_file", "")).strip() or "-",
+                "bbox_x": meta["bbox_x"] or 0,
+                "bbox_y": meta["bbox_y"] or 0,
+                "bbox_width": meta["bbox_width"] or 0,
+                "bbox_height": meta["bbox_height"] or 0,
+                "raw_payload_json": json.dumps(params, ensure_ascii=False, sort_keys=True),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=detail_columns)
+
+
+def build_event_definition_bundle_html(
+    meta: Dict[str, object],
+    event_definition_df: pd.DataFrame,
+    event_support_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+) -> str:
+    event_records = event_detail_df.to_dict("records") if not event_detail_df.empty else []
+    cards_html: List[str] = []
+    nav_html: List[str] = []
+    for idx, row in enumerate(event_records):
+        event_no = str(row.get("event no", "")).strip()
+        annotation_no = str(row.get("annotation_no", event_no)).strip() or event_no
+        custom_event = html.escape(str(row.get("custom_event", row.get("event_name", ""))))
+        status = html.escape(str(row.get("status", "")))
+        status_class = (
+            "warn" if status in {"확인 필요", "식별자 보완 필요"} else "error" if status == "매핑 오류 의심" else "ok"
+        )
+        custom_parameters = html.escape(str(row.get("custom_parameters", "-")))
+        cards_html.append(
+            f"""
+            <article
+              class="event-card{' active' if idx == 0 else ''}"
+              id="event-{html.escape(event_no)}"
+              data-event-no="{html.escape(event_no)}"
+              data-annotation-no="{html.escape(annotation_no)}"
+            >
+              <button type="button" class="card-button" data-select-event="{html.escape(event_no)}">
+                <div class="event-card-head">
+                  <div class="event-number">#{html.escape(annotation_no)}</div>
+                  <div>
+                    <h2>{custom_event}</h2>
+                    <p class="event-ident">{html.escape(str(row.get("identification", "-")))}</p>
+                  </div>
+                  <span class="status {status_class}">{status}</span>
+                </div>
+                <dl class="event-meta">
+                  <dt>target_id</dt><dd>{html.escape(str(row.get("target_id", "-")))}</dd>
+                  <dt>section_name</dt><dd>{html.escape(str(row.get("section_name", "-")))}</dd>
+                  <dt>page_id</dt><dd>{html.escape(str(row.get("page_id", "-")))}</dd>
+                  <dt>custom_parameters</dt><dd>{custom_parameters}</dd>
+                </dl>
+              </button>
+              <details class="event-debug">
+                <summary>상세 보기</summary>
+                <dl class="event-debug-meta">
+                  <dt>extra custom</dt><dd>{html.escape(str(row.get("extra_custom_parameters", "-")))}</dd>
+                  <dt>short selector</dt><dd>{html.escape(str(row.get("short_selector", "-")))}</dd>
+                  <dt>raw selector</dt><dd>{html.escape(str(row.get("selector", "-")))}</dd>
+                  <dt>bbox</dt><dd>{html.escape(f"x={row.get('bbox_x', 0)}, y={row.get('bbox_y', 0)}, w={row.get('bbox_width', 0)}, h={row.get('bbox_height', 0)}")}</dd>
+                </dl>
+                <pre>{html.escape(str(row.get("raw_payload_json", "{}")))}</pre>
+              </details>
+            </article>
+            """
+        )
+        nav_html.append(
+            f'<button type="button" class="annotation-chip{" active" if idx == 0 else ""}" data-select-event="{html.escape(event_no)}">{html.escape(annotation_no)}</button>'
+        )
+
+    event_payload = json.dumps(event_records, ensure_ascii=False)
+    summary_count = int((event_definition_df["no"].astype(str).str.strip() != "").sum()) if not event_definition_df.empty else 0
+
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Event Definition Review Report</title>
+  <style>
+    :root {{
+      --bg: #f3efe8;
+      --panel: #fffdf8;
+      --line: #d8d1c3;
+      --ink: #18212f;
+      --muted: #6b7280;
+      --accent: #0f766e;
+      --accent-weak: rgba(15, 118, 110, 0.14);
+      --warn: #9a3412;
+      --warn-weak: rgba(154, 52, 18, 0.12);
+      --error: #b91c1c;
+      --error-weak: rgba(185, 28, 28, 0.12);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: linear-gradient(180deg, #f8f4ec 0%, #ede7dd 100%); color: var(--ink); font-family: "Helvetica Neue", Arial, sans-serif; }}
+    a {{ color: inherit; }}
+    main {{ max-width: 1600px; margin: 0 auto; padding: 24px; }}
+    .hero {{ background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 22px; margin-bottom: 18px; }}
+    .hero h1 {{ margin: 0 0 10px; font-size: 28px; }}
+    .hero p {{ margin: 6px 0; }}
+    .file-links {{ display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; }}
+    .file-links a {{ text-decoration: none; border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; background: #fff; }}
+    .layout {{ display: grid; grid-template-columns: minmax(560px, 1.15fr) minmax(380px, 0.85fr); gap: 18px; align-items: start; }}
+    .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 18px; }}
+    .annotation-panel {{ position: sticky; top: 20px; padding: 18px; }}
+    .annotation-header {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 12px; }}
+    .annotation-header h2 {{ margin: 0; font-size: 20px; }}
+    .annotation-sub {{ color: var(--muted); font-size: 14px; }}
+    .annotation-stage {{ position: relative; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: #f8fafc; min-height: 420px; }}
+    .annotation-stage img {{ display: block; width: 100%; height: auto; }}
+    .overlay-layer {{ position: absolute; inset: 0; }}
+    .overlay-box {{
+      position: absolute;
+      border: 2px solid rgba(148, 163, 184, 0.6);
+      background: rgba(148, 163, 184, 0.12);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 160ms ease;
+    }}
+    .overlay-box.active {{
+      border-color: var(--accent);
+      background: var(--accent-weak);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.85) inset;
+      z-index: 3;
+    }}
+    .overlay-label {{
+      position: absolute;
+      top: -12px;
+      left: -2px;
+      min-width: 28px;
+      height: 28px;
+      padding: 0 8px;
+      border-radius: 999px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(100, 116, 139, 0.82);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .overlay-box.active .overlay-label {{ background: var(--accent); }}
+    .annotation-chips {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }}
+    .annotation-chip {{
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 7px 11px;
+      cursor: pointer;
+      opacity: 0.55;
+    }}
+    .annotation-chip.active {{ opacity: 1; border-color: var(--accent); color: var(--accent); }}
+    .annotation-footer {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 14px; color: var(--muted); }}
+    .annotation-footer a {{ text-decoration: none; border-bottom: 1px solid currentColor; }}
+    .cards-panel {{ padding: 18px; }}
+    .cards-panel h2 {{ margin: 0 0 10px; font-size: 20px; }}
+    .cards-list {{ display: grid; gap: 12px; }}
+    .event-card {{ border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: #fff; transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease; }}
+    .event-card.active {{ border-color: var(--accent); box-shadow: 0 14px 34px rgba(15, 118, 110, 0.12); transform: translateY(-1px); }}
+    .card-button {{ width: 100%; background: transparent; border: 0; text-align: left; padding: 16px; cursor: pointer; color: inherit; }}
+    .event-card-head {{ display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: start; }}
+    .event-card-head h2 {{ margin: 0 0 6px; font-size: 18px; }}
+    .event-ident {{ margin: 0; color: var(--muted); font-size: 14px; }}
+    .event-number {{ width: 42px; height: 42px; border-radius: 999px; background: #ecfeff; color: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 700; }}
+    .status {{ border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 700; white-space: nowrap; }}
+    .status.ok {{ background: var(--accent-weak); color: var(--accent); }}
+    .status.warn {{ background: var(--warn-weak); color: var(--warn); }}
+    .status.error {{ background: var(--error-weak); color: var(--error); }}
+    .event-meta, .event-debug-meta {{ display: grid; grid-template-columns: 124px 1fr; gap: 8px 12px; margin: 14px 0 0; }}
+    .event-meta dt, .event-debug-meta dt {{ color: var(--muted); }}
+    .event-meta dd, .event-debug-meta dd {{ margin: 0; word-break: break-word; }}
+    .event-debug {{ border-top: 1px solid var(--line); padding: 0 16px 16px; }}
+    .event-debug summary {{ cursor: pointer; padding-top: 12px; color: var(--muted); }}
+    .event-debug pre {{ margin: 12px 0 0; padding: 12px; border-radius: 12px; background: #0f172a; color: #e2e8f0; overflow: auto; font-size: 12px; }}
+    .empty-stage {{ min-height: 420px; display: flex; align-items: center; justify-content: center; color: var(--muted); }}
+    @media (max-width: 1180px) {{
+      .layout {{ grid-template-columns: 1fr; }}
+      .annotation-panel {{ position: static; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>Event Definition Review Report</h1>
+      <p>HTML 하나만 열어도 어느 위치를 테스트했는지, 어떤 custom event가 수집됐는지, 핵심 custom parameter가 무엇인지 빠르게 검수할 수 있도록 구성했습니다.</p>
+      <p>project={html.escape(str(meta.get("project_slug", "-")))} | session={html.escape(str(meta.get("session_id", "-")))} | run_id={html.escape(str(meta.get("run_id", "-")))} | events={summary_count}</p>
+      <div class="file-links">
+        <a href="event_definition.csv">1. 이벤트 정의 CSV</a>
+        <a href="event_support.csv">2. annotation 지원 CSV</a>
+        <a href="event_review_details.csv">3. 이벤트별 상세 검수 산출물</a>
+      </div>
+    </section>
+    <section class="layout">
+      <section class="panel annotation-panel">
+        <div class="annotation-header">
+          <div>
+            <h2>Annotation View</h2>
+            <div class="annotation-sub">왼쪽은 사용자가 실제로 본 viewport 캡처 기반 bbox 오버레이, 오른쪽 카드는 이벤트 상세입니다.</div>
+          </div>
+          <div class="annotation-sub" id="annotation-meta">선택된 이벤트 없음</div>
+        </div>
+        <div class="annotation-stage" id="annotation-stage">
+          <img id="annotation-image" alt="annotation stage" />
+          <div class="overlay-layer" id="overlay-layer"></div>
+          <div class="empty-stage" id="annotation-empty">표시할 annotation 이미지가 없습니다.</div>
+        </div>
+        <div class="annotation-chips" id="annotation-nav">
+          {''.join(nav_html)}
+        </div>
+        <div class="annotation-footer">
+          <a id="annotation-link" href="#" target="_blank" rel="noopener">annotation 이미지 열기</a>
+          <a id="raw-link" href="#" target="_blank" rel="noopener">원본 viewport 스크린샷 열기</a>
+        </div>
+      </section>
+      <section class="panel cards-panel">
+        <h2>Event Cards</h2>
+        <div class="cards-list">
+          {''.join(cards_html)}
+        </div>
+      </section>
+    </section>
+  </main>
+  <script>
+    const EVENT_DATA = {event_payload};
+    const annotationImage = document.getElementById("annotation-image");
+    const annotationEmpty = document.getElementById("annotation-empty");
+    const overlayLayer = document.getElementById("overlay-layer");
+    const annotationMeta = document.getElementById("annotation-meta");
+    const annotationLink = document.getElementById("annotation-link");
+    const rawLink = document.getElementById("raw-link");
+    const navButtons = Array.from(document.querySelectorAll("[data-select-event]"));
+    const cards = Array.from(document.querySelectorAll(".event-card"));
+    let activeEventNo = EVENT_DATA.length ? String(EVENT_DATA[0]["event no"]) : "";
+
+    function getEventRecord(eventNo) {{
+      return EVENT_DATA.find((item) => String(item["event no"]) === String(eventNo)) || null;
+    }}
+
+    function getGroupItems(rawScreenshotFile) {{
+      return EVENT_DATA.filter((item) => String(item.raw_screenshot_file || "") === String(rawScreenshotFile || ""));
+    }}
+
+    function renderOverlay(groupItems, activeItem) {{
+      overlayLayer.innerHTML = "";
+      if (!groupItems.length) return;
+      const naturalWidth = annotationImage.naturalWidth || annotationImage.clientWidth || 1;
+      const naturalHeight = annotationImage.naturalHeight || annotationImage.clientHeight || 1;
+      const displayWidth = annotationImage.clientWidth || 1;
+      const displayHeight = annotationImage.clientHeight || 1;
+      groupItems.forEach((item) => {{
+        const x = Number(item.bbox_x || 0);
+        const y = Number(item.bbox_y || 0);
+        const w = Number(item.bbox_width || 0);
+        const h = Number(item.bbox_height || 0);
+        if (!w || !h) return;
+        const box = document.createElement("button");
+        box.type = "button";
+        box.className = "overlay-box" + (String(item["event no"]) === String(activeItem["event no"]) ? " active" : "");
+        box.style.left = `${{(x / naturalWidth) * displayWidth}}px`;
+        box.style.top = `${{(y / naturalHeight) * displayHeight}}px`;
+        box.style.width = `${{(w / naturalWidth) * displayWidth}}px`;
+        box.style.height = `${{(h / naturalHeight) * displayHeight}}px`;
+        box.dataset.selectEvent = String(item["event no"]);
+        const label = document.createElement("span");
+        label.className = "overlay-label";
+        label.textContent = String(item.annotation_no || item["event no"] || "");
+        box.appendChild(label);
+        box.addEventListener("click", () => setActiveEvent(String(item["event no"]), true));
+        overlayLayer.appendChild(box);
+      }});
+    }}
+
+    function syncSelection(eventNo) {{
+      cards.forEach((card) => {{
+        card.classList.toggle("active", card.dataset.eventNo === String(eventNo));
+      }});
+      navButtons.forEach((button) => {{
+        button.classList.toggle("active", button.dataset.selectEvent === String(eventNo));
+      }});
+    }}
+
+    function setActiveEvent(eventNo, scrollCard) {{
+      const item = getEventRecord(eventNo);
+      if (!item) return;
+      activeEventNo = String(eventNo);
+      syncSelection(activeEventNo);
+      const rawScreenshotFile = String(item.raw_screenshot_file || "");
+      const annotationFile = String(item.screenshot_file || "");
+      const hasStageImage = rawScreenshotFile && rawScreenshotFile !== "-";
+      annotationImage.style.display = hasStageImage ? "block" : "none";
+      annotationEmpty.style.display = hasStageImage ? "none" : "flex";
+      annotationMeta.textContent = `#${{item.annotation_no || item["event no"]}} · ${{item.custom_event || item.event_name || "-"}} · ${{item.status || "-"}}`;
+      annotationLink.href = annotationFile && annotationFile !== "-" ? annotationFile : "#";
+      rawLink.href = hasStageImage ? rawScreenshotFile : "#";
+      if (!hasStageImage) {{
+        overlayLayer.innerHTML = "";
+        return;
+      }}
+      annotationImage.onload = () => {{
+        renderOverlay(getGroupItems(rawScreenshotFile), item);
+      }};
+      annotationImage.src = rawScreenshotFile;
+      if (annotationImage.complete) {{
+        renderOverlay(getGroupItems(rawScreenshotFile), item);
+      }}
+      if (scrollCard) {{
+        const card = document.getElementById(`event-${{item["event no"]}}`);
+        if (card) card.scrollIntoView({{ behavior: "smooth", block: "center" }});
+      }}
+    }}
+
+    navButtons.forEach((button) => {{
+      button.addEventListener("click", () => setActiveEvent(button.dataset.selectEvent, true));
+    }});
+    cards.forEach((card) => {{
+      const button = card.querySelector(".card-button");
+      if (button) {{
+        button.addEventListener("click", () => setActiveEvent(card.dataset.eventNo, false));
+      }}
+    }});
+    window.addEventListener("resize", () => {{
+      const item = getEventRecord(activeEventNo);
+      if (!item || !annotationImage.src) return;
+      renderOverlay(getGroupItems(String(item.raw_screenshot_file || "")), item);
+    }});
+    if (EVENT_DATA.length) {{
+      setActiveEvent(activeEventNo, false);
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
+def save_event_definition_bundle(
+    raw_debug_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]],
+    qa_report_xlsx: bytes,
+    target_url: str,
+    session_id: str,
+) -> Tuple[bytes, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    event_definition_df, event_support_df, asset_paths = build_event_definition_exports(raw_debug_df, schemas)
+    event_detail_df = build_event_review_detail_df(raw_debug_df, schemas)
+    event_detail_export_df = (
+        event_detail_df.drop(columns=["raw_payload_json"], errors="ignore").copy()
+        if not event_detail_df.empty
+        else event_detail_df.copy()
+    )
+    compare_key = _build_url_compare_key(target_url)
+    url_hash = _build_url_hash(compare_key)
+    run_id = datetime.now(tz=ZoneInfo("UTC")).strftime("%Y%m%d_%H%M%S_%f")
+    exports_root = get_active_project_paths()["exports_dir"] / "event_definition_history" / url_hash
+    run_dir = exports_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    event_definition_path = run_dir / "event_definition.csv"
+    event_support_path = run_dir / "event_support.csv"
+    event_detail_path = run_dir / "event_review_details.csv"
+    event_definition_df.to_csv(event_definition_path, index=False, encoding="utf-8-sig")
+    event_support_df.to_csv(event_support_path, index=False, encoding="utf-8-sig")
+    event_detail_export_df.to_csv(event_detail_path, index=False, encoding="utf-8-sig")
+
+    baseline_path = exports_root / "baseline_run_id.txt"
+    latest_path = exports_root / "latest_run_id.txt"
+    auto_baseline = False
+    if not baseline_path.exists():
+        baseline_path.write_text(run_id, encoding="utf-8")
+        auto_baseline = True
+    latest_path.write_text(run_id, encoding="utf-8")
+
+    meta = {
+        "project_slug": get_active_project_slug(),
+        "target_url": target_url,
+        "url_compare_key": compare_key,
+        "url_hash": url_hash,
+        "saved_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+        "run_id": run_id,
+        "session_id": session_id,
+        "event_rows": int(len(event_definition_df)),
+        "event_count": int((event_definition_df["no"].astype(str).str.strip() != "").sum()) if not event_definition_df.empty else 0,
+        "support_rows": int(len(event_support_df)),
+        "detail_rows": int(len(event_detail_export_df)),
+        "files": {
+            "event_definition": "event_definition.csv",
+            "event_support": "event_support.csv",
+            "event_review_details": "event_review_details.csv",
+            "html_index": "index.html",
+        },
+        "auto_baseline": auto_baseline,
+    }
+    meta_path = run_dir / "meta.json"
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    index_html = build_event_definition_bundle_html(meta, event_definition_df, event_support_df, event_detail_df)
+    index_path = run_dir / "index.html"
+    index_path.write_text(index_html, encoding="utf-8")
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("event_definition.csv", event_definition_path.read_bytes())
+        zf.writestr("event_review_details.csv", event_detail_path.read_bytes())
+        zf.writestr("event_support.csv", event_support_path.read_bytes())
+        zf.writestr("index.html", index_path.read_text(encoding="utf-8"))
+        zf.writestr("meta.json", meta_path.read_text(encoding="utf-8"))
+        if qa_report_xlsx:
+            zf.writestr("qa_report.xlsx", qa_report_xlsx)
+        for rel_path in asset_paths:
+            abs_path = BASE_DIR / rel_path
+            if abs_path.exists() and abs_path.is_file():
+                zf.write(abs_path, arcname=rel_path)
+
+    return out.getvalue(), event_definition_df, event_support_df, meta
+
+
+def get_event_definition_history_root(target_url: str) -> tuple[Path, str, str]:
+    compare_key = _build_url_compare_key(target_url)
+    url_hash = _build_url_hash(compare_key)
+    exports_root = get_active_project_paths()["exports_dir"] / "event_definition_history" / url_hash
+    return exports_root, compare_key, url_hash
+
+
+def list_event_definition_runs(target_url: str) -> pd.DataFrame:
+    columns = ["run_id", "saved_at", "event_count", "session_id", "state", "target_url", "run_dir"]
+    if not str(target_url or "").strip():
+        return pd.DataFrame(columns=columns)
+    exports_root, _, _ = get_event_definition_history_root(target_url)
+    if not exports_root.exists():
+        return pd.DataFrame(columns=columns)
+    baseline_run_id = ""
+    latest_run_id = ""
+    baseline_path = exports_root / "baseline_run_id.txt"
+    latest_path = exports_root / "latest_run_id.txt"
+    if baseline_path.exists():
+        baseline_run_id = baseline_path.read_text(encoding="utf-8").strip()
+    if latest_path.exists():
+        latest_run_id = latest_path.read_text(encoding="utf-8").strip()
+    rows: List[Dict[str, object]] = []
+    for run_dir in sorted([p for p in exports_root.iterdir() if p.is_dir()], reverse=True):
+        meta_path = run_dir / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        run_id = str(meta.get("run_id", run_dir.name)).strip() or run_dir.name
+        state_parts: List[str] = []
+        if run_id == baseline_run_id:
+            state_parts.append("Baseline")
+        if run_id == latest_run_id:
+            state_parts.append("Latest")
+        if not state_parts:
+            state_parts.append("Candidate")
+        rows.append(
+            {
+                "run_id": run_id,
+                "saved_at": str(meta.get("saved_at", "")).strip(),
+                "event_count": int(meta.get("event_count", 0) or 0),
+                "session_id": str(meta.get("session_id", "")).strip(),
+                "state": " / ".join(state_parts),
+                "target_url": str(meta.get("target_url", target_url)).strip(),
+                "run_dir": str(run_dir),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    out = pd.DataFrame(rows)
+    out["saved_at_dt"] = pd.to_datetime(out["saved_at"], errors="coerce", utc=True)
+    out = out.sort_values(["saved_at_dt", "run_id"], ascending=[False, False]).drop(columns=["saved_at_dt"])
+    return out.reset_index(drop=True)
+
+
+def set_event_definition_baseline(target_url: str, run_id: str) -> None:
+    exports_root, _, _ = get_event_definition_history_root(target_url)
+    exports_root.mkdir(parents=True, exist_ok=True)
+    (exports_root / "baseline_run_id.txt").write_text(str(run_id or "").strip(), encoding="utf-8")
+
+
+def load_event_definition_run_detail_df(target_url: str, run_id: str) -> pd.DataFrame:
+    columns = [
+        "event no",
+        "custom_event",
+        "identification",
+        "target_id",
+        "section_name",
+        "page_id",
+        "status",
+        "custom_parameters",
+    ]
+    if not str(target_url or "").strip() or not str(run_id or "").strip():
+        return pd.DataFrame(columns=columns)
+    exports_root, _, _ = get_event_definition_history_root(target_url)
+    detail_path = exports_root / str(run_id).strip() / "event_review_details.csv"
+    if not detail_path.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        return pd.read_csv(detail_path).fillna("")
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+
+def compare_event_definition_runs(baseline_df: pd.DataFrame, candidate_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "change_type",
+        "custom_event",
+        "identification",
+        "target_id",
+        "section_name",
+        "page_id",
+        "baseline_status",
+        "candidate_status",
+        "baseline_parameters",
+        "candidate_parameters",
+    ]
+    if baseline_df.empty and candidate_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    def build_map(df: pd.DataFrame) -> Dict[Tuple[str, ...], Dict[str, object]]:
+        mapping: Dict[Tuple[str, ...], Dict[str, object]] = {}
+        if df.empty:
+            return mapping
+        for row in df.to_dict("records"):
+            key = (
+                str(row.get("custom_event", row.get("event_name", ""))).strip(),
+                str(row.get("identification", "")).strip(),
+                str(row.get("target_id", "")).strip(),
+                str(row.get("section_name", "")).strip(),
+                str(row.get("page_id", "")).strip(),
+            )
+            if any(key):
+                mapping[key] = row
+        return mapping
+
+    base_map = build_map(baseline_df)
+    cand_map = build_map(candidate_df)
+    keys = sorted(set(base_map.keys()) | set(cand_map.keys()))
+    rows: List[Dict[str, object]] = []
+    for key in keys:
+        base_row = base_map.get(key, {})
+        cand_row = cand_map.get(key, {})
+        if not base_row:
+            change_type = "added"
+        elif not cand_row:
+            change_type = "removed"
+        else:
+            baseline_status = str(base_row.get("status", "")).strip()
+            candidate_status = str(cand_row.get("status", "")).strip()
+            baseline_parameters = str(base_row.get("custom_parameters", "")).strip()
+            candidate_parameters = str(cand_row.get("custom_parameters", "")).strip()
+            if baseline_status != candidate_status or baseline_parameters != candidate_parameters:
+                change_type = "changed"
+            else:
+                continue
+        rows.append(
+            {
+                "change_type": change_type,
+                "custom_event": key[0],
+                "identification": key[1],
+                "target_id": key[2],
+                "section_name": key[3],
+                "page_id": key[4],
+                "baseline_status": str(base_row.get("status", "")).strip() or "-",
+                "candidate_status": str(cand_row.get("status", "")).strip() or "-",
+                "baseline_parameters": str(base_row.get("custom_parameters", "")).strip() or "-",
+                "candidate_parameters": str(cand_row.get("custom_parameters", "")).strip() or "-",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 def build_tracking_package_zip_bytes(
     tracking_plan_xlsx: bytes,
     screen_definition_xlsx: bytes,
@@ -1281,6 +2370,60 @@ def normalize_debug_target_url(raw_url: str) -> str:
         if g.scheme and g.netloc:
             return guess
     return ""
+
+
+QA_MODE_OPTIONS = ["전체 이벤트 테스트", "시나리오 테스트", "Tracking plan 검증"]
+QA_ENVIRONMENT_OPTIONS = ["prod", "staging", "custom"]
+QA_BROWSER_OPTIONS = ["Chrome", "Chromium"]
+QA_VIEWPORT_PRESETS = {
+    "Desktop 1440 x 900": {"width": 1440, "height": 900, "mobile_mode": False, "mobile_device": ""},
+    "Laptop 1280 x 720": {"width": 1280, "height": 720, "mobile_mode": False, "mobile_device": ""},
+    "iPhone 13": {"width": 390, "height": 844, "mobile_mode": True, "mobile_device": "iPhone 13"},
+}
+QA_SCENARIO_TEMPLATES = {
+    "상품 구매 흐름": {
+        "steps": "view_item,add_to_cart,begin_checkout,purchase",
+        "required_events": "view_item,add_to_cart,begin_checkout,purchase",
+        "funnel_steps": "view_item,add_to_cart,begin_checkout,purchase",
+        "key_mode_label": "transaction_id 기준",
+    },
+    "회원가입 흐름": {
+        "steps": "page_view,sign_up",
+        "required_events": "page_view,sign_up",
+        "funnel_steps": "page_view,sign_up",
+        "key_mode_label": "qa_debug_session_id 기준",
+    },
+    "랜딩 → 클릭 흐름": {
+        "steps": "page_view,click_button,click_content",
+        "required_events": "page_view,click_button,click_content",
+        "funnel_steps": "page_view,click_button,click_content",
+        "key_mode_label": "qa_debug_session_id 기준",
+    },
+}
+
+
+def build_debug_run_settings() -> Dict[str, object]:
+    viewport_key = str(st.session_state.get("qa_viewport_preset", "Desktop 1440 x 900")).strip()
+    viewport = QA_VIEWPORT_PRESETS.get(viewport_key, QA_VIEWPORT_PRESETS["Desktop 1440 x 900"])
+    browser_label = str(st.session_state.get("qa_browser_name", "Chrome")).strip()
+    browser_name = "chromium" if browser_label == "Chromium" else "chrome"
+    return {
+        "environment": st.session_state.get("qa_environment", "prod"),
+        "browser_name": browser_name,
+        "viewport_width": int(viewport["width"]),
+        "viewport_height": int(viewport["height"]),
+        "mobile_mode": bool(viewport["mobile_mode"]),
+        "mobile_device": str(viewport.get("mobile_device", "")).strip(),
+        "auto_crawl_enabled": True,
+        "auto_stop_after_crawl": True,
+        "max_auto_clicks": int(st.session_state.get("qa_auto_crawl_max_clicks", 80)),
+        "click_interval_ms": int(st.session_state.get("qa_auto_crawl_click_interval_ms", 1200)),
+        "wait_after_click_ms": int(st.session_state.get("qa_auto_crawl_wait_after_click_ms", 1200)),
+        "block_link_navigation": bool(st.session_state.get("qa_auto_block_link_nav", True)),
+        "single_page_only": bool(st.session_state.get("qa_single_page_only", True)),
+        "qa_mode": st.session_state.get("qa_mode", "전체 이벤트 테스트"),
+        "scenario_template": st.session_state.get("qa_scenario_template", ""),
+    }
 
 
 def _get_request_headers() -> Dict[str, str]:
@@ -2259,6 +3402,96 @@ SYSTEM_PARAM_KEYS = {
     "session_id",
 }
 
+GA4_RESERVED_EVENT_NAMES = {
+    "ad_impression",
+    "app_clear_data",
+    "app_exception",
+    "app_install",
+    "app_remove",
+    "app_store_refund",
+    "app_store_subscription_cancel",
+    "app_store_subscription_convert",
+    "app_store_subscription_renew",
+    "click",
+    "dynamic_link_app_open",
+    "dynamic_link_app_update",
+    "dynamic_link_first_open",
+    "error",
+    "exception",
+    "file_download",
+    "first_open",
+    "first_visit",
+    "form_start",
+    "form_submit",
+    "in_app_purchase",
+    "notification_dismiss",
+    "notification_foreground",
+    "notification_open",
+    "notification_receive",
+    "os_update",
+    "page_view",
+    "screen_view",
+    "scroll",
+    "session_start",
+    "user_engagement",
+    "video_complete",
+    "video_progress",
+    "video_start",
+    "view_search_results",
+}
+GA4_DEFAULT_PARAM_KEYS = {
+    "app_id",
+    "batch_ordering_id",
+    "batch_page_id",
+    "batch_event_index",
+    "campaign",
+    "campaign_id",
+    "campaign_content",
+    "campaign_medium",
+    "campaign_name",
+    "campaign_source",
+    "campaign_term",
+    "client_id",
+    "content_group",
+    "debug_mode",
+    "engagement_time_msec",
+    "firebase_conversion",
+    "firebase_event_origin",
+    "firebase_screen",
+    "firebase_screen_class",
+    "firebase_screen_id",
+    "ga_session_id",
+    "ga_session_number",
+    "ignore_referrer",
+    "language",
+    "medium",
+    "page_hostname",
+    "page_location",
+    "page_referrer",
+    "page_title",
+    "screen_resolution",
+    "session_engaged",
+    "session_id",
+    "session_number",
+    "source",
+    "term",
+    "user_agent",
+    "user_id",
+    "user_pseudo_id",
+}
+GA4_TECHNICAL_PARAM_PREFIXES = (
+    "ga_",
+    "google_",
+    "gtm.",
+    "qa_",
+    "uaa",
+    "uab",
+    "uap",
+    "uapv",
+    "uaw",
+    "up.",
+)
+
 MISSING_VALUE_TOKENS = {
     "",
     "(not set)",
@@ -2293,6 +3526,146 @@ def _is_system_param_key(key: str) -> bool:
     if k.startswith("gtm."):
         return True
     return False
+
+
+def _is_hidden_default_param_key(key: str) -> bool:
+    raw_key = str(key or "").strip().lower()
+    normalized = normalize_param_name(str(key or "")).strip().lower()
+    if not raw_key and not normalized:
+        return True
+    if _is_system_param_key(raw_key) or _is_system_param_key(normalized):
+        return True
+    if raw_key in EVENT_DEFINITION_HIDDEN_KEYS or normalized in EVENT_DEFINITION_HIDDEN_KEYS:
+        return True
+    if raw_key in GA4_DEFAULT_PARAM_KEYS or normalized in GA4_DEFAULT_PARAM_KEYS:
+        return True
+    if raw_key.startswith("session_") or normalized.startswith("session_"):
+        return True
+    if raw_key.startswith("client_") or normalized.startswith("client_"):
+        return True
+    if raw_key.startswith(GA4_TECHNICAL_PARAM_PREFIXES) or normalized.startswith(GA4_TECHNICAL_PARAM_PREFIXES):
+        return True
+    return False
+
+
+def _has_schema_definition(event_name: str, schemas: Dict[str, Dict[str, object]]) -> bool:
+    name = str(event_name or "").strip()
+    if not name:
+        return False
+    return name in schemas
+
+
+def _is_custom_event_name(event_name: str, schemas: Dict[str, Dict[str, object]]) -> bool:
+    name = str(event_name or "").strip()
+    if not name:
+        return False
+    if _has_schema_definition(name, schemas):
+        return True
+    return name.lower() not in GA4_RESERVED_EVENT_NAMES
+
+
+def _schema_custom_param_keys(event_name: str, schemas: Dict[str, Dict[str, object]]) -> List[str]:
+    schema_obj = schemas.get(str(event_name or "").strip(), {})
+    if not isinstance(schema_obj, dict):
+        return []
+    ordered: List[str] = []
+    for key in list(schema_obj.get("required", [])) + list(schema_obj.get("optional", [])):
+        key_text = str(key).strip()
+        if not key_text or key_text in ordered:
+            continue
+        if _is_hidden_default_param_key(key_text):
+            continue
+        ordered.append(key_text)
+    return ordered
+
+
+def _sort_custom_param_keys(keys: List[str]) -> List[str]:
+    priority_order = {name: idx for idx, name in enumerate(EVENT_DEFINITION_PARAM_PRIORITY)}
+    return sorted(
+        list(dict.fromkeys([str(key).strip() for key in keys if str(key).strip()])),
+        key=lambda key: (priority_order.get(key, 10_000), key),
+    )
+
+
+def _is_meaningful_custom_param_key(key: str) -> bool:
+    key_text = str(key or "").strip().lower()
+    if not key_text:
+        return False
+    if key_text in {item.lower() for item in EVENT_DEFINITION_PARAM_PRIORITY}:
+        return True
+    meaningful_tokens = (
+        "button",
+        "section",
+        "content",
+        "banner",
+        "category",
+        "filter",
+        "tab",
+        "page_id",
+        "page_link",
+        "extra",
+        "title",
+        "index",
+    )
+    if any(token in key_text for token in meaningful_tokens):
+        return True
+    if key_text.endswith("_id") or key_text.endswith("_name") or key_text.endswith("_type") or key_text.endswith("_value"):
+        return True
+    return False
+
+
+def split_custom_param_items(custom_items: List[Tuple[str, str]]) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    if not custom_items:
+        return [], []
+    ordered = [(str(key).strip(), str(value).strip()) for key, value in custom_items if str(key).strip() and str(value).strip()]
+    priority_names = list(dict.fromkeys(EVENT_DEFINITION_PARAM_PRIORITY))
+    top_items: List[Tuple[str, str]] = []
+    for key in priority_names:
+        for item_key, item_value in ordered:
+            if item_key == key and (item_key, item_value) not in top_items:
+                top_items.append((item_key, item_value))
+    if not top_items:
+        top_items = ordered[:6]
+    else:
+        top_items = top_items[:8]
+    extra_items = [item for item in ordered if item not in top_items]
+    return top_items, extra_items
+
+
+def extract_custom_event_payload(
+    event_name: str,
+    params: Dict[str, object],
+    schemas: Dict[str, Dict[str, object]],
+) -> Tuple[str, List[Tuple[str, str]]]:
+    normalized_event = str(event_name or "").strip()
+    if not normalized_event:
+        return "", []
+    if not _is_custom_event_name(normalized_event, schemas):
+        return "", []
+
+    custom_keys: List[str] = []
+    if _has_schema_definition(normalized_event, schemas):
+        custom_keys = _schema_custom_param_keys(normalized_event, schemas)
+    else:
+        for key in params.keys():
+            key_text = str(key).strip()
+            if not key_text or _is_hidden_default_param_key(key_text):
+                continue
+            if not _is_meaningful_custom_param_key(key_text):
+                continue
+            custom_keys.append(key_text)
+    ordered_keys = _sort_custom_param_keys(custom_keys)
+    custom_items: List[Tuple[str, str]] = []
+    for key in ordered_keys:
+        if key not in params:
+            continue
+        value_text = _to_text_value(params.get(key, ""))
+        if not value_text:
+            continue
+        custom_items.append((key, value_text))
+    if not custom_items and not _has_schema_definition(normalized_event, schemas):
+        return "", []
+    return normalized_event, custom_items
 
 
 def _to_text_value(value: object) -> str:
@@ -2556,6 +3929,7 @@ def build_realtime_event_rows(
     debug_df: pd.DataFrame,
     allowed_events: List[str] | None = None,
     unknown_event_policy: str = "정보",
+    schemas: Dict[str, Dict[str, object]] | None = None,
 ) -> pd.DataFrame:
     cols = [
         "group_session_id",
@@ -2580,6 +3954,7 @@ def build_realtime_event_rows(
         work = work.sort_values("captured_at", ascending=False)
 
     suspicious_profile = build_suspicious_param_profile(work)
+    schema_store = schemas if isinstance(schemas, dict) else {}
 
     rows: List[Dict[str, object]] = []
     for _, row in work.iterrows():
@@ -2596,18 +3971,19 @@ def build_realtime_event_rows(
             all_params["measurement_id"] = measurement_id
         if client_id and "client_id" not in all_params:
             all_params["client_id"] = client_id
+        custom_event_name, custom_items = extract_custom_event_payload(event_name, all_params, schema_store)
+        if not custom_event_name:
+            continue
+        custom_params = {key: value for key, value in custom_items}
 
         normal_group: Dict[str, Dict[str, str]] = {}
         missing_group: Dict[str, Dict[str, str]] = {}
         suspicious_group: Dict[str, Dict[str, str]] = {}
         system_group: Dict[str, Dict[str, str]] = {}
-        for key, value in all_params.items():
+        for key, value in custom_params.items():
             key_text = str(key).strip()
             value_text = _to_text_value(value)
             if not key_text:
-                continue
-            if _is_system_param_key(key_text):
-                system_group[key_text] = {"값": value_text or "-", "사유": "시스템/기술 파라미터"}
                 continue
             if _is_missing_like_value(value_text):
                 missing_group[key_text] = {"값": value_text or "-", "사유": "미입력/기본값"}
@@ -2650,8 +4026,8 @@ def build_realtime_event_rows(
 
         group_session_id = _to_text_value(row.get("session_id", "")) or _to_text_value(params.get("qa_debug_session_id", "")) or "-"
         status = evaluate_event_status(
-            event_name=event_name,
-            params=all_params,
+            event_name=custom_event_name,
+            params=custom_params,
             allowed_events=allowed_events,
             unknown_event_policy=unknown_event_policy,
         )
@@ -2660,7 +4036,7 @@ def build_realtime_event_rows(
             {
                 "group_session_id": group_session_id,
                 "시간": format_local_time(row.get("captured_at")),
-                "이벤트": event_name,
+                "이벤트": custom_event_name,
                 "대표 파라미터": primary_key,
                 "대표 값": primary_value,
                 "상태": status,
@@ -2668,7 +4044,10 @@ def build_realtime_event_rows(
                 "값없음 그룹": missing_group,
                 "의심 그룹": suspicious_group,
                 "시스템 그룹": system_group,
-                "전체 파라미터": all_params,
+                "전체 파라미터": custom_params,
+                "원본 payload": all_params,
+                "custom_event": custom_event_name,
+                "custom_parameters": " | ".join([f"{key}={value}" for key, value in custom_items]) if custom_items else "-",
                 "captured_at": row.get("captured_at"),
             }
         )
@@ -2821,6 +4200,64 @@ def resolve_debug_output_file(
     return candidates[0] if candidates else None
 
 
+def restore_latest_project_session_state() -> None:
+    current_sid = str(st.session_state.get("qa_debug_session_id", "")).strip()
+    current_output = str(st.session_state.get("qa_debug_output_file", "")).strip()
+    if current_sid and current_output and Path(current_output).exists():
+        return
+    try:
+        sess_df = list_recent_sessions(get_active_test_log_db_path(), limit=1)
+    except Exception:
+        sess_df = pd.DataFrame()
+    if not sess_df.empty:
+        sid = str(sess_df.iloc[0].get("session_id", "")).strip()
+        if sid:
+            snap = get_session(get_active_test_log_db_path(), sid)
+            output_file = get_active_project_paths()["qa_sessions_dir"] / sid / "debug_stream.jsonl"
+            if not output_file.exists():
+                fallback = Path(f"data/debug_stream/{sid}.jsonl")
+                if fallback.exists():
+                    output_file = fallback
+            if output_file.exists():
+                st.session_state["qa_debug_session_id"] = sid
+                st.session_state["qa_debug_output_file"] = str(output_file)
+                st.session_state["qa_debug_started_at"] = str(snap.get("started_at", "")).strip()
+                return
+
+    candidates: List[Path] = []
+    try:
+        candidates.extend(
+            sorted(
+                get_active_project_paths()["qa_sessions_dir"].glob("*/debug_stream.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    except Exception:
+        pass
+    try:
+        candidates.extend(
+            sorted(
+                Path("data/debug_stream").glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    except Exception:
+        pass
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        sid = candidate.parent.name if candidate.parent.name != "debug_stream" else candidate.stem
+        if not sid:
+            continue
+        st.session_state["qa_debug_session_id"] = sid
+        st.session_state["qa_debug_output_file"] = str(candidate)
+        if not str(st.session_state.get("qa_debug_started_at", "")).strip():
+            st.session_state["qa_debug_started_at"] = ""
+        return
+
+
 def inject_case_from_page_location(df: pd.DataFrame, case_param: str) -> pd.DataFrame:
     param = case_param.strip()
     if df.empty or not param or "page_location" not in df.columns:
@@ -2872,7 +4309,10 @@ def filter_debug_events_by_view(debug_df: pd.DataFrame, capture_view: str) -> pd
         return debug_df
     src_series = debug_df["source"].astype(str).str.strip()
     if capture_view == "히트(collect)":
-        return debug_df[src_series == "ga_hit"].copy()
+        hit_df = debug_df[src_series == "ga_hit"].copy()
+        if not hit_df.empty:
+            return hit_df
+        return debug_df[src_series == "auto_crawl"].copy()
     if capture_view == "발화(dataLayer/gtag)":
         return debug_df[src_series != "ga_hit"].copy()
     return debug_df.copy()
@@ -3081,6 +4521,32 @@ if "qa_new_project_domain" not in st.session_state:
     st.session_state["qa_new_project_domain"] = ""
 if "qa_project_notice" not in st.session_state:
     st.session_state["qa_project_notice"] = ""
+if "qa_environment" not in st.session_state:
+    st.session_state["qa_environment"] = "prod"
+if "qa_browser_name" not in st.session_state:
+    st.session_state["qa_browser_name"] = "Chrome"
+if "qa_viewport_preset" not in st.session_state:
+    st.session_state["qa_viewport_preset"] = "Desktop 1440 x 900"
+if "qa_mode" not in st.session_state:
+    st.session_state["qa_mode"] = "전체 이벤트 테스트"
+if "qa_scenario_template" not in st.session_state:
+    st.session_state["qa_scenario_template"] = "상품 구매 흐름"
+if "qa_auto_crawl_max_clicks" not in st.session_state:
+    st.session_state["qa_auto_crawl_max_clicks"] = int(get_config_value("QA_AUTO_CRAWL_MAX_CLICKS", "80") or "80")
+if "qa_auto_crawl_click_interval_ms" not in st.session_state:
+    st.session_state["qa_auto_crawl_click_interval_ms"] = int(
+        get_config_value("QA_AUTO_CRAWL_CLICK_INTERVAL_MS", "1200") or "1200"
+    )
+if "qa_auto_crawl_wait_after_click_ms" not in st.session_state:
+    st.session_state["qa_auto_crawl_wait_after_click_ms"] = int(
+        get_config_value("QA_AUTO_CRAWL_WAIT_AFTER_CLICK_MS", "1200") or "1200"
+    )
+if "qa_auto_block_link_nav" not in st.session_state:
+    st.session_state["qa_auto_block_link_nav"] = is_truthy(get_config_value("QA_AUTO_BLOCK_LINK_NAV", "1"))
+if "qa_single_page_only" not in st.session_state:
+    st.session_state["qa_single_page_only"] = is_truthy(get_config_value("QA_SINGLE_PAGE_ONLY", "1"))
+if "qa_template_seed" not in st.session_state:
+    st.session_state["qa_template_seed"] = ""
 
 ensure_project_structure(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
 
@@ -3108,6 +4574,13 @@ else:
     detail_bits.append(f"local_health({'ok' if local_health_ok else 'fail'}): http://127.0.0.1:8600/qa/health")
     st.session_state["qa_ingest_server_error"] = " | ".join(detail_bits)
 
+if not str(st.session_state.get("qa_tester_name", "")).strip():
+    auto_tester = str(st.session_state.get("qa_access_user", "")).strip()
+    if auto_tester:
+        st.session_state["qa_tester_name"] = auto_tester
+
+restore_latest_project_session_state()
+
 scenario_enabled = True
 scenario_steps_text = default_scenario_steps
 scenario_key_mode_label = "transaction_id 기준"
@@ -3117,7 +4590,7 @@ realtime_debug_start_clicked = False
 realtime_debug_stop_clicked = False
 
 with st.sidebar:
-    st.header("설정")
+    st.header("QA Workflow")
     st.caption(
         f"접속: {st.session_state.get('qa_access_user', '-') or '-'} "
         f"({st.session_state.get('qa_access_role', 'guest')})"
@@ -3128,7 +4601,7 @@ with st.sidebar:
         st.session_state["qa_access_role"] = "guest"
         st.session_state["qa_access_user"] = ""
         st.rerun()
-    with st.expander("0) Workspace / Project", expanded=True):
+    with st.expander("1) Test Setup", expanded=True):
         project_notice = str(st.session_state.get("qa_project_notice", "")).strip()
         if project_notice:
             st.info(project_notice)
@@ -3144,12 +4617,175 @@ with st.sidebar:
             key="qa_project_slug_selectbox",
         )
         st.session_state["qa_project_slug"] = _slugify_project_name(selected_project)
+        st.selectbox("Environment", options=QA_ENVIRONMENT_OPTIONS, key="qa_environment")
         st.text_input(
-            "Project Domain",
-            value=st.session_state.get("qa_project_domain", ""),
-            key="qa_project_domain",
-            placeholder="예: datanugget.io",
+            "Target URL",
+            value=st.session_state.get("qa_debug_target_url", ""),
+            key="qa_debug_target_url",
+            placeholder="예: https://www.musinsa.com/main/beauty/recommend?gf=A",
         )
+        st.selectbox("Browser", options=QA_BROWSER_OPTIONS, key="qa_browser_name")
+        st.selectbox("Viewport", options=list(QA_VIEWPORT_PRESETS.keys()), key="qa_viewport_preset")
+        st.text_input(
+            "Tester",
+            value=st.session_state.get("qa_tester_name", ""),
+            key="qa_tester_name",
+            placeholder="자동 채움 가능",
+        )
+        st.text_area(
+            "Memo",
+            value=st.session_state.get("qa_tester_note", ""),
+            key="qa_tester_note",
+            placeholder="선택 입력",
+            height=80,
+        )
+        st.caption("Project / Environment / URL만 입력하면 자동수집 중심으로 실행됩니다.")
+
+    with st.expander("2) QA Mode / Scenario", expanded=True):
+        selected_mode = st.radio(
+            "QA Mode",
+            options=QA_MODE_OPTIONS,
+            index=QA_MODE_OPTIONS.index(st.session_state.get("qa_mode", "전체 이벤트 테스트")),
+            key="qa_mode",
+        )
+        st.caption("이벤트 수집 방식은 기본적으로 Auto Crawl입니다.")
+
+        if selected_mode == "시나리오 테스트":
+            template_name = st.selectbox(
+                "Scenario template",
+                options=list(QA_SCENARIO_TEMPLATES.keys()),
+                key="qa_scenario_template",
+            )
+            template = QA_SCENARIO_TEMPLATES[template_name]
+            scenario_enabled = True
+            scenario_steps_text = str(template["steps"])
+            required_event_text = str(template["required_events"])
+            funnel_text = str(template["funnel_steps"])
+            scenario_key_mode_label = str(template["key_mode_label"])
+            scenario_key_field = scenario_key_modes[scenario_key_mode_label]
+            scenario_key_value = ""
+            template_seed = f"{selected_mode}:{template_name}"
+            if st.session_state.get("qa_template_seed", "") != template_seed:
+                st.session_state["required_event_text_input"] = required_event_text
+                st.session_state["qa_template_seed"] = template_seed
+            st.caption(f"자동 채움 이벤트: {required_event_text}")
+        elif selected_mode == "Tracking plan 검증":
+            scenario_enabled = False
+            scenario_steps_text = ""
+            required_event_text = ""
+            funnel_text = default_funnel_steps
+            scenario_key_mode_label = "qa_debug_session_id 기준"
+            scenario_key_field = scenario_key_modes[scenario_key_mode_label]
+            scenario_key_value = ""
+            st.session_state["qa_template_seed"] = selected_mode
+            st.caption("자동수집 후 Tracking Plan / Event Definition Export를 바로 비교하는 모드입니다.")
+        else:
+            scenario_enabled = False
+            scenario_steps_text = ""
+            required_event_text = ""
+            funnel_text = default_funnel_steps
+            scenario_key_mode_label = "qa_debug_session_id 기준"
+            scenario_key_field = scenario_key_modes[scenario_key_mode_label]
+            scenario_key_value = ""
+            st.session_state["qa_template_seed"] = selected_mode
+            st.caption("대표 UI 패턴 기준으로 이벤트를 자동 수집합니다.")
+
+    with st.expander("3) Run Test", expanded=True):
+        st.caption("1. URL 입력  2. QA Mode 선택  3. Run QA Test  4. 결과 확인")
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            realtime_debug_start_clicked = st.button("Run QA Test", type="primary")
+        with dc2:
+            realtime_debug_stop_clicked = st.button("Stop Test")
+        active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
+        debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
+        resolved_output_path = resolve_debug_output_file(
+            session_id=active_debug_session_id,
+            snapshot=debug_snapshot,
+            state_output_file=st.session_state.get("qa_debug_output_file", ""),
+        )
+        recovered_from_file = bool((not debug_snapshot) and resolved_output_path and resolved_output_path.exists())
+        if debug_snapshot or recovered_from_file:
+            sid_for_view = (
+                str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
+            )
+            status_for_view = str(debug_snapshot.get("status", "")).strip() if debug_snapshot else "recovered(file)"
+            captured_count_for_view = int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else "-"
+            st.caption(
+                f"세션: {sid_for_view} | "
+                f"상태: {status_for_view or '-'} | "
+                f"캡처: {captured_count_for_view}건"
+            )
+            st.caption(f"표시 시간대: {DISPLAY_TZ_NAME}")
+            tester_name_view = str(debug_snapshot.get("tester_name", "")).strip() if debug_snapshot else ""
+            if tester_name_view:
+                st.caption(f"테스터: {tester_name_view}")
+            if debug_snapshot and debug_snapshot.get("last_error", "").strip():
+                st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
+            run_settings = debug_snapshot.get("run_settings", {}) if isinstance(debug_snapshot, dict) else {}
+            mode_label = str(run_settings.get("qa_mode", st.session_state.get("qa_mode", ""))).strip()
+            viewport_label = str(st.session_state.get("qa_viewport_preset", "")).strip()
+            if mode_label:
+                st.caption(f"모드: {mode_label} | Viewport: {viewport_label or '-'}")
+            st.caption("결과는 오른쪽 패널의 QA Overview / Export에서 확인합니다.")
+        else:
+            st.caption("실행 후 자동수집이 끝나면 결과 패널에서 바로 확인할 수 있습니다.")
+
+    with st.expander("4) Advanced", expanded=False):
+        if st.session_state.get("qa_ingest_server_ok", False):
+            st.caption("수집기 상태: OK (local:127.0.0.1:8600)")
+        else:
+            st.error("수집기 상태: 실패")
+            last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
+            if last_ingest_err:
+                st.caption(f"원인: {last_ingest_err}")
+        analytics_proxy_on = str(os.getenv("QA_ANALYTICS_PROXY_ENABLED", "0")).strip()
+        st.caption(f"Analytics Proxy: {'ON' if analytics_proxy_on in {'1', 'true', 'True'} else 'OFF'}")
+        st.number_input("Auto Crawl Max Clicks", min_value=1, max_value=500, key="qa_auto_crawl_max_clicks")
+        st.number_input(
+            "Click Interval (ms)",
+            min_value=100,
+            max_value=10000,
+            step=100,
+            key="qa_auto_crawl_click_interval_ms",
+        )
+        st.number_input(
+            "Wait After Click (ms)",
+            min_value=100,
+            max_value=10000,
+            step=100,
+            key="qa_auto_crawl_wait_after_click_ms",
+        )
+        st.checkbox("링크 이동 차단", key="qa_auto_block_link_nav")
+        st.checkbox("시작 페이지 범위만 수집", key="qa_single_page_only")
+        today = date.today()
+        start_date = st.date_input("시작일", value=today - timedelta(days=1))
+        end_date = st.date_input("종료일", value=today)
+        param_text = st.text_area("조회할 param (쉼표 구분)", value=default_params)
+        st.caption("예: transaction_id,value,currency,qa_debug_session_id")
+        required_event_default = required_event_text if selected_mode == "시나리오 테스트" else default_required_events
+        required_event_text = st.text_area("필수 이벤트", value=required_event_default, key="required_event_text_input")
+        st.caption("비워두면 필수 이벤트 체크를 생략합니다. 필요할 때만 입력하세요.")
+        unknown_event_policy = st.selectbox(
+            "실시간 미정의 이벤트 처리",
+            options=["정보", "경고", "무시"],
+            index=["정보", "경고", "무시"].index(st.session_state.get("unknown_event_policy", "정보")),
+            help="필수 이벤트 목록에 없는 이벤트를 실시간 타임라인에서 어떻게 표시할지 선택합니다.",
+            key="unknown_event_policy",
+        )
+        st.caption("사이트 상황에 맞는 이벤트명을 쉼표로 자유 입력하세요.")
+        required_param_text = st.text_area(
+            "필수 param 규칙 (event: p1,p2)",
+            value=default_param_text,
+            height=120,
+        )
+        st.caption("비워두면 필수 파라미터 체크를 생략합니다.")
+        funnel_default = funnel_text if selected_mode == "시나리오 테스트" else default_funnel_steps
+        funnel_text = st.text_input("퍼널 시퀀스", value=funnel_default)
+        null_threshold = st.slider("null 경고 임계치", min_value=0.05, max_value=0.9, value=0.2, step=0.05)
+        max_rows = st.number_input("최대 조회 행", min_value=1000, max_value=500000, value=50000, step=1000)
+
+    with st.expander("5) Admin", expanded=False):
         p1, p2 = st.columns(2)
         with p1:
             st.text_input("새 Project", key="qa_new_project_name", placeholder="예: musinsa")
@@ -3209,132 +4845,7 @@ with st.sidebar:
                 st.success(f"세션 불러오기 완료: {sid}")
                 st.rerun()
 
-    with st.expander("1) 데이터 소스/연결", expanded=True):
-        st.markdown("**Playwright 네트워크 인터셉트 + QA 리포트 API 참조 모드**")
-        st.caption("확장/스니펫 없이 Playwright request hook으로 collect 히트를 수집합니다.")
-        st.caption("QA 리포트 화면에서는 최근 30일 API 이벤트/매개변수 목록을 참고용으로 불러올 수 있습니다.")
-        if st.session_state.get("qa_ingest_server_ok", False):
-            st.caption("서버 수집기 상태: OK (local:127.0.0.1:8600)")
-        else:
-            st.error("서버 수집기 상태: 실패 (서비스 로그 확인)")
-            last_ingest_err = str(st.session_state.get("qa_ingest_server_error", "")).strip()
-            if last_ingest_err:
-                st.caption(f"원인: {last_ingest_err}")
-        analytics_proxy_on = str(os.getenv("QA_ANALYTICS_PROXY_ENABLED", "0")).strip()
-        st.caption(f"Analytics Proxy: {'ON' if analytics_proxy_on in {'1', 'true', 'True'} else 'OFF'}")
-
-    with st.expander("2) 실시간 디버깅 스트림", expanded=True):
-        default_debug_url = st.session_state.get("qa_debug_target_url", "").strip()
-        if default_debug_url and not st.session_state.get("qa_debug_target_url", "").strip():
-            st.session_state["qa_debug_target_url"] = default_debug_url
-
-        debug_target_url = st.text_input(
-            "디버깅 대상 URL",
-            value=st.session_state.get("qa_debug_target_url", ""),
-            key="qa_debug_target_url",
-            placeholder="예: https://datanugget.io/",
-        )
-        st.caption("디버깅 모드 시작 시 Playwright 테스트 브라우저가 열리고 collect 히트를 감시합니다.")
-        st.caption(f"현재 Project: {get_active_project_slug()} (Session 단위 저장)")
-        novnc_popup_url = get_novnc_popup_url()
-        if st.session_state.get("qa_access_role", "guest") == "admin":
-            st.caption(f"원격 디버그 팝업 URL: {novnc_popup_url}")
-            st.markdown(f"[원격 디버그 화면 열기 (noVNC)]({novnc_popup_url})")
-        else:
-            st.caption("원격 디버그 팝업(noVNC)은 관리자 계정에서만 열 수 있습니다.")
-        st.text_input(
-            "테스터 이름",
-            value=st.session_state.get("qa_tester_name", ""),
-            key="qa_tester_name",
-            placeholder="예: kim.qa",
-        )
-        st.text_input(
-            "테스트 메모",
-            value=st.session_state.get("qa_tester_note", ""),
-            key="qa_tester_note",
-            placeholder="예: 랜딩 배너 클릭 시나리오",
-        )
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            realtime_debug_start_clicked = st.button("Start QA Session", type="primary")
-        with dc2:
-            realtime_debug_stop_clicked = st.button("QA Session 종료")
-
-        active_debug_session_id = st.session_state.get("qa_debug_session_id", "").strip()
-        debug_snapshot = get_debug_session_snapshot(active_debug_session_id) if active_debug_session_id else {}
-        resolved_output_path = resolve_debug_output_file(
-            session_id=active_debug_session_id,
-            snapshot=debug_snapshot,
-            state_output_file=st.session_state.get("qa_debug_output_file", ""),
-        )
-        recovered_from_file = bool((not debug_snapshot) and resolved_output_path and resolved_output_path.exists())
-        if debug_snapshot or recovered_from_file:
-            sid_for_view = (
-                str(debug_snapshot.get("session_id", "")).strip() if debug_snapshot else active_debug_session_id
-            )
-            status_for_view = str(debug_snapshot.get("status", "")).strip() if debug_snapshot else "recovered(file)"
-            captured_count_for_view = int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else "-"
-            st.caption(
-                f"세션: {sid_for_view} | "
-                f"상태: {status_for_view or '-'} | "
-                f"캡처: {captured_count_for_view}건"
-            )
-            st.caption(f"표시 시간대: {DISPLAY_TZ_NAME}")
-            tester_name_view = str(debug_snapshot.get("tester_name", "")).strip() if debug_snapshot else ""
-            if tester_name_view:
-                st.caption(f"테스터: {tester_name_view}")
-            if debug_snapshot and debug_snapshot.get("last_error", "").strip():
-                st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
-            st.caption("실시간 QA 리스트는 메인 영역의 `실시간 테스트 QA 리스트` 탭에서 확인하세요.")
-        else:
-            st.caption("디버깅 시작 후 타임라인이 표시됩니다.")
-
-    with st.expander("3) QA 설정", expanded=True):
-        today = date.today()
-        start_date = st.date_input("시작일", value=today - timedelta(days=1))
-        end_date = st.date_input("종료일", value=today)
-        param_text = st.text_area("조회할 param (쉼표 구분)", value=default_params)
-        st.caption("예: transaction_id,value,currency,qa_debug_session_id")
-        required_event_text = st.text_area(
-            "필수 이벤트",
-            value=default_required_events,
-            key="required_event_text_input",
-        )
-        st.caption("비워두면 필수 이벤트 체크를 생략합니다. 필요할 때만 입력하세요.")
-        unknown_event_policy = st.selectbox(
-            "실시간 미정의 이벤트 처리",
-            options=["정보", "경고", "무시"],
-            index=["정보", "경고", "무시"].index(st.session_state.get("unknown_event_policy", "정보")),
-            help="필수 이벤트 목록에 없는 이벤트를 실시간 타임라인에서 어떻게 표시할지 선택합니다.",
-            key="unknown_event_policy",
-        )
-        st.caption("사이트 상황에 맞는 이벤트명을 쉼표로 자유 입력하세요.")
-        required_param_text = st.text_area(
-            "필수 param 규칙 (event: p1,p2)",
-            value=default_param_text,
-            height=120,
-        )
-        st.caption("비워두면 필수 파라미터 체크를 생략합니다.")
-        funnel_text = st.text_input("퍼널 시퀀스", value=default_funnel_steps)
-        null_threshold = st.slider("null 경고 임계치", min_value=0.05, max_value=0.9, value=0.2, step=0.05)
-        max_rows = st.number_input("최대 조회 행", min_value=1000, max_value=500000, value=50000, step=1000)
-
-    with st.expander("4) 시나리오 1회 검증", expanded=True):
-        scenario_enabled = st.checkbox("시나리오 검증 활성화", value=True)
-        scenario_key_mode_label = st.selectbox(
-            "식별 방식",
-            options=list(scenario_key_modes.keys()),
-            index=0,
-        )
-        scenario_key_field = scenario_key_modes[scenario_key_mode_label]
-        if scenario_key_field == "none":
-            st.caption("키 없이 전체 로그 기준 집계형 검증으로 동작합니다.")
-            scenario_key_value = ""
-        else:
-            scenario_key_value = st.text_input(f"{scenario_key_field} 값", placeholder="예: dbg_20260302_081843_c90d")
-        scenario_steps_text = st.text_input("기대 시나리오 step", value=default_scenario_steps)
-
-st.caption("실시간 디버깅과 테스트 제어는 왼쪽 사이드바에서 실행합니다.")
+st.caption("왼쪽에서는 Test Setup / QA Mode / Run Test만 조작하면 되고, 결과 확인은 메인 패널에서 진행합니다.")
 
 resume_notice = str(st.session_state.get("qa_oauth_resume_notice", "")).strip()
 if resume_notice:
@@ -3345,12 +4856,16 @@ if realtime_debug_start_clicked:
     try:
         normalized_target_url = normalize_debug_target_url(st.session_state.get("qa_debug_target_url", ""))
         if not normalized_target_url:
-            st.error("디버깅 대상 URL 형식이 올바르지 않습니다. 예: https://datanugget.io/")
+            st.error("Target URL 형식이 올바르지 않습니다. 예: https://datanugget.io/")
             log_ui_action("debug_start_error", {"error": "invalid_target_url"})
             st.stop()
         log_ui_action(
             "debug_start_click",
-            {"target_url": normalized_target_url},
+            {
+                "target_url": normalized_target_url,
+                "qa_mode": st.session_state.get("qa_mode", "전체 이벤트 테스트"),
+                "environment": st.session_state.get("qa_environment", "prod"),
+            },
         )
         previous_sid = st.session_state.get("qa_debug_session_id", "").strip()
         if previous_sid:
@@ -3359,6 +4874,7 @@ if realtime_debug_start_clicked:
         active_paths = get_active_project_paths()
         debug_file = active_paths["qa_sessions_dir"] / debug_session_id / "debug_stream.jsonl"
         debug_file.parent.mkdir(parents=True, exist_ok=True)
+        run_settings = build_debug_run_settings()
         snapshot = start_debug_session(
             session_id=debug_session_id,
             target_url=normalized_target_url,
@@ -3367,14 +4883,16 @@ if realtime_debug_start_clicked:
             tester_note=st.session_state.get("qa_tester_note", "").strip(),
             db_path=get_active_test_log_db_path(),
             launch_browser=True,
+            run_settings=run_settings,
         )
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
         st.session_state["qa_debug_started_at"] = str(snapshot.get("started_at", "")).strip()
+        st.session_state["realtime_panel_auto_refresh"] = True
         log_ui_action("debug_start_success", {"session_id": debug_session_id})
         st.success(
-            f"디버깅 세션 시작: qa_debug_session_id={debug_session_id} "
-            f"(상태: {snapshot.get('status', '-')}, 모드: playwright intercept capture)"
+            f"QA Test 시작: qa_debug_session_id={debug_session_id} "
+            f"(모드: {run_settings.get('qa_mode', '-')}, 수집: Auto Crawl)"
         )
         if (
             st.session_state.get("qa_access_role", "guest") == "admin"
@@ -3384,7 +4902,7 @@ if realtime_debug_start_clicked:
             st.caption("원격 디버그 팝업(noVNC) 자동 열기를 시도했습니다. 차단되면 링크를 직접 열어주세요.")
     except Exception as exc:
         log_ui_action("debug_start_error", {"error": str(exc)})
-        st.error(f"디버깅 모드 시작 실패: {to_user_error_message(exc)}")
+        st.error(f"QA Test 시작 실패: {to_user_error_message(exc)}")
 
 if realtime_debug_stop_clicked:
     log_ui_action("debug_stop_click")
@@ -3392,14 +4910,15 @@ if realtime_debug_stop_clicked:
     if sid:
         stop_debug_session(sid)
         log_ui_action("debug_stop_success", {"session_id": sid})
-        st.success("디버깅 모드 종료 요청을 보냈습니다.")
+        st.success("테스트 종료 요청을 보냈습니다.")
     else:
-        st.info("종료할 디버깅 세션이 없습니다.")
+        st.info("종료할 테스트 세션이 없습니다.")
 
 realtime_tab, report_tab, schema_tab = st.tabs(
     ["1단: 실시간 테스트 화면", "2단: QA 리포트 화면", "3단: 이벤트 기준표 탭"]
 )
 with realtime_tab:
+    restore_latest_project_session_state()
     st.markdown("### QA Workflow")
     wf1, wf2, wf3, wf4 = st.columns(4)
     wf1.info("1. Test Events\n사이트 클릭으로 이벤트 발생")
@@ -3438,6 +4957,10 @@ with realtime_tab:
     sid_for_view = "-"
     status_for_view = "-"
     captured_for_view = 0
+    raw_captured_for_view = 0
+    ga_hit_count_for_view = 0
+    auto_crawl_count_for_view = 0
+    timeline_df_active = pd.DataFrame()
     timeline_df = pd.DataFrame()
     rt_events = pd.DataFrame()
     st.session_state["schema_rt_events_cache"] = []
@@ -3467,20 +4990,25 @@ with realtime_tab:
         captured_from_snapshot = int(debug_snapshot.get("captured_events", 0)) if debug_snapshot else 0
         captured_from_file = int(len(timeline_df))
         captured_for_view = max(captured_from_snapshot, captured_from_file)
+        raw_captured_for_view = int(len(timeline_df_active))
+        if not timeline_df_active.empty and "source" in timeline_df_active.columns:
+            source_series = timeline_df_active["source"].astype(str).str.strip()
+            ga_hit_count_for_view = int(source_series.eq("ga_hit").sum())
+            auto_crawl_count_for_view = int(source_series.eq("auto_crawl").sum())
     else:
         st.info("활성 디버깅 세션이 없습니다. 사이드바에서 `디버깅 모드 시작`을 실행하세요.")
 
+    schema_store = load_event_schemas()
     allowed_events_rt = parse_csv_list(st.session_state.get("required_event_text_input", default_required_events))
     if not timeline_df.empty:
         rt_events = build_realtime_event_rows(
             timeline_df,
             allowed_events=allowed_events_rt,
             unknown_event_policy=st.session_state.get("unknown_event_policy", "정보"),
+            schemas=schema_store,
         )
     if not rt_events.empty:
         st.session_state["schema_rt_events_cache"] = rt_events.to_dict("records")
-
-    schema_store = load_event_schemas()
     issue_df = build_issue_summary(rt_events, schema_store)
     tracking_plan_df = build_tracking_plan_df(rt_events, schema_store)
     schema_summary = summarize_schema_validation(rt_events, schema_store)
@@ -3515,15 +5043,24 @@ with realtime_tab:
         flow_issue_count = int((owork["status"].isin(["FAIL", "WARN"])).sum())
 
     section_overview, section_issues, section_detail, section_export = st.tabs(
-        ["1. QA Overview", "2. Issues (문제 이벤트)", "3. Event Detail", "4. Export / Tracking Plan"]
+        ["1. QA Overview", "2. Issues (문제 이벤트)", "3. Event Detail", "4. Export / Event Definition"]
     )
 
     with section_overview:
         st.caption(
             f"세션: {sid_for_view} | 상태: {status_for_view} | 캡처: {captured_for_view}건 | 시간대: {DISPLAY_TZ_NAME}"
         )
+        if raw_captured_for_view:
+            st.caption(
+                f"원본 로그 {raw_captured_for_view}건 | GA hit {ga_hit_count_for_view}건 | auto crawl {auto_crawl_count_for_view}건"
+            )
         if rt_events.empty:
-            st.info("아직 캡처된 이벤트가 없습니다.")
+            if raw_captured_for_view > 0 and ga_hit_count_for_view == 0:
+                st.warning("자동수집 로그는 있지만 아직 GA hit(collect)가 없습니다. 브라우저/수집기 연결 상태를 확인하세요.")
+            elif raw_captured_for_view > 0:
+                st.info("GA4 hit는 있지만 기본/기술 이벤트를 제외하고 나면 표시할 custom event가 없습니다.")
+            else:
+                st.info("아직 캡처된 이벤트가 없습니다.")
         else:
             st.subheader("QA Summary")
             m0, m1, m2, m3, m4, m5 = st.columns(6)
@@ -3667,12 +5204,30 @@ with realtime_tab:
             c3.metric("상태", str(row_ev.get("상태", "-")))
 
             all_params = row_ev.get("전체 파라미터", {})
-            st.markdown("**Payload**")
+            raw_payload = row_ev.get("원본 payload", {})
+            st.markdown("**Custom Parameters**")
             if isinstance(all_params, dict) and all_params:
-                payload_rows = [{"param": str(k), "value": _to_text_value(v)} for k, v in all_params.items()]
+                payload_rows = [{"custom_parameter": str(k), "custom_value": _to_text_value(v)} for k, v in all_params.items()]
                 st.table(pd.DataFrame(payload_rows))
             else:
-                st.caption("payload가 없습니다.")
+                st.caption("기본 노출할 custom parameter가 없습니다.")
+
+            extra_custom_summary = str(row_ev.get("extra_custom_parameters", "-")).strip()
+            if extra_custom_summary and extra_custom_summary != "-":
+                with st.expander("추가 custom parameter 보기", expanded=False):
+                    extra_rows = []
+                    for item in extra_custom_summary.split(" | "):
+                        if "=" not in item:
+                            continue
+                        key, value = item.split("=", 1)
+                        extra_rows.append({"custom_parameter": key, "custom_value": value})
+                    if extra_rows:
+                        st.table(pd.DataFrame(extra_rows))
+
+            if isinstance(raw_payload, dict) and raw_payload and raw_payload != all_params:
+                with st.expander("원본 payload 보기", expanded=False):
+                    raw_rows = [{"param": str(k), "value": _to_text_value(v)} for k, v in raw_payload.items()]
+                    st.table(pd.DataFrame(raw_rows))
 
             schema_check = validate_schema_for_event(
                 event_name=str(row_ev.get("이벤트", "")),
@@ -3699,8 +5254,8 @@ with realtime_tab:
                     st.table(pd.DataFrame(check_rows))
 
     with section_export:
-        st.caption("Export는 QA 문서/이벤트 원본/트래킹 패키지 3개로 제공합니다.")
-        if rt_events.empty:
+        st.caption("Export는 QA 문서, 이벤트 로그, event definition bundle 형태로 제공합니다.")
+        if timeline_df_active.empty:
             st.info("내보낼 실시간 데이터가 없습니다.")
         else:
             browser_timeline = build_realtime_timeline_view(
@@ -3732,23 +5287,31 @@ with realtime_tab:
                 }
             )
             event_logs_csv = dataframe_to_csv_bytes(event_logs_df)
-
-            current_action_map_df = load_action_object_map()
-            tracking_plan_export_df = build_tracking_plan_export_df(
-                rt_events,
+            event_definition_preview_df, event_support_preview_df, _ = build_event_definition_exports(
+                timeline_df_active,
                 schema_store,
-                action_map_df=current_action_map_df,
             )
-            screen_definition_df = build_screen_definition_export_df(tracking_plan_export_df)
-            tracking_plan_xlsx = dataframes_to_excel_bytes({"tracking_plan": tracking_plan_export_df})
-            screen_definition_xlsx = dataframes_to_excel_bytes({"screen_definition": screen_definition_df})
-            screen_marked_png = build_screen_marked_png_bytes(screen_definition_df)
-            tracking_package_zip = build_tracking_package_zip_bytes(
-                tracking_plan_xlsx=tracking_plan_xlsx,
-                screen_definition_xlsx=screen_definition_xlsx,
-                screen_marked_png=screen_marked_png,
-                qa_report_xlsx=qa_report_xlsx,
+            event_detail_preview_df = build_event_review_detail_df(timeline_df_active, schema_store).drop(
+                columns=["raw_payload_json"],
+                errors="ignore",
             )
+            target_url_for_bundle = (
+                str(st.session_state.get("qa_debug_target_url", "")).strip()
+                or str(debug_snapshot.get("target_url", "")).strip()
+                or (
+                    str(timeline_df_active.iloc[-1].get("page_url", "")).strip()
+                    if not timeline_df_active.empty
+                    else ""
+                )
+            )
+            bundle_cache_key = (
+                f"{sid_for_view}|{len(timeline_df_active)}|"
+                f"{str(timeline_df_active['captured_at'].max()) if 'captured_at' in timeline_df_active.columns and not timeline_df_active.empty else ''}"
+            )
+            if st.session_state.get("qa_event_definition_bundle_cache_key", "") != bundle_cache_key:
+                st.session_state["qa_event_definition_bundle_cache_key"] = bundle_cache_key
+                st.session_state["qa_event_definition_bundle_bytes"] = b""
+                st.session_state["qa_event_definition_bundle_meta"] = {}
 
             st.markdown("### Export")
             st.caption("QA 상태 기준: FAIL(필수/타입/순서 오류), WARN(기준표 없음/추가 파라미터/순서 경고), PASS(그 외)")
@@ -3774,22 +5337,109 @@ with realtime_tab:
                 )
                 st.caption("테스트 중 수집된 이벤트 로그")
             with b3:
-                st.download_button(
-                    "[3] Tracking Plan",
-                    data=tracking_package_zip,
-                    file_name="tracking_package.zip",
-                    mime="application/zip",
-                    disabled=not bool(tracking_package_zip),
-                    help="tracking_plan + qa_report + screen_marked 패키지",
+                save_snapshot_clicked = st.button(
+                    "[3-1] 저장본 저장",
+                    key="generate_event_definition_bundle",
+                    disabled=event_definition_preview_df.empty,
+                    help="현재 이벤트 테스트 결과를 Run 저장본으로 저장하고 bundle을 생성합니다.",
                 )
-                st.caption("tracking_plan.xlsx + qa_report.xlsx + screen_marked.png")
+                if save_snapshot_clicked:
+                    bundle_bytes, _, _, bundle_meta = save_event_definition_bundle(
+                        raw_debug_df=timeline_df_active,
+                        schemas=schema_store,
+                        qa_report_xlsx=qa_report_xlsx,
+                        target_url=target_url_for_bundle,
+                        session_id=active_debug_session_id or sid_for_view,
+                    )
+                    st.session_state["qa_event_definition_bundle_bytes"] = bundle_bytes
+                    st.session_state["qa_event_definition_bundle_meta"] = bundle_meta
+                    st.success(f"저장본 저장 완료: {bundle_meta.get('run_id', '-')}")
+                bundle_bytes = st.session_state.get("qa_event_definition_bundle_bytes", b"")
+                st.download_button(
+                    "[3-2] Bundle 다운로드",
+                    data=bundle_bytes,
+                    file_name="event_definition_bundle.zip",
+                    mime="application/zip",
+                    disabled=not bool(bundle_bytes),
+                    help="event_definition.csv + event_review_details.csv + index.html + screenshot bundle",
+                )
+                bundle_meta = st.session_state.get("qa_event_definition_bundle_meta", {})
+                if bundle_meta:
+                    st.caption(
+                        f"run_id={bundle_meta.get('run_id', '-')} | "
+                        f"events={bundle_meta.get('event_count', 0)} | "
+                        f"auto_baseline={bundle_meta.get('auto_baseline', False)}"
+                    )
+                else:
+                    st.caption("먼저 저장본 저장 버튼을 눌러 Run을 만든 뒤 다운로드하세요.")
 
-            st.markdown("**Tracking Plan 미리보기**")
-            st.caption(f"Action/Object 매핑 적용: {int(len(current_action_map_df))}개 이벤트")
-            if tracking_plan_export_df.empty:
-                st.info("Tracking Plan을 만들 데이터가 없습니다.")
+            st.markdown("**Event Definition 미리보기**")
+            if event_definition_preview_df.empty:
+                if ga_hit_count_for_view == 0 and auto_crawl_count_for_view > 0:
+                    st.warning("auto crawl 로그만 있고 GA hit가 없어 event definition CSV를 만들 수 없습니다.")
+                elif ga_hit_count_for_view > 0:
+                    st.info("GA4 hit 중 기본/기술 이벤트를 제외하면 산출할 custom event definition이 없습니다.")
+                else:
+                    st.info("Event Definition을 만들 데이터가 없습니다.")
             else:
-                st.dataframe(tracking_plan_export_df, use_container_width=True, height=320)
+                st.dataframe(event_definition_preview_df, use_container_width=True, height=320)
+            st.markdown("**Annotation / Support 미리보기**")
+            if event_support_preview_df.empty:
+                st.caption("보조 annotation 정보가 없습니다.")
+            else:
+                st.dataframe(event_support_preview_df, use_container_width=True, height=220)
+            st.markdown("**이벤트별 상세 검수 미리보기**")
+            if event_detail_preview_df.empty:
+                st.caption("이벤트별 상세 검수 산출물이 없습니다.")
+            else:
+                st.dataframe(event_detail_preview_df, use_container_width=True, height=260)
+
+            st.markdown("**Version History**")
+            run_history_df = list_event_definition_runs(target_url_for_bundle)
+            if run_history_df.empty:
+                st.caption("저장된 Run이 없습니다. 저장본 저장 버튼으로 첫 Run을 만드세요.")
+            else:
+                history_show_cols = ["run_id", "saved_at", "state", "event_count", "session_id"]
+                st.dataframe(run_history_df[history_show_cols], use_container_width=True, height=220)
+
+                baseline_candidates = run_history_df["run_id"].astype(str).tolist()
+                default_baseline_idx = 0
+                for idx, state in enumerate(run_history_df["state"].astype(str).tolist()):
+                    if "Baseline" in state:
+                        default_baseline_idx = idx
+                        break
+                selected_baseline_run = st.selectbox(
+                    "Baseline Run",
+                    options=baseline_candidates,
+                    index=default_baseline_idx,
+                    key="qa_compare_baseline_run",
+                )
+                selected_candidate_run = st.selectbox(
+                    "Compare Run",
+                    options=baseline_candidates,
+                    index=0,
+                    key="qa_compare_candidate_run",
+                )
+                h1, h2 = st.columns([1.1, 2.4])
+                with h1:
+                    if st.button("선택 Run을 Baseline으로 승격", key="qa_promote_baseline_btn"):
+                        set_event_definition_baseline(target_url_for_bundle, selected_baseline_run)
+                        st.success(f"Baseline 변경 완료: {selected_baseline_run}")
+                        st.rerun()
+                with h2:
+                    st.caption("Run 저장 후 Baseline/Latest/Candidate 상태로 관리하고, 두 버전 간 차이를 바로 비교합니다.")
+
+                baseline_detail_df = load_event_definition_run_detail_df(target_url_for_bundle, selected_baseline_run)
+                candidate_detail_df = load_event_definition_run_detail_df(target_url_for_bundle, selected_candidate_run)
+                compare_df = compare_event_definition_runs(baseline_detail_df, candidate_detail_df)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Added", int((compare_df["change_type"] == "added").sum()) if not compare_df.empty else 0)
+                c2.metric("Removed", int((compare_df["change_type"] == "removed").sum()) if not compare_df.empty else 0)
+                c3.metric("Changed", int((compare_df["change_type"] == "changed").sum()) if not compare_df.empty else 0)
+                if compare_df.empty:
+                    st.caption("선택한 두 버전의 custom event 차이가 없습니다.")
+                else:
+                    st.dataframe(compare_df, use_container_width=True, height=260)
 
     if (
         st.session_state.get("realtime_panel_auto_refresh", False)

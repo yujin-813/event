@@ -30,6 +30,7 @@ class DebugSession:
     tester_note: str
     db_path: Path
     launch_browser: bool
+    run_settings: Dict[str, object]
     stop_event: threading.Event
     thread: threading.Thread | None
 
@@ -269,17 +270,88 @@ def _append_query(url: str, extra: Dict[str, str]) -> str:
     )
 
 
+def _is_truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(key: str, default: int) -> int:
+    raw = str(os.getenv(key, "")).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        num = int(value)
+    except Exception:
+        num = default
+    return max(minimum, min(maximum, num))
+
+
+def _normalize_run_settings(run_settings: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    raw = dict(run_settings or {})
+    browser_name = str(raw.get("browser_name", "chrome") or "chrome").strip().lower()
+    if browser_name not in {"chrome", "chromium"}:
+        browser_name = "chrome"
+    settings = {
+        "environment": str(raw.get("environment", "prod") or "prod").strip() or "prod",
+        "browser_name": browser_name,
+        "viewport_width": _clamp_int(raw.get("viewport_width"), 1440, 320, 2560),
+        "viewport_height": _clamp_int(raw.get("viewport_height"), 900, 320, 2560),
+        "auto_crawl_enabled": bool(raw.get("auto_crawl_enabled", True)),
+        "auto_stop_after_crawl": bool(raw.get("auto_stop_after_crawl", True)),
+        "max_auto_clicks": _clamp_int(
+            raw.get("max_auto_clicks", _env_int("QA_AUTO_CRAWL_MAX_CLICKS", 80)),
+            80,
+            1,
+            500,
+        ),
+        "click_interval_ms": _clamp_int(
+            raw.get("click_interval_ms", _env_int("QA_AUTO_CRAWL_CLICK_INTERVAL_MS", 1200)),
+            1200,
+            100,
+            10000,
+        ),
+        "wait_after_click_ms": _clamp_int(
+            raw.get("wait_after_click_ms", _env_int("QA_AUTO_CRAWL_WAIT_AFTER_CLICK_MS", 1200)),
+            1200,
+            100,
+            10000,
+        ),
+        "block_link_navigation": bool(
+            raw.get("block_link_navigation", _is_truthy(os.getenv("QA_AUTO_BLOCK_LINK_NAV", "1")))
+        ),
+        "single_page_only": bool(
+            raw.get("single_page_only", _is_truthy(os.getenv("QA_SINGLE_PAGE_ONLY", "1")))
+        ),
+        "mobile_mode": bool(raw.get("mobile_mode", _is_truthy(os.getenv("QA_DEBUG_MOBILE_MODE", "0")))),
+        "mobile_device": str(raw.get("mobile_device", "iPhone 13") or "iPhone 13").strip() or "iPhone 13",
+        "qa_mode": str(raw.get("qa_mode", "전체 이벤트 테스트") or "전체 이벤트 테스트").strip(),
+        "scenario_template": str(raw.get("scenario_template", "") or "").strip(),
+    }
+    return settings
+
+
 def _launch_browser(playwright):
     last_err: Exception | None = None
     attempt_errors: List[str] = []
+    browser_name = "chrome"
+    if isinstance(playwright, tuple):
+        playwright, browser_name = playwright
     # EC2(무GUI) 환경에서도 동작하도록 headed -> headless 순으로 폴백한다.
     for launch_kwargs in (
-        {"headless": False, "channel": "chrome"},
+        {"headless": False, "channel": "chrome"} if browser_name == "chrome" else {"headless": False},
         {"headless": False},
-        {"headless": True, "channel": "chrome"},
+        {"headless": True, "channel": "chrome"} if browser_name == "chrome" else {"headless": True},
         {"headless": True},
         # 일부 EC2/컨테이너 환경에서 sandbox 관련 실패를 우회하기 위한 최후 폴백
-        {"headless": True, "channel": "chrome", "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
+        {"headless": True, "channel": "chrome", "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+        if browser_name == "chrome"
+        else {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
         {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
     ):
         if platform.system().lower() != "linux" and "args" in launch_kwargs:
@@ -296,6 +368,20 @@ def _launch_browser(playwright):
         "EC2에서는 `/opt/ga4-qa-mvp/.venv/bin/playwright install --with-deps chromium` 실행 후 서비스 재시작이 필요할 수 있습니다. "
         f"(last_error: {detail})"
     ) from last_err
+
+
+def _build_context_kwargs(playwright, run_settings: Dict[str, object]) -> Dict[str, object]:
+    settings = _normalize_run_settings(run_settings)
+    if settings.get("mobile_mode", False):
+        device_profile = playwright.devices.get(str(settings.get("mobile_device", "iPhone 13")))
+        if isinstance(device_profile, dict) and device_profile:
+            return dict(device_profile)
+    return {
+        "viewport": {
+            "width": int(settings.get("viewport_width", 1440)),
+            "height": int(settings.get("viewport_height", 900)),
+        }
+    }
 
 
 def _build_init_script(session_id: str) -> str:
@@ -581,6 +667,25 @@ def _append_event_with_db(output_file: Path, payload: Dict[str, object], db_path
         return
 
 
+def _record_runtime_payload(session_id: str, payload: Dict[str, object]) -> None:
+    session = _get_session(session_id)
+    if not session:
+        return
+    payload.setdefault("captured_at", datetime.now(timezone.utc).isoformat())
+    payload.setdefault("session_id", session_id)
+    payload.setdefault("page_url", session.target_url)
+    _append_event_with_db(session.output_file, payload, session.db_path)
+    with _LOCK:
+        current = _SESSIONS.get(session_id)
+        if current:
+            current.captured_events += 1
+            should_sync = current.captured_events % 10 == 0
+        else:
+            should_sync = False
+    if should_sync:
+        _sync_session_db(session_id)
+
+
 def _session_to_payload(session: DebugSession) -> Dict[str, object]:
     return {
         "session_id": session.session_id,
@@ -623,6 +728,324 @@ def _get_session(session_id: str) -> Optional[DebugSession]:
         return _SESSIONS.get(session_id)
 
 
+def _build_compare_key(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    host = parsed.netloc.lower().strip()
+    path = parsed.path or "/"
+    return f"{host}{path}"
+
+
+def _capture_annotated_screenshot(page, screenshot_path: Path, bbox: Dict[str, int], marker_index: int) -> tuple[str, Dict[str, int]]:
+    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+    image_bytes = page.screenshot(full_page=False)
+    raw_path = screenshot_path.with_name(f"{screenshot_path.stem}_raw{screenshot_path.suffix}")
+    raw_path.write_bytes(image_bytes)
+    normalized_bbox = {
+        "bbox_x": int(max(0, bbox.get("bbox_x", 0))),
+        "bbox_y": int(max(0, bbox.get("bbox_y", 0))),
+        "bbox_width": int(max(0, bbox.get("bbox_width", 0))),
+        "bbox_height": int(max(0, bbox.get("bbox_height", 0))),
+    }
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        img_width, img_height = image.size
+        draw = ImageDraw.Draw(image)
+        x1 = int(min(max(0, normalized_bbox.get("bbox_x", 0)), max(0, img_width - 1)))
+        y1 = int(min(max(0, normalized_bbox.get("bbox_y", 0)), max(0, img_height - 1)))
+        x2 = int(min(max(x1, x1 + normalized_bbox.get("bbox_width", 0)), max(0, img_width - 1)))
+        y2 = int(min(max(y1, y1 + normalized_bbox.get("bbox_height", 0)), max(0, img_height - 1)))
+        normalized_bbox = {
+            "bbox_x": x1,
+            "bbox_y": y1,
+            "bbox_width": max(0, x2 - x1),
+            "bbox_height": max(0, y2 - y1),
+        }
+        draw.rectangle([x1, y1, x2, y2], outline=(220, 38, 38), width=4)
+        circle_x = max(22, x1 + 18)
+        circle_y = max(22, y1 + 18)
+        draw.ellipse([circle_x - 18, circle_y - 18, circle_x + 18, circle_y + 18], fill=(30, 64, 175))
+        draw.text((circle_x - 6, circle_y - 10), str(marker_index), fill=(255, 255, 255))
+        image.save(screenshot_path, format="PNG")
+    except Exception:
+        screenshot_path.write_bytes(image_bytes)
+    return str(raw_path), normalized_bbox
+
+
+def _extract_candidate_metadata(handle) -> Dict[str, object]:
+    return handle.evaluate(
+        """
+        (el) => {
+          const readAttr = (node, name) => (node && node.getAttribute ? (node.getAttribute(name) || "") : "");
+          const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+          const toPattern = (value) => String(value || "").replace(/\\d+/g, "#");
+          const buildSelector = (node) => {
+            const parts = [];
+            let current = node;
+            let depth = 0;
+            while (current && current.nodeType === 1 && depth < 6) {
+              let part = current.tagName.toLowerCase();
+              if (current.id) {
+                part += `#${current.id}`;
+                parts.unshift(part);
+                break;
+              }
+              const className = normalizeText(current.className || "").split(" ").filter(Boolean).slice(0, 2).join(".");
+              if (className) {
+                part += `.${className}`;
+              }
+              let nth = 1;
+              let sibling = current;
+              while ((sibling = sibling.previousElementSibling)) {
+                if (sibling.tagName === current.tagName) nth += 1;
+              }
+              part += `:nth-of-type(${nth})`;
+              parts.unshift(part);
+              current = current.parentElement;
+              depth += 1;
+            }
+            return parts.join(" > ");
+          };
+
+          const sectionHost = el.closest("[data-section-name]");
+          const sectionName = readAttr(el, "data-section-name") || readAttr(sectionHost, "data-section-name") || "";
+          const text = normalizeText(el.innerText || el.textContent || readAttr(el, "aria-label") || readAttr(el, "title"));
+          const href = readAttr(el, "href");
+          const tag = (el.tagName || "").toLowerCase();
+          const classAttribute = normalizeText(readAttr(el, "class"));
+          const role = readAttr(el, "role");
+          const targetId = readAttr(el, "data-qa")
+            ? `data-qa:${readAttr(el, "data-qa")}`
+            : (readAttr(el, "data-button-id")
+              ? `data-button-id:${readAttr(el, "data-button-id")}`
+              : (readAttr(el, "data-section-name")
+                ? `data-section-name:${readAttr(el, "data-section-name")}`
+                : (el.id ? `id:${el.id}` : "")));
+          const uiRole = role || (tag === "a" ? "link" : (tag === "button" || tag === "input" ? "button_like" : "clickable"));
+          const selector = buildSelector(el);
+          const selectorPattern = toPattern(selector);
+          const screenState = `modal:${document.querySelectorAll('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"]').length > 0 ? 1 : 0}|expanded:${document.querySelectorAll('[aria-expanded="true"]').length > 0 ? 1 : 0}|tooltip:${document.querySelectorAll('[role="tooltip"], [class*="tooltip"]').length > 0 ? 1 : 0}|self_expanded:${readAttr(el, 'aria-expanded') || 'na'}`;
+          const pageId = location.pathname || "/";
+          const classPattern = toPattern(classAttribute.split(" ").slice(0, 2).join("."));
+          const key = [pageId, tag, targetId || selector, text.slice(0, 80), href].join("|");
+          const patternKey = [pageId, sectionName || "section", uiRole, tag, classPattern || selectorPattern, targetId || "na", screenState].join("|");
+          return {
+            key,
+            pattern_key: patternKey,
+            text,
+            href,
+            target_id: targetId || selector,
+            selector,
+            selector_pattern: selectorPattern,
+            section_name: sectionName,
+            screen_state: screenState,
+            class_attribute: classAttribute,
+            ui_role: uiRole,
+            tag,
+            page_id: pageId
+          };
+        }
+        """
+    )
+
+
+def _emit_auto_crawl_event(session_id: str, event_name: str, page_url: str, params: Dict[str, object]) -> None:
+    _record_runtime_payload(
+        session_id,
+        {
+            "source": "auto_crawl",
+            "event_name": event_name,
+            "params": params,
+            "page_url": page_url,
+            "request_method": "AUTO",
+        },
+    )
+
+
+def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop_event: threading.Event) -> None:
+    settings = _normalize_run_settings(run_settings)
+    max_auto_clicks = int(settings.get("max_auto_clicks", 80))
+    wait_after_click_ms = int(settings.get("wait_after_click_ms", 1200))
+    click_interval_ms = int(settings.get("click_interval_ms", 1200))
+    block_link_navigation = bool(settings.get("block_link_navigation", True))
+    single_page_only = bool(settings.get("single_page_only", True))
+    start_compare_key = _build_compare_key(page.url)
+    start_url = page.url
+    screenshots_dir = Path("data/debug_screens") / session_id
+    candidate_selectors = [
+        "[data-qa]",
+        "[data-button-id]",
+        "button",
+        "a.gtm-click-button",
+        "a.gtm-click-content",
+        "a[href]",
+        "[role='button']",
+        "input[type='button']",
+        "input[type='submit']",
+        "[onclick]",
+    ]
+    seen_pattern_keys: set[str] = set()
+    clicked_count = 0
+
+    while not stop_event.is_set() and clicked_count < max_auto_clicks:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+
+        selected_handle = None
+        selected_meta: Dict[str, object] = {}
+        selected_bbox: Dict[str, int] = {}
+        for selector in candidate_selectors:
+            handles = page.locator(selector).element_handles()
+            for handle in handles:
+                try:
+                    bbox = handle.bounding_box()
+                    if not bbox:
+                        continue
+                    if float(bbox.get("width", 0)) < 6 or float(bbox.get("height", 0)) < 6:
+                        continue
+                    meta = _extract_candidate_metadata(handle)
+                    if not meta:
+                        continue
+                    text = str(meta.get("text", "")).strip()
+                    if not text and str(meta.get("tag", "")) not in {"button", "input"}:
+                        continue
+                    pattern_key = str(meta.get("pattern_key", "")).strip()
+                    if not pattern_key or pattern_key in seen_pattern_keys:
+                        continue
+                    selected_handle = handle
+                    selected_meta = meta
+                    selected_bbox = {
+                        "bbox_x": int(max(0, bbox.get("x", 0))),
+                        "bbox_y": int(max(0, bbox.get("y", 0))),
+                        "bbox_width": int(max(0, bbox.get("width", 0))),
+                        "bbox_height": int(max(0, bbox.get("height", 0))),
+                    }
+                    break
+                except Exception:
+                    continue
+            if selected_handle is not None:
+                break
+
+        if selected_handle is None:
+            _emit_auto_crawl_event(
+                session_id,
+                "auto_crawl_idle",
+                page.url,
+                {
+                    "reason": "no_new_candidates",
+                    "auto_click_index": clicked_count,
+                    "max_auto_clicks": max_auto_clicks,
+                    "run_mode": "Auto Crawl",
+                },
+            )
+            break
+
+        clicked_count += 1
+        seen_pattern_keys.add(str(selected_meta.get("pattern_key", "")).strip())
+        screenshot_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_auto_click.png"
+        screenshot_path = screenshots_dir / screenshot_name
+        screenshot_file = str(screenshot_path).strip()
+        raw_screenshot_file = ""
+        navigation_blocked = False
+        current_url = page.url
+
+        try:
+            selected_handle.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+
+        try:
+            raw_screenshot_file, selected_bbox = _capture_annotated_screenshot(
+                page,
+                screenshot_path,
+                selected_bbox,
+                clicked_count,
+            )
+        except Exception:
+            screenshot_file = ""
+            raw_screenshot_file = ""
+
+        click_reason = "clicked"
+        try:
+            href = str(selected_meta.get("href", "")).strip()
+            if href and block_link_navigation:
+                navigation_blocked = True
+                selected_handle.evaluate(
+                    """
+                    (el) => {
+                      const blocker = (event) => event.preventDefault();
+                      el.addEventListener("click", blocker, { capture: true, once: true });
+                      el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                    }
+                    """
+                )
+            else:
+                selected_handle.click(timeout=2500, force=True)
+        except Exception as exc:
+            click_reason = f"error:{exc}"
+
+        _emit_auto_crawl_event(
+            session_id,
+            "auto_click",
+            current_url,
+            {
+                "clicked": click_reason == "clicked",
+                "reason": click_reason,
+                "key": str(selected_meta.get("key", "")).strip(),
+                "pattern_key": str(selected_meta.get("pattern_key", "")).strip(),
+                "text": str(selected_meta.get("text", "")).strip(),
+                "href": str(selected_meta.get("href", "")).strip(),
+                "target_id": str(selected_meta.get("target_id", "")).strip(),
+                "selector": str(selected_meta.get("selector", "")).strip(),
+                "section_name": str(selected_meta.get("section_name", "")).strip(),
+                "screen_state": str(selected_meta.get("screen_state", "")).strip(),
+                "class_attribute": str(selected_meta.get("class_attribute", "")).strip(),
+                "ui_role": str(selected_meta.get("ui_role", "")).strip(),
+                "selector_pattern": str(selected_meta.get("selector_pattern", "")).strip(),
+                "tag": str(selected_meta.get("tag", "")).strip(),
+                "navigation_blocked": navigation_blocked,
+                "url": current_url,
+                "auto_click_index": clicked_count,
+                "max_auto_clicks": max_auto_clicks,
+                "run_mode": "Auto Crawl",
+                "selector_screenshot": screenshot_file,
+                "raw_screenshot_file": raw_screenshot_file,
+                **selected_bbox,
+            },
+        )
+
+        try:
+            page.wait_for_timeout(wait_after_click_ms)
+            page.wait_for_load_state("networkidle", timeout=2500)
+        except Exception:
+            pass
+
+        if single_page_only and _build_compare_key(page.url) != start_compare_key:
+            try:
+                page.goto(start_url, wait_until="domcontentloaded")
+                page.wait_for_timeout(click_interval_ms)
+            except Exception:
+                pass
+        else:
+            page.wait_for_timeout(click_interval_ms)
+
+    if clicked_count >= max_auto_clicks:
+        _emit_auto_crawl_event(
+            session_id,
+            "max_auto_clicks_reached",
+            page.url,
+            {
+                "auto_click_index": clicked_count,
+                "max_auto_clicks": max_auto_clicks,
+                "run_mode": "Auto Crawl",
+            },
+        )
+
+
 def _run_debug_session(session_id: str) -> None:
     session = _get_session(session_id)
     if not session:
@@ -650,8 +1073,9 @@ def _run_debug_session(session_id: str) -> None:
         _sync_session_db(session_id)
 
         with sync_playwright() as p:
-            browser = _launch_browser(p)
-            context = browser.new_context()
+            run_settings = _normalize_run_settings(session.run_settings)
+            browser = _launch_browser((p, str(run_settings.get("browser_name", "chrome"))))
+            context = browser.new_context(**_build_context_kwargs(p, run_settings))
 
             def on_emit(source, payload):  # noqa: ANN001
                 try:
@@ -709,6 +1133,20 @@ def _run_debug_session(session_id: str) -> None:
             page = context.new_page()
             page.goto(test_url, wait_until="domcontentloaded")
             page.bring_to_front()
+
+            if run_settings.get("auto_crawl_enabled", True):
+                try:
+                    page.wait_for_timeout(1200)
+                    _run_auto_crawl(page, session_id, run_settings, session.stop_event)
+                except Exception as exc:
+                    _emit_auto_crawl_event(
+                        session_id,
+                        "auto_crawl_error",
+                        page.url,
+                        {"reason": str(exc), "run_mode": "Auto Crawl"},
+                    )
+                if run_settings.get("auto_stop_after_crawl", True):
+                    session.stop_event.set()
 
             while not session.stop_event.is_set():
                 page.wait_for_timeout(500)
@@ -809,6 +1247,7 @@ def start_debug_session(
     tester_note: str = "",
     db_path: Path | None = None,
     launch_browser: bool = True,
+    run_settings: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     sid = session_id.strip()
     url = target_url.strip()
@@ -843,6 +1282,7 @@ def start_debug_session(
             tester_note=tester_note.strip(),
             db_path=effective_db_path,
             launch_browser=bool(launch_browser),
+            run_settings=_normalize_run_settings(run_settings),
             stop_event=stop_event,
             thread=None,
         )
@@ -895,6 +1335,7 @@ def get_debug_session_snapshot(session_id: str) -> Dict[str, object]:
             "tester_note": session.tester_note,
             "db_path": str(session.db_path),
             "launch_browser": bool(session.launch_browser),
+            "run_settings": dict(session.run_settings),
         }
 
 
