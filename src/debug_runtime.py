@@ -454,20 +454,26 @@ def _launch_browser(playwright):
     browser_name = "chrome"
     if isinstance(playwright, tuple):
         playwright, browser_name = playwright
+    common_args = [
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-search-engine-choice-screen",
+        "--disable-features=ChromeWhatsNewUI,WelcomePage,SigninIntercept",
+    ]
     # EC2(무GUI) 환경에서도 동작하도록 headed -> headless 순으로 폴백한다.
     for launch_kwargs in (
-        {"headless": False, "channel": "chrome"} if browser_name == "chrome" else {"headless": False},
-        {"headless": False},
-        {"headless": True, "channel": "chrome"} if browser_name == "chrome" else {"headless": True},
-        {"headless": True},
+        {"headless": False, "channel": "chrome", "args": common_args} if browser_name == "chrome" else {"headless": False, "args": common_args},
+        {"headless": False, "args": common_args},
+        {"headless": True, "channel": "chrome", "args": common_args} if browser_name == "chrome" else {"headless": True, "args": common_args},
+        {"headless": True, "args": common_args},
         # 일부 EC2/컨테이너 환경에서 sandbox 관련 실패를 우회하기 위한 최후 폴백
-        {"headless": True, "channel": "chrome", "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+        {"headless": True, "channel": "chrome", "args": common_args + ["--no-sandbox", "--disable-dev-shm-usage"]}
         if browser_name == "chrome"
-        else {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
-        {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]},
+        else {"headless": True, "args": common_args + ["--no-sandbox", "--disable-dev-shm-usage"]},
+        {"headless": True, "args": common_args + ["--no-sandbox", "--disable-dev-shm-usage"]},
     ):
-        if platform.system().lower() != "linux" and "args" in launch_kwargs:
-            continue
+        if platform.system().lower() != "linux" and any(arg in launch_kwargs.get("args", []) for arg in ["--no-sandbox", "--disable-dev-shm-usage"]):
+            pass
         try:
             return playwright.chromium.launch(**launch_kwargs)
         except Exception as exc:  # pragma: no cover - runtime environment dependent
@@ -862,21 +868,51 @@ def _capture_annotated_screenshot(page, screenshot_path: Path, bbox: Dict[str, i
         from io import BytesIO
         from PIL import Image, ImageDraw, ImageFont
 
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        image = Image.open(BytesIO(image_bytes)).convert("RGBA")
         img_width, img_height = image.size
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
         draw = ImageDraw.Draw(image)
         font = ImageFont.load_default()
         x1 = int(min(max(0, normalized_bbox.get("bbox_x", 0)), max(0, img_width - 1)))
         y1 = int(min(max(0, normalized_bbox.get("bbox_y", 0)), max(0, img_height - 1)))
         x2 = int(min(max(x1, x1 + normalized_bbox.get("bbox_width", 0)), max(0, img_width - 1)))
         y2 = int(min(max(y1, y1 + normalized_bbox.get("bbox_height", 0)), max(0, img_height - 1)))
+        min_box_width = 40
+        min_box_height = 28
+        if (x2 - x1) < min_box_width:
+            expand = int((min_box_width - (x2 - x1)) / 2) + 1
+            x1 = max(0, x1 - expand)
+            x2 = min(img_width - 1, x2 + expand)
+        if (y2 - y1) < min_box_height:
+            expand = int((min_box_height - (y2 - y1)) / 2) + 1
+            y1 = max(0, y1 - expand)
+            y2 = min(img_height - 1, y2 + expand)
         normalized_bbox = {
             "bbox_x": x1,
             "bbox_y": y1,
             "bbox_width": max(0, x2 - x1),
             "bbox_height": max(0, y2 - y1),
         }
-        draw.rectangle([x1, y1, x2, y2], outline=(220, 38, 38), width=4)
+        overlay_draw.rectangle([x1, y1, x2, y2], fill=(235, 28, 36, 34))
+        image = Image.alpha_composite(image, overlay)
+        draw = ImageDraw.Draw(image)
+        # Add a double outer stroke so the target box stays visible on bright and dark backgrounds.
+        draw.rectangle([max(0, x1 - 5), max(0, y1 - 5), min(img_width - 1, x2 + 5), min(img_height - 1, y2 + 5)], outline=(255, 255, 255), width=3)
+        draw.rectangle([max(0, x1 - 2), max(0, y1 - 2), min(img_width - 1, x2 + 2), min(img_height - 1, y2 + 2)], outline=(80, 0, 0), width=3)
+        draw.rectangle([x1, y1, x2, y2], outline=(235, 28, 36), width=9)
+        corner = max(18, min(36, int(min(max(1, x2 - x1), max(1, y2 - y1)) * 0.2)))
+        for start, end in [
+            ((x1, y1), (min(x2, x1 + corner), y1)),
+            ((x1, y1), (x1, min(y2, y1 + corner))),
+            ((x2, y1), (max(x1, x2 - corner), y1)),
+            ((x2, y1), (x2, min(y2, y1 + corner))),
+            ((x1, y2), (min(x2, x1 + corner), y2)),
+            ((x1, y2), (x1, max(y1, y2 - corner))),
+            ((x2, y2), (max(x1, x2 - corner), y2)),
+            ((x2, y2), (x2, max(y1, y2 - corner))),
+        ]:
+            draw.line([start, end], fill=(255, 255, 255), width=4)
         marker_text = str(marker_index)
         text_bbox = draw.textbbox((0, 0), marker_text, font=font)
         text_width = int(text_bbox[2] - text_bbox[0])
@@ -893,8 +929,8 @@ def _capture_annotated_screenshot(page, screenshot_path: Path, bbox: Dict[str, i
             label_y = max(0, img_height - label_height)
         draw.rectangle(
             [label_x, label_y, label_x + label_width, label_y + label_height],
-            fill=(220, 38, 38),
-            outline=(220, 38, 38),
+            fill=(235, 28, 36),
+            outline=(255, 255, 255),
             width=2,
         )
         draw.text(
@@ -903,7 +939,7 @@ def _capture_annotated_screenshot(page, screenshot_path: Path, bbox: Dict[str, i
             fill=(255, 255, 255),
             font=font,
         )
-        image.save(screenshot_path, format="PNG")
+        image.convert("RGB").save(screenshot_path, format="PNG")
     except Exception:
         screenshot_path.write_bytes(image_bytes)
     return str(raw_path), normalized_bbox
@@ -916,6 +952,69 @@ def _extract_candidate_metadata(handle) -> Dict[str, object]:
           const readAttr = (node, name) => (node && node.getAttribute ? (node.getAttribute(name) || "") : "");
           const normalizeText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
           const toPattern = (value) => String(value || "").replace(/\\d+/g, "#");
+          const semanticSelectors = [
+            '[data-qa]',
+            '[data-button-id]',
+            '[data-section-name]',
+            '[data-index]',
+            'button',
+            'a',
+            'li',
+            '[role="button"]',
+            '[onclick]',
+            '.gtm-click-button',
+            '.gtm-click-content'
+          ];
+          const hasSemanticIdentity = (node) => semanticSelectors.some((selector) => {
+            try {
+              return node && node.matches && node.matches(selector);
+            } catch (e) {
+              return false;
+            }
+          });
+          const getRect = (node) => {
+            if (!node || !node.getBoundingClientRect) {
+              return { x: 0, y: 0, width: 0, height: 0 };
+            }
+            const rect = node.getBoundingClientRect();
+            return {
+              x: Math.max(0, Math.round(rect.left)),
+              y: Math.max(0, Math.round(rect.top)),
+              width: Math.max(0, Math.round(rect.width)),
+              height: Math.max(0, Math.round(rect.height)),
+            };
+          };
+          const isTooSmall = (rect) => rect.width < 40 || rect.height < 18;
+          const resolveSemanticTarget = (node) => {
+            let current = node;
+            let best = node;
+            let depth = 0;
+            while (current && current.nodeType === 1 && depth < 6) {
+              const rect = getRect(current);
+              if (rect.width > 0 && rect.height > 0) {
+                best = current;
+              }
+              if (hasSemanticIdentity(current) && !isTooSmall(rect)) {
+                best = current;
+                break;
+              }
+              if ((current.tagName || '').toLowerCase() === 'section' && !isTooSmall(rect)) {
+                best = current;
+                break;
+              }
+              current = current.parentElement;
+              depth += 1;
+            }
+            let target = best;
+            let rect = getRect(target);
+            let fallbackDepth = 0;
+            while (target && isTooSmall(rect) && target.parentElement && fallbackDepth < 4) {
+              target = target.parentElement;
+              rect = getRect(target);
+              fallbackDepth += 1;
+            }
+            return { target, rect };
+          };
           const buildSelector = (node) => {
             const parts = [];
             let current = node;
@@ -944,27 +1043,30 @@ def _extract_candidate_metadata(handle) -> Dict[str, object]:
             return parts.join(" > ");
           };
 
-          const sectionHost = el.closest("[data-section-name]");
-          const sectionName = readAttr(el, "data-section-name") || readAttr(sectionHost, "data-section-name") || "";
-          const text = normalizeText(el.innerText || el.textContent || readAttr(el, "aria-label") || readAttr(el, "title"));
-          const href = readAttr(el, "href");
-          const tag = (el.tagName || "").toLowerCase();
-          const classAttribute = normalizeText(readAttr(el, "class"));
-          const role = readAttr(el, "role");
-          const dataQa = readAttr(el, "data-qa");
-          const dataButtonId = readAttr(el, "data-button-id");
-          const dataSectionName = readAttr(el, "data-section-name");
+          const resolved = resolveSemanticTarget(el);
+          const target = resolved.target || el;
+          const targetRect = resolved.rect || getRect(target);
+          const sectionHost = target.closest("[data-section-name]");
+          const sectionName = readAttr(target, "data-section-name") || readAttr(sectionHost, "data-section-name") || "";
+          const text = normalizeText(target.innerText || target.textContent || readAttr(target, "aria-label") || readAttr(target, "title"));
+          const href = readAttr(target, "href");
+          const tag = (target.tagName || "").toLowerCase();
+          const classAttribute = normalizeText(readAttr(target, "class"));
+          const role = readAttr(target, "role");
+          const dataQa = readAttr(target, "data-qa");
+          const dataButtonId = readAttr(target, "data-button-id");
+          const dataSectionName = readAttr(target, "data-section-name");
           const targetId = dataQa
             ? `data-qa:${dataQa}`
             : (dataButtonId
               ? `data-button-id:${dataButtonId}`
               : (dataSectionName
                 ? `data-section-name:${dataSectionName}`
-                : (el.id ? `id:${el.id}` : "")));
+                : (target.id ? `id:${target.id}` : "")));
           const uiRole = role || (tag === "a" ? "link" : (tag === "button" || tag === "input" ? "button_like" : "clickable"));
-          const selector = buildSelector(el);
+          const selector = buildSelector(target);
           const selectorPattern = toPattern(selector);
-          const screenState = `modal:${document.querySelectorAll('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"]').length > 0 ? 1 : 0}|expanded:${document.querySelectorAll('[aria-expanded="true"]').length > 0 ? 1 : 0}|tooltip:${document.querySelectorAll('[role="tooltip"], [class*="tooltip"]').length > 0 ? 1 : 0}|self_expanded:${readAttr(el, 'aria-expanded') || 'na'}`;
+          const screenState = `modal:${document.querySelectorAll('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"]').length > 0 ? 1 : 0}|expanded:${document.querySelectorAll('[aria-expanded="true"]').length > 0 ? 1 : 0}|tooltip:${document.querySelectorAll('[role="tooltip"], [class*="tooltip"]').length > 0 ? 1 : 0}|self_expanded:${readAttr(target, 'aria-expanded') || 'na'}`;
           const pageId = location.pathname || "/";
           const classPattern = toPattern(classAttribute.split(" ").slice(0, 2).join("."));
           const key = [pageId, tag, targetId || selector, text.slice(0, 80), href].join("|");
@@ -987,7 +1089,11 @@ def _extract_candidate_metadata(handle) -> Dict[str, object]:
             class_attribute: classAttribute,
             ui_role: uiRole,
             tag,
-            page_id: pageId
+            page_id: pageId,
+            bbox_x: targetRect.x,
+            bbox_y: targetRect.y,
+            bbox_width: targetRect.width,
+            bbox_height: targetRect.height
           };
         }
         """
@@ -1007,7 +1113,115 @@ def _emit_auto_crawl_event(session_id: str, event_name: str, page_url: str, para
     )
 
 
-def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop_event: threading.Event) -> None:
+def _detect_access_challenge(page) -> str:
+    try:
+        title = str(page.title() or "").strip().lower()
+    except Exception:
+        title = ""
+    try:
+        body_text = str(page.locator("body").inner_text(timeout=1500) or "").strip().lower()
+    except Exception:
+        body_text = ""
+    haystack = " ".join([title, body_text])
+    challenge_markers = [
+        "are you human",
+        "verify you are human",
+        "captcha",
+        "bot",
+        "robot",
+        "unusual traffic",
+        "access denied",
+        "비정상적인 접근",
+        "접속할 수 없습니다",
+        "봇인지 확인",
+        "자동화된",
+        "차단",
+    ]
+    for marker in challenge_markers:
+        if marker in haystack:
+            return marker
+    return ""
+
+
+def _show_target_overlay(page, bbox: Dict[str, int], marker_index: int, meta: Dict[str, object], phase: str = "target") -> None:
+    try:
+        label = str(meta.get("target_id", "")).strip() or str(meta.get("text", "")).strip() or str(meta.get("selector", "")).strip()
+        label = label[:72]
+        page.evaluate(
+            """
+            ({ bbox, markerIndex, label, phase }) => {
+              const overlayId = "__qaAutoTargetOverlay";
+              let root = document.getElementById(overlayId);
+              if (!root) {
+                root = document.createElement("div");
+                root.id = overlayId;
+                root.style.position = "fixed";
+                root.style.inset = "0";
+                root.style.pointerEvents = "none";
+                root.style.zIndex = "2147483645";
+                document.documentElement.appendChild(root);
+              }
+              root.innerHTML = "";
+              const x = Math.max(0, Number(bbox.x || 0));
+              const y = Math.max(0, Number(bbox.y || 0));
+              const width = Math.max(0, Number(bbox.width || 0));
+              const height = Math.max(0, Number(bbox.height || 0));
+              const box = document.createElement("div");
+              box.style.position = "fixed";
+              box.style.left = `${x}px`;
+              box.style.top = `${y}px`;
+              box.style.width = `${width}px`;
+              box.style.height = `${height}px`;
+              box.style.boxSizing = "border-box";
+              box.style.border = phase === "clicked" ? "4px solid #16a34a" : "4px solid #ef4444";
+              box.style.boxShadow = phase === "clicked"
+                ? "0 0 0 3px rgba(255,255,255,.92), 0 0 0 8px rgba(22,163,74,.35)"
+                : "0 0 0 3px rgba(255,255,255,.92), 0 0 0 8px rgba(239,68,68,.28)";
+              box.style.background = phase === "clicked" ? "rgba(22,163,74,.08)" : "rgba(239,68,68,.08)";
+              box.style.borderRadius = "8px";
+              root.appendChild(box);
+
+              const badge = document.createElement("div");
+              badge.textContent = `#${markerIndex} ${label}`;
+              badge.style.position = "fixed";
+              badge.style.left = `${Math.max(8, x)}px`;
+              badge.style.top = `${Math.max(8, y - 34)}px`;
+              badge.style.maxWidth = "420px";
+              badge.style.padding = "6px 10px";
+              badge.style.borderRadius = "999px";
+              badge.style.background = phase === "clicked" ? "#16a34a" : "#ef4444";
+              badge.style.color = "#fff";
+              badge.style.font = "700 12px/1.2 -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+              badge.style.boxShadow = "0 8px 24px rgba(15,23,42,.28)";
+              badge.style.whiteSpace = "nowrap";
+              badge.style.overflow = "hidden";
+              badge.style.textOverflow = "ellipsis";
+              root.appendChild(badge);
+
+              clearTimeout(window.__qaAutoTargetOverlayTimer);
+              window.__qaAutoTargetOverlayTimer = setTimeout(() => {
+                const current = document.getElementById(overlayId);
+                if (current) current.innerHTML = "";
+              }, phase === "clicked" ? 1800 : 1400);
+            }
+            """,
+            {
+                "bbox": {
+                    "x": int(bbox.get("bbox_x", 0)),
+                    "y": int(bbox.get("bbox_y", 0)),
+                    "width": int(bbox.get("bbox_width", 0)),
+                    "height": int(bbox.get("bbox_height", 0)),
+                },
+                "markerIndex": int(marker_index),
+                "label": label,
+                "phase": str(phase or "target"),
+            },
+        )
+    except Exception:
+        return
+
+
+def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop_event: threading.Event) -> str:
     settings = _normalize_run_settings(run_settings)
     definition_targets = _get_definition_event_targets(settings)
     definition_hints = _get_definition_runtime_hints(settings)
@@ -1035,6 +1249,20 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
     clicked_count = 0
 
     while not stop_event.is_set() and clicked_count < max_auto_clicks:
+        challenge_reason = _detect_access_challenge(page)
+        if challenge_reason:
+            _emit_auto_crawl_event(
+                session_id,
+                "auto_crawl_blocked",
+                page.url,
+                {
+                    "reason": "access_challenge_detected",
+                    "challenge_marker": challenge_reason,
+                    "auto_click_index": clicked_count,
+                    "run_mode": "Auto Crawl",
+                },
+            )
+            return "challenge_detected"
         target_names, matched_names, definition_done = _get_definition_progress(session_id, settings)
         if definition_done:
             _emit_auto_crawl_event(
@@ -1048,7 +1276,7 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                     "run_mode": "Auto Crawl",
                 },
             )
-            break
+            return "definition_targets_reached"
         try:
             page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:
@@ -1061,13 +1289,16 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
             handles = page.locator(selector).element_handles()
             for handle in handles:
                 try:
-                    bbox = handle.bounding_box()
-                    if not bbox:
-                        continue
-                    if float(bbox.get("width", 0)) < 6 or float(bbox.get("height", 0)) < 6:
-                        continue
                     meta = _extract_candidate_metadata(handle)
                     if not meta:
+                        continue
+                    bbox = {
+                        "x": float(meta.get("bbox_x", 0) or 0),
+                        "y": float(meta.get("bbox_y", 0) or 0),
+                        "width": float(meta.get("bbox_width", 0) or 0),
+                        "height": float(meta.get("bbox_height", 0) or 0),
+                    }
+                    if float(bbox.get("width", 0)) < 12 or float(bbox.get("height", 0)) < 12:
                         continue
                     if definition_targets and not _candidate_matches_definition(meta, definition_hints):
                         continue
@@ -1092,6 +1323,20 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                 break
 
         if selected_handle is None:
+            challenge_reason = _detect_access_challenge(page)
+            if challenge_reason:
+                _emit_auto_crawl_event(
+                    session_id,
+                    "auto_crawl_blocked",
+                    page.url,
+                    {
+                        "reason": "access_challenge_detected",
+                        "challenge_marker": challenge_reason,
+                        "auto_click_index": clicked_count,
+                        "run_mode": "Auto Crawl",
+                    },
+                )
+                return "challenge_detected"
             _emit_auto_crawl_event(
                 session_id,
                 "auto_crawl_idle",
@@ -1103,7 +1348,7 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                     "run_mode": "Auto Crawl",
                 },
             )
-            break
+            return "idle"
 
         clicked_count += 1
         seen_pattern_keys.add(str(selected_meta.get("pattern_key", "")).strip())
@@ -1116,6 +1361,12 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
 
         try:
             selected_handle.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+
+        _show_target_overlay(page, selected_bbox, clicked_count + 1, selected_meta, phase="target")
+        try:
+            page.wait_for_timeout(280)
         except Exception:
             pass
 
@@ -1148,6 +1399,14 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                 selected_handle.click(timeout=2500, force=True)
         except Exception as exc:
             click_reason = f"error:{exc}"
+
+        _show_target_overlay(
+            page,
+            selected_bbox,
+            clicked_count,
+            selected_meta,
+            phase="clicked" if click_reason == "clicked" else "target",
+        )
 
         _emit_auto_crawl_event(
             session_id,
@@ -1210,7 +1469,7 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                         "auto_click_index": clicked_count,
                     },
                 )
-                break
+                return "definition_targets_reached"
 
         if single_page_only and _build_compare_key(page.url) != start_compare_key:
             try:
@@ -1232,6 +1491,8 @@ def _run_auto_crawl(page, session_id: str, run_settings: Dict[str, object], stop
                 "run_mode": "Auto Crawl",
             },
         )
+        return "max_auto_clicks_reached"
+    return "stopped"
 
 
 def _run_debug_session(session_id: str) -> None:
@@ -1314,26 +1575,28 @@ def _run_debug_session(session_id: str) -> None:
 
             context.on("request", on_request)
 
-            test_url = _append_query(
-                session.target_url,
-                {"qa_debug_mode": "1", "qa_debug_session_id": session_id},
-            )
             page = context.new_page()
-            page.goto(test_url, wait_until="domcontentloaded")
+            page.goto(session.target_url, wait_until="domcontentloaded")
             page.bring_to_front()
 
             if run_settings.get("auto_crawl_enabled", True):
                 try:
                     page.wait_for_timeout(1200)
-                    _run_auto_crawl(page, session_id, run_settings, session.stop_event)
+                    crawl_outcome = _run_auto_crawl(page, session_id, run_settings, session.stop_event)
                 except Exception as exc:
+                    crawl_outcome = "error"
                     _emit_auto_crawl_event(
                         session_id,
                         "auto_crawl_error",
                         page.url,
                         {"reason": str(exc), "run_mode": "Auto Crawl"},
                     )
-                if run_settings.get("auto_stop_after_crawl", True):
+                if crawl_outcome == "challenge_detected":
+                    _set_session_fields(
+                        session_id,
+                        last_error="접근 제한/봇 확인 페이지가 감지되어 브라우저를 열어둔 채 대기합니다. 확인 후 Stop Test로 종료하세요.",
+                    )
+                elif run_settings.get("auto_stop_after_crawl", True):
                     session.stop_event.set()
 
             while not session.stop_event.is_set():

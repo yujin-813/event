@@ -551,6 +551,14 @@ def _clean_definition_cell(value: object) -> str:
     return str(value).replace("\ufeff", "").replace("\xa0", " ").strip()
 
 
+def _preserve_definition_cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value).replace("\ufeff", "")
+
+
 def _normalize_definition_header(value: object) -> str:
     text = _clean_definition_cell(value)
     if not text:
@@ -731,6 +739,7 @@ def _analyze_definition_matrix(raw_df: pd.DataFrame) -> Dict[str, object]:
                 continue
             if col_idx >= len(param_values):
                 continue
+            raw_cell_text = _preserve_definition_cell_text(param_values[col_idx])
             cell_text = _clean_definition_cell(param_values[col_idx])
             if not cell_text:
                 continue
@@ -738,7 +747,7 @@ def _analyze_definition_matrix(raw_df: pd.DataFrame) -> Dict[str, object]:
             if not param_name or param_name in required_params:
                 continue
             required_params.append(param_name)
-            param_value_map[param_name] = cell_text
+            param_value_map[param_name] = raw_cell_text
         event_meta = dict(event_row)
         event_meta["param_values"] = param_value_map
         _merge_definition_schema_entry(
@@ -1095,7 +1104,11 @@ def _iter_definition_cases(schemas: Dict[str, Dict[str, object]]) -> List[Dict[s
                     "required": [str(v).strip() for v in case.get("required", []) if str(v).strip()],
                     "optional": [str(v).strip() for v in case.get("optional", []) if str(v).strip()],
                     "parameter_columns": [str(v).strip() for v in case.get("parameter_columns", []) if str(v).strip()],
-                    "param_values": {str(k).strip(): str(v).strip() for k, v in param_values.items() if str(k).strip() and str(v).strip()},
+                    "param_values": {
+                        str(k).strip(): _preserve_definition_cell_text(v)
+                        for k, v in param_values.items()
+                        if str(k).strip() and _preserve_definition_cell_text(v) != ""
+                    },
                 }
             )
     return rows
@@ -1330,11 +1343,13 @@ def build_definition_validation_frames(
         "no",
         "event_name",
         "description",
+        "captured_event_no",
         "matched_at",
         "target_id",
         "section_name",
         "page_id",
         "matched_identification",
+        "screenshot_file",
         "match_score",
         "result",
         "failure_type",
@@ -1414,11 +1429,13 @@ def build_definition_validation_frames(
                 "no": str(best_case.get("no", "")).strip(),
                 "event_name": event_name,
                 "description": str(best_case.get("description", "")).strip(),
+                "captured_event_no": str(row.get("annotation_no", row.get("event no", ""))).strip() or "-",
                 "matched_at": str(row.get("시간", "-")).strip() or "-",
                 "target_id": str(row.get("target_id", "-")).strip() or "-",
                 "section_name": str(row.get("section_name", "-")).strip() or "-",
                 "page_id": str(row.get("page_id", "-")).strip() or "-",
                 "matched_identification": _build_rt_event_identification(row),
+                "screenshot_file": str(row.get("screenshot_path", row.get("selector_screenshot", "-"))).strip() or "-",
                 "match_score": round(float(best_score.get("score", 0.0)), 2),
                 "result": str(validation.get("status", "WARN")).upper(),
                 "failure_type": str(validation.get("failure_type", "ok")).strip() or "ok",
@@ -1949,10 +1966,25 @@ def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
             for sheet_name, df in sheets.items():
                 safe_sheet = str(sheet_name or "Sheet1")[:31]
                 df_to_write = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+                if not df_to_write.empty:
+                    df_to_write = df_to_write.copy()
+                    df_to_write.columns = [to_excel_safe_text(col) for col in df_to_write.columns]
+                    for col in df_to_write.columns:
+                        series = df_to_write[col]
+                        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+                            df_to_write[col] = series.map(lambda value: to_excel_safe_text(value) if value is not None else "")
                 df_to_write.to_excel(writer, index=False, sheet_name=safe_sheet)
         return out.getvalue()
-    except Exception:
-        return b""
+    except Exception as exc:
+        fallback = io.BytesIO()
+        with pd.ExcelWriter(fallback, engine="openpyxl") as writer:
+            pd.DataFrame(
+                [
+                    {"status": "export_failed", "reason": to_excel_safe_text(exc)},
+                    {"status": "sheets", "reason": ", ".join([to_excel_safe_text(name) for name in sheets.keys()])},
+                ]
+            ).to_excel(writer, index=False, sheet_name="ExportError")
+        return fallback.getvalue()
 
 
 def _parse_pipe_kv_text(text: object) -> Dict[str, str]:
@@ -2110,13 +2142,22 @@ def build_qa_review_excel_bytes(
 def build_log_definition_excel_bytes(
     event_definition_df: pd.DataFrame,
     event_detail_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]] | None = None,
+    definition_matches_df: pd.DataFrame | None = None,
 ) -> bytes:
+    review_df, _, _records, _unmatched = build_log_definition_export_tables(
+        event_definition_df=event_definition_df,
+        event_detail_df=event_detail_df,
+        schemas=schemas,
+        definition_matches_df=definition_matches_df,
+    )
     wb = Workbook()
     default_ws = wb.active
     wb.remove(default_ws)
-    if event_definition_df.empty:
+    if review_df.empty:
         ws = wb.create_sheet("log_definition")
-        ws["A1"] = to_excel_safe_text("데이터가 없습니다.")
+        ws["A1"] = to_excel_safe_text("생성 가능한 로그정의서 데이터가 없습니다.")
+        ws["A2"] = to_excel_safe_text("이벤트 매칭 성공 건이 있으면 파라미터 FAIL/WARN이어도 로그정의서를 생성합니다.")
         out = io.BytesIO()
         wb.save(out)
         return out.getvalue()
@@ -2129,7 +2170,7 @@ def build_log_definition_excel_bytes(
                 detail_map[event_no] = row
 
     grouped_rows: List[Tuple[str, pd.DataFrame]] = []
-    work = event_definition_df.copy()
+    work = review_df.copy()
     work["sheet_group"] = work["screenshot_file"].astype(str).replace("-", "").str.strip()
     current_group = ""
     group_keys: List[str] = []
@@ -2144,16 +2185,20 @@ def build_log_definition_excel_bytes(
     for group_key in group_keys or sorted(work["sheet_group"].astype(str).unique().tolist()):
         grouped_rows.append((group_key, work[work["sheet_group"].astype(str) == str(group_key)].copy()))
 
+    created_sheet = False
     for idx, (group_key, group_df) in enumerate(grouped_rows, start=1):
+        if group_df.empty:
+            continue
         event_start_rows = group_df[group_df["no"].astype(str).str.strip() != ""].copy()
         first_no = str(event_start_rows.iloc[0]["no"]).strip() if not event_start_rows.empty else ""
         detail = detail_map.get(first_no, {})
-        section_name = str(detail.get("section_name", "")).strip() or str(group_df.iloc[0].get("section_name", "")).strip() or "review"
+        first_group_row = group_df.iloc[0].to_dict() if not group_df.empty else {}
+        section_name = str(detail.get("section_name", "")).strip() or str(first_group_row.get("section_name", "")).strip() or "review"
         sheet_name = to_excel_safe_text(f"{section_name}_{idx}")[:31] or f"review_{idx}"
         ws = wb.create_sheet(sheet_name)
         ws["A1"] = to_excel_safe_text("로그정의서 생성")
         ws["A1"].font = Font(bold=True, size=14)
-        screenshot_rel = str(detail.get("screenshot_file", "")).strip() or str(group_df.iloc[0].get("screenshot_file", "")).strip()
+        screenshot_rel = str(detail.get("screenshot_file", "")).strip() or str(first_group_row.get("screenshot_file", "")).strip()
         cursor = 3
         screenshot_abs = BASE_DIR / screenshot_rel if screenshot_rel and screenshot_rel != "-" else None
         if screenshot_abs and screenshot_abs.exists():
@@ -2174,13 +2219,13 @@ def build_log_definition_excel_bytes(
         headers = [
             "action",
             "object",
-            "event name",
+            "event_name",
             "params.key",
-            "req",
+            "required",
             "params.value (as-is)",
             "params.value",
-            "class-attribute",
-            "status",
+            "class_attribute",
+            "qa_status",
         ]
         for col_idx, header in enumerate(headers, start=1):
             cell = ws.cell(row=cursor, column=col_idx, value=to_excel_safe_text(header))
@@ -2199,9 +2244,955 @@ def build_log_definition_excel_bytes(
         ws.column_dimensions["G"].width = 28
         ws.column_dimensions["H"].width = 22
         ws.column_dimensions["I"].width = 14
+        created_sheet = True
+    if not created_sheet:
+        ws = wb.create_sheet("log_definition")
+        ws["A1"] = to_excel_safe_text("생성 가능한 로그정의서 시트가 없습니다.")
+        ws["A2"] = to_excel_safe_text("정의서 매칭 성공 건이 없거나 그룹화 가능한 screenshot 정보가 없습니다.")
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
+
+
+def _sanitize_export_filename_part(text: object, default: str = "item") -> str:
+    raw = str(text or "").strip().lower()
+    safe = re.sub(r"[^0-9a-zA-Z가-힣]+", "_", raw).strip("_")
+    return safe[:48] or default
+
+
+def build_annotation_export_relpath(no: object, identification: object) -> str:
+    no_text = str(no or "").strip() or "0"
+    ident_text = _sanitize_export_filename_part(identification, default="event")
+    return f"annotations/{no_text}_{ident_text}.png"
+
+
+def normalize_expected_param_value(raw_value: object) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    if ">>" in text:
+        return str(text.split(">>")[-1]).strip()
+    return text
+
+
+def _build_definition_case_lookup(schemas: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
+    return {
+        str(case.get("definition_row_id", "")).strip(): case
+        for case in _iter_definition_cases(schemas)
+        if str(case.get("definition_row_id", "")).strip()
+    }
+
+
+def _build_captured_event_case_map(
+    definition_matches_df: pd.DataFrame | None,
+    schemas: Dict[str, Dict[str, object]] | None,
+) -> Dict[str, Dict[str, object]]:
+    if not isinstance(definition_matches_df, pd.DataFrame) or definition_matches_df.empty:
+        return {}
+    case_lookup = _build_definition_case_lookup(schemas or {})
+    if not case_lookup:
+        return {}
+    ranked = definition_matches_df.copy()
+    rank_map = {"PASS": 3, "WARN": 2, "FAIL": 1}
+    ranked["rank"] = ranked.get("result", pd.Series(dtype=str)).astype(str).map(rank_map).fillna(0)
+    ranked["match_score"] = pd.to_numeric(ranked.get("match_score", 0), errors="coerce").fillna(0)
+    ranked = ranked.sort_values(by=["rank", "match_score"], ascending=[False, False])
+    out: Dict[str, Dict[str, object]] = {}
+    for row in ranked.to_dict("records"):
+        captured_event_no = str(row.get("captured_event_no", "")).strip()
+        definition_row_id = str(row.get("definition_row_id", "")).strip()
+        if not captured_event_no or captured_event_no in out:
+            continue
+        matched_case = case_lookup.get(definition_row_id)
+        if matched_case:
+            out[captured_event_no] = matched_case
+    return out
+
+
+def _build_detail_param_map(detail_row: Dict[str, object]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    out.update(_parse_pipe_kv_text(detail_row.get("custom_parameters", "")))
+    out.update(_parse_pipe_kv_text(detail_row.get("extra_custom_parameters", "")))
+    raw_payload = str(detail_row.get("raw_payload_json", "")).strip()
+    if raw_payload:
+        try:
+            payload_obj = json.loads(raw_payload)
+            if isinstance(payload_obj, dict):
+                for key, value in payload_obj.items():
+                    key_text = str(key).strip()
+                    if key_text and key_text not in out:
+                        out[key_text] = _to_text_value(value)
+        except Exception:
+            pass
+    return out
+
+
+def build_log_definition_export_tables(
+    event_definition_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]] | None = None,
+    definition_matches_df: pd.DataFrame | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, object]], List[Dict[str, object]]]:
+    final_columns = [
+        "no",
+        "이벤트 설명",
+        "action",
+        "object",
+        "event_name",
+        "section_name",
+        "section_index",
+        "params.key",
+        "required",
+        "params.value (as-is)",
+        "params.value",
+        "actual_value",
+        "qa_status",
+        "issue_type",
+        "trigger",
+        "qa_note",
+        "screenshot_file",
+        "selector",
+        "class_attribute",
+    ]
+    support_columns = [
+        "no",
+        "event_name",
+        "identification",
+        "target_id",
+        "section_name",
+        "page_id",
+        "status",
+        "custom_parameters",
+        "extra_custom_parameters",
+        "raw_payload_json",
+        "raw_selector",
+        "screenshot_path",
+        "class_attribute",
+        "bbox_x",
+        "bbox_y",
+        "bbox_width",
+        "bbox_height",
+    ]
+    if event_definition_df.empty or event_detail_df.empty:
+        return pd.DataFrame(columns=final_columns), pd.DataFrame(columns=support_columns), [], []
+
+    detail_map: Dict[str, Dict[str, object]] = {}
+    for row in event_detail_df.to_dict("records"):
+        event_no = str(row.get("event no", "")).strip()
+        if event_no and event_no not in detail_map:
+            detail_map[event_no] = row
+    case_lookup = _build_definition_case_lookup(schemas or {})
+    if isinstance(definition_matches_df, pd.DataFrame) and case_lookup:
+        ranked = definition_matches_df.copy()
+        rank_map = {"PASS": 3, "WARN": 2, "FAIL": 1}
+        ranked["rank"] = ranked.get("result", pd.Series(dtype=str)).astype(str).map(rank_map).fillna(0)
+        ranked["match_score"] = pd.to_numeric(ranked.get("match_score", 0), errors="coerce").fillna(0)
+        ranked = ranked.sort_values(by=["rank", "match_score"], ascending=[False, False])
+
+        final_rows: List[Dict[str, object]] = []
+        support_rows: List[Dict[str, object]] = []
+        html_records: List[Dict[str, object]] = []
+        unmatched_records: List[Dict[str, object]] = []
+        matched_definition_ids: set[str] = set()
+        for match_row in ranked.groupby("definition_row_id", as_index=False).first().to_dict("records") if not ranked.empty else []:
+            definition_row_id = str(match_row.get("definition_row_id", "")).strip()
+            captured_event_no = str(match_row.get("captured_event_no", "")).strip()
+            if not definition_row_id or not captured_event_no:
+                continue
+            case = case_lookup.get(definition_row_id, {})
+            detail = detail_map.get(captured_event_no, {})
+            if not case or not detail:
+                continue
+            matched_definition_ids.add(definition_row_id)
+            param_values = case.get("param_values", {}) if isinstance(case.get("param_values", {}), dict) else {}
+            required_keys = {str(v).strip() for v in case.get("required", []) if str(v).strip()}
+            parameter_keys = list(
+                dict.fromkeys(
+                    [str(v).strip() for v in case.get("required", []) if str(v).strip()]
+                    + [str(v).strip() for v in case.get("optional", []) if str(v).strip()]
+                    + [str(v).strip() for v in case.get("parameter_columns", []) if str(v).strip()]
+                    + [str(v).strip() for v in param_values.keys() if str(v).strip()]
+                )
+            )
+            actual_map = _build_detail_param_map(detail)
+            display_no = captured_event_no
+            parameter_rows: List[Dict[str, object]] = []
+            for param_name in parameter_keys:
+                expected_raw = str(param_values.get(param_name, "")).strip()
+                expected_value = normalize_expected_param_value(expected_raw) or "-"
+                actual_value = str(actual_map.get(param_name, "")).strip()
+                issue_type = "ok"
+                qa_status = str(match_row.get("result", detail.get("status", "-"))).strip() or "-"
+                if param_name in required_keys and _is_missing_like_value(actual_value):
+                    qa_status = "FAIL"
+                    issue_type = "missing_parameter"
+                elif expected_value != "-" and not _is_definition_placeholder_value(expected_value) and actual_value and actual_value != expected_value:
+                    qa_status = "WARN"
+                    issue_type = "value_mismatch"
+                elif _is_missing_like_value(actual_value):
+                    qa_status = "WARN"
+                    issue_type = "missing_parameter"
+                parameter_rows.append(
+                    {
+                        "params.key": param_name,
+                        "req": "Y" if param_name in required_keys else "N",
+                        "params.value (as-is)": expected_raw or "-",
+                        "params.value": expected_value,
+                        "actual_value": actual_value or "-",
+                        "status": qa_status,
+                        "issue_type": issue_type,
+                    }
+                )
+                final_rows.append(
+                    {
+                        "no": display_no,
+                        "이벤트 설명": str(case.get("description", detail.get("identification", "-"))).strip() or "-",
+                        "action": str(case.get("action", detail.get("action", "-"))).strip() or "-",
+                        "object": str(case.get("object", detail.get("object", "-"))).strip() or "-",
+                        "event_name": str(case.get("event_name", detail.get("custom_event", "-"))).strip() or "-",
+                        "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                        "section_index": actual_map.get("section_index", "-") or "-",
+                        "params.key": param_name,
+                        "required": "Y" if param_name in required_keys else "N",
+                        "params.value (as-is)": expected_raw or "-",
+                        "params.value": expected_value,
+                        "actual_value": actual_value or "-",
+                        "qa_status": qa_status,
+                        "issue_type": issue_type,
+                        "trigger": str(match_row.get("matched_identification", detail.get("identification", "-"))).strip() or "-",
+                        "qa_note": str(match_row.get("failure_reason", detail.get("status", "-"))).strip() or "-",
+                        "screenshot_file": str(detail.get("screenshot_file", "-")).strip() or "-",
+                        "selector": str(detail.get("selector", "-")).strip() or "-",
+                        "class_attribute": str(detail.get("class_attribute", "-")).strip() or "-",
+                    }
+                )
+            support_rows.append(
+                {
+                    "no": display_no,
+                    "event_name": str(case.get("event_name", detail.get("custom_event", "-"))).strip() or "-",
+                    "identification": str(case.get("description", detail.get("identification", "-"))).strip() or "-",
+                    "target_id": str(detail.get("target_id", "-")).strip() or "-",
+                    "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                    "page_id": str(detail.get("page_id", "-")).strip() or "-",
+                    "status": str(match_row.get("result", detail.get("status", "-"))).strip() or "-",
+                    "custom_parameters": str(detail.get("custom_parameters", "-")).strip() or "-",
+                    "extra_custom_parameters": str(detail.get("extra_custom_parameters", "-")).strip() or "-",
+                    "raw_payload_json": str(detail.get("raw_payload_json", "{}")).strip() or "{}",
+                    "raw_selector": str(detail.get("selector", "-")).strip() or "-",
+                    "screenshot_path": str(detail.get("screenshot_file", "-")).strip() or "-",
+                    "class_attribute": str(detail.get("class_attribute", "-")).strip() or "-",
+                    "bbox_x": detail.get("bbox_x", 0),
+                    "bbox_y": detail.get("bbox_y", 0),
+                    "bbox_width": detail.get("bbox_width", 0),
+                    "bbox_height": detail.get("bbox_height", 0),
+                }
+            )
+            html_records.append(
+                {
+                    "no": display_no,
+                    "event_name": str(case.get("event_name", detail.get("custom_event", "-"))).strip() or "-",
+                    "identification": str(case.get("description", detail.get("identification", "-"))).strip() or "-",
+                    "record_type": "definition_match",
+                    "definition_row_id": definition_row_id,
+                    "definition_no": str(case.get("no", "")).strip() or "-",
+                    "match_status": str(match_row.get("result", detail.get("status", "-"))).strip() or "-",
+                    "target_id": str(detail.get("target_id", "-")).strip() or "-",
+                    "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                    "page_id": str(detail.get("page_id", "-")).strip() or "-",
+                    "status": str(match_row.get("result", detail.get("status", "-"))).strip() or "-",
+                    "custom_parameters": str(detail.get("custom_parameters", "-")).strip() or "-",
+                    "extra_custom_parameters": str(detail.get("extra_custom_parameters", "-")).strip() or "-",
+                    "raw_payload_json": str(detail.get("raw_payload_json", "{}")).strip() or "{}",
+                    "raw_selector": str(detail.get("selector", "-")).strip() or "-",
+                    "screenshot_file": str(detail.get("screenshot_file", "-")).strip() or "-",
+                    "parameter_rows": parameter_rows,
+                }
+            )
+        for definition_row_id, case in case_lookup.items():
+            if definition_row_id in matched_definition_ids:
+                continue
+            unmatched_records.append(
+                {
+                    "definition_row_id": definition_row_id,
+                    "definition_no": str(case.get("no", "")).strip() or "-",
+                    "event_name": str(case.get("event_name", "")).strip() or "-",
+                    "description": str(case.get("description", "")).strip() or "-",
+                    "page_id": str((case.get("param_values", {}) or {}).get("page_id", "")).strip() or "-",
+                    "section_name": str((case.get("param_values", {}) or {}).get("section_name", "")).strip() or "-",
+                    "match_status": "UNMATCHED",
+                }
+            )
+        return (
+            pd.DataFrame(final_rows, columns=final_columns),
+            pd.DataFrame(support_rows, columns=support_columns),
+            html_records,
+            unmatched_records,
+        )
+    matched_case_by_event_no = _build_captured_event_case_map(definition_matches_df, schemas)
+
+    current_event: Dict[str, object] = {}
+    final_rows: List[Dict[str, object]] = []
+    support_rows: List[Dict[str, object]] = []
+    html_record_map: Dict[str, Dict[str, object]] = {}
+    added_support_nos: set[str] = set()
+    for row in event_definition_df.to_dict("records"):
+        row_no = str(row.get("no", "")).strip()
+        if row_no:
+            current_event = dict(row)
+            current_event["no"] = row_no
+        if not current_event:
+            continue
+        event_no = str(current_event.get("no", "")).strip()
+        detail = detail_map.get(event_no, {})
+        if not detail:
+            continue
+        actual_map = _build_detail_param_map(detail)
+        matched_case = matched_case_by_event_no.get(event_no, {})
+        matched_case_param_values = matched_case.get("param_values", {}) if isinstance(matched_case.get("param_values", {}), dict) else {}
+        param_name = str(row.get("params.key", "")).strip()
+        if not param_name:
+            continue
+        expected_raw = (
+            str(matched_case_param_values.get(param_name, "")).strip()
+            or str(row.get("params.value (as-is)", "")).strip()
+            or str(row.get("params.value", "")).strip()
+        )
+        expected_value = normalize_expected_param_value(expected_raw) or str(row.get("params.value", "")).strip()
+        actual_value = actual_map.get(param_name, "")
+        issue_type = "ok"
+        qa_status = str(detail.get("status", "-")).strip() or "-"
+        if _is_missing_like_value(str(actual_value)):
+            qa_status = "FAIL"
+            issue_type = "missing_parameter"
+        elif expected_value and not _is_definition_placeholder_value(expected_value) and actual_value and expected_value != actual_value:
+            qa_status = "WARN"
+            issue_type = "value_mismatch"
+        matched_description = str(matched_case.get("description", "")).strip()
+        event_description = matched_description or str(detail.get("identification", detail.get("custom_event", "-"))).strip() or "-"
+        required_flag = str(row.get("req", "")).strip()
+        if not required_flag and matched_case:
+            required_flag = "Y" if param_name in {str(v).strip() for v in matched_case.get("required", []) if str(v).strip()} else "N"
+        final_rows.append(
+            {
+                "no": event_no,
+                "이벤트 설명": event_description,
+                "action": str(current_event.get("action", detail.get("action", "-"))).strip() or "-",
+                "object": str(current_event.get("object", detail.get("object", "-"))).strip() or "-",
+                "event_name": str(current_event.get("event name", detail.get("custom_event", "-"))).strip() or "-",
+                "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                "section_index": actual_map.get("section_index", "-") or "-",
+                "params.key": param_name,
+                "required": required_flag or "N",
+                "params.value (as-is)": expected_raw or "-",
+                "params.value": expected_value or "-",
+                "actual_value": actual_value or "-",
+                "qa_status": qa_status,
+                "issue_type": issue_type,
+                "trigger": str(detail.get("identification", "-")).strip() or "-",
+                "qa_note": str(detail.get("status", "-")).strip() or "-",
+                "screenshot_file": str(detail.get("screenshot_file", "-")).strip() or "-",
+                "selector": str(detail.get("selector", "-")).strip() or "-",
+                "class_attribute": str(detail.get("class_attribute", "-")).strip() or "-",
+            }
+        )
+        if event_no not in added_support_nos:
+            support_rows.append(
+                {
+                    "no": event_no,
+                    "event_name": str(detail.get("custom_event", detail.get("event_name", "-"))).strip() or "-",
+                    "identification": str(detail.get("identification", "-")).strip() or "-",
+                    "target_id": str(detail.get("target_id", "-")).strip() or "-",
+                    "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                    "page_id": str(detail.get("page_id", "-")).strip() or "-",
+                    "status": str(detail.get("status", "-")).strip() or "-",
+                    "custom_parameters": str(detail.get("custom_parameters", "-")).strip() or "-",
+                    "extra_custom_parameters": str(detail.get("extra_custom_parameters", "-")).strip() or "-",
+                    "raw_payload_json": str(detail.get("raw_payload_json", "{}")).strip() or "{}",
+                    "raw_selector": str(detail.get("selector", "-")).strip() or "-",
+                    "screenshot_path": str(detail.get("screenshot_file", "-")).strip() or "-",
+                    "class_attribute": str(detail.get("class_attribute", "-")).strip() or "-",
+                    "bbox_x": detail.get("bbox_x", 0),
+                    "bbox_y": detail.get("bbox_y", 0),
+                    "bbox_width": detail.get("bbox_width", 0),
+                    "bbox_height": detail.get("bbox_height", 0),
+                }
+            )
+            html_record_map[event_no] = (
+                {
+                    "no": event_no,
+                    "event_name": str(detail.get("custom_event", detail.get("event_name", "-"))).strip() or "-",
+                    "identification": event_description,
+                    "record_type": "captured_event",
+                    "definition_row_id": "-",
+                    "definition_no": "-",
+                    "match_status": str(detail.get("status", "-")).strip() or "-",
+                    "target_id": str(detail.get("target_id", "-")).strip() or "-",
+                    "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                    "page_id": str(detail.get("page_id", "-")).strip() or "-",
+                    "status": str(detail.get("status", "-")).strip() or "-",
+                    "custom_parameters": str(detail.get("custom_parameters", "-")).strip() or "-",
+                    "extra_custom_parameters": str(detail.get("extra_custom_parameters", "-")).strip() or "-",
+                    "raw_payload_json": str(detail.get("raw_payload_json", "{}")).strip() or "{}",
+                    "raw_selector": str(detail.get("selector", "-")).strip() or "-",
+                    "screenshot_file": str(detail.get("screenshot_file", "-")).strip() or "-",
+                    "parameter_rows": [],
+                }
+            )
+            added_support_nos.add(event_no)
+        html_record_map.setdefault(
+            event_no,
+            {
+                "no": event_no,
+                "event_name": str(current_event.get("event name", detail.get("custom_event", "-"))).strip() or "-",
+                "identification": event_description,
+                "record_type": "captured_event",
+                "definition_row_id": "-",
+                "definition_no": "-",
+                "match_status": str(detail.get("status", "-")).strip() or "-",
+                "target_id": str(detail.get("target_id", "-")).strip() or "-",
+                "section_name": str(detail.get("section_name", "-")).strip() or "-",
+                "page_id": str(detail.get("page_id", "-")).strip() or "-",
+                "status": str(detail.get("status", "-")).strip() or "-",
+                "custom_parameters": str(detail.get("custom_parameters", "-")).strip() or "-",
+                "extra_custom_parameters": str(detail.get("extra_custom_parameters", "-")).strip() or "-",
+                "raw_payload_json": str(detail.get("raw_payload_json", "{}")).strip() or "{}",
+                "raw_selector": str(detail.get("selector", "-")).strip() or "-",
+                "screenshot_file": str(detail.get("screenshot_file", "-")).strip() or "-",
+                "parameter_rows": [],
+            },
+        )
+        html_record_map[event_no]["parameter_rows"].append(
+            {
+                "params.key": param_name,
+                "req": required_flag or "N",
+                "params.value (as-is)": expected_raw or "-",
+                "params.value": expected_value or "-",
+                "actual_value": actual_value or "-",
+                "status": qa_status,
+            }
+        )
+    return (
+        pd.DataFrame(final_rows, columns=final_columns),
+        pd.DataFrame(support_rows, columns=support_columns),
+        list(html_record_map.values()),
+        [],
+    )
+
+
+def build_log_definition_review_html(records: List[Dict[str, object]], unmatched_records: List[Dict[str, object]] | None = None) -> str:
+    unmatched_records = unmatched_records or []
+    if not records and not unmatched_records:
+        return """<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>event_definition_review</title></head><body><p>데이터가 없습니다.</p></body></html>"""
+    first_no = str(records[0].get("no", "")).strip() if records else "1"
+    nav_html = "".join(
+        [
+            f'<button type="button" class="annotation-chip{" active" if idx == 0 else ""}" data-select-no="{html.escape(str(row.get("no", "")))}">{html.escape(str(row.get("no", "")))}</button>'
+            for idx, row in enumerate(records)
+        ]
+    )
+    card_html = "".join(
+        [
+            (
+                lambda param_rows_html, issue_summary_html: f"""
+            <article class="event-card{' active' if idx == 0 else ''}" id="card-{html.escape(str(row.get('no', '')))}" data-no="{html.escape(str(row.get('no', '')))}">
+              <button type="button" class="card-button" data-select-no="{html.escape(str(row.get('no', '')))}">
+                <div class="card-head">
+                  <div class="event-number">#{html.escape(str(row.get('no', '')))}</div>
+                  <div>
+                    <h2>{html.escape(str(row.get('event_name', '-')))}</h2>
+                    <p>{html.escape(str(row.get('identification', '-')))}</p>
+                  </div>
+                  <span class="status">{html.escape(str(row.get('status', '-')))}</span>
+                </div>
+                <section class="card-section">
+                  <h3>매칭 구분</h3>
+                  <div class="issue-summary">
+                    <span class="issue-chip ok">{html.escape('정의서 매칭 성공 row' if str(row.get('record_type', '')).strip() == 'definition_match' else '캡처 이벤트')}</span>
+                    <span class="issue-chip subtle">definition_row_id={html.escape(str(row.get('definition_row_id', '-')))}</span>
+                    <span class="issue-chip subtle">definition_no={html.escape(str(row.get('definition_no', '-')))}</span>
+                    <span class="issue-chip subtle">match_status={html.escape(str(row.get('match_status', row.get('status', '-'))))}</span>
+                  </div>
+                </section>
+                <section class="card-section">
+                  <h3>위치 정보</h3>
+                  <dl class="meta-grid">
+                    <dt>target_id</dt><dd>{html.escape(str(row.get('target_id', '-')))}</dd>
+                    <dt>section_name</dt><dd>{html.escape(str(row.get('section_name', '-')))}</dd>
+                    <dt>page_id</dt><dd>{html.escape(str(row.get('page_id', '-')))}</dd>
+                  </dl>
+                </section>
+                <section class="card-section">
+                  <h3>핵심 파라미터</h3>
+                  <p class="key-param-block">{html.escape(str(row.get('custom_parameters', '-')))}</p>
+                </section>
+                <section class="card-section">
+                  <h3>이슈 요약</h3>
+                  <div class="issue-summary">{issue_summary_html}</div>
+                </section>
+              </button>
+              <details><summary>검수 상세</summary>
+                <div class="detail-stack">
+                  <section class="card-section">
+                    <h3>추가 파라미터</h3>
+                    <p class="detail-text">{html.escape(str(row.get('extra_custom_parameters', '-')))}</p>
+                  </section>
+                  <section class="card-section">
+                    <h3>raw selector</h3>
+                    <p class="detail-text mono">{html.escape(str(row.get('raw_selector', '-')))}</p>
+                  </section>
+                  <section class="card-section">
+                    <h3>screenshot path</h3>
+                    <p class="detail-text mono">{html.escape(str(row.get('screenshot_file', '-')))}</p>
+                  </section>
+                  <section class="card-section">
+                    <h3>parameter review</h3>
+                    {param_rows_html}
+                  </section>
+                </div>
+              </details>
+              <details><summary>raw payload</summary><pre>{html.escape(str(row.get('raw_payload_json', '{}')))}</pre></details>
+            </article>
+            """
+            )(
+                (
+                    "<table class=\"param-table\"><thead><tr><th>params.key</th><th>req</th><th>params.value (as-is)</th><th>params.value</th><th>actual</th><th>status</th></tr></thead><tbody>"
+                    + "".join(
+                        [
+                            "<tr>"
+                            f"<td>{html.escape(str(param_row.get('params.key', '-')))}</td>"
+                            f"<td>{html.escape(str(param_row.get('req', '-')))}</td>"
+                            f"<td>{html.escape(str(param_row.get('params.value (as-is)', '-')))}</td>"
+                            f"<td>{html.escape(str(param_row.get('params.value', '-')))}</td>"
+                            f"<td>{html.escape(str(param_row.get('actual_value', '-')))}</td>"
+                            f"<td>{html.escape(str(param_row.get('status', '-')))}</td>"
+                            "</tr>"
+                            for param_row in (row.get("parameter_rows", []) if isinstance(row.get("parameter_rows", []), list) else [])
+                        ]
+                    )
+                    + "</tbody></table>"
+                ),
+                (
+                    (
+                        lambda param_rows: (
+                            f"<span class=\"issue-chip {'ok' if not [p for p in param_rows if str(p.get('status', '-')).strip().upper() not in {'PASS', '정상', 'OK', '-'}] else 'warn'}\">"
+                            + (
+                                "정상"
+                                if not [p for p in param_rows if str(p.get('status', '-')).strip().upper() not in {'PASS', '정상', 'OK', '-'}]
+                                else f"이슈 {len([p for p in param_rows if str(p.get('status', '-')).strip().upper() not in {'PASS', '정상', 'OK', '-'}])}건"
+                            )
+                            + "</span>"
+                            + (
+                                "".join(
+                                    [
+                                        f"<span class=\"issue-chip subtle\">{html.escape(str(p.get('params.key', '-')))}: {html.escape(str(p.get('status', '-')))}</span>"
+                                        for p in param_rows
+                                        if str(p.get('status', '-')).strip().upper() not in {'PASS', '정상', 'OK', '-'}
+                                    ][:4]
+                                )
+                                or "<span class=\"issue-chip subtle\">누락/불일치 없음</span>"
+                            )
+                        )
+                    )(
+                        row.get("parameter_rows", []) if isinstance(row.get("parameter_rows", []), list) else []
+                    )
+                )
+            )
+            for idx, row in enumerate(records)
+        ]
+    )
+    event_payload = json.dumps(records, ensure_ascii=False)
+    unmatched_html = (
+        "<table class=\"param-table\"><thead><tr><th>definition_row_id</th><th>definition no</th><th>event_name</th><th>description</th><th>page_id</th><th>section_name</th><th>status</th></tr></thead><tbody>"
+        + "".join(
+            [
+                "<tr>"
+                f"<td>{html.escape(str(row.get('definition_row_id', '-')))}</td>"
+                f"<td>{html.escape(str(row.get('definition_no', '-')))}</td>"
+                f"<td>{html.escape(str(row.get('event_name', '-')))}</td>"
+                f"<td>{html.escape(str(row.get('description', '-')))}</td>"
+                f"<td>{html.escape(str(row.get('page_id', '-')))}</td>"
+                f"<td>{html.escape(str(row.get('section_name', '-')))}</td>"
+                f"<td>{html.escape(str(row.get('match_status', 'UNMATCHED')))}</td>"
+                "</tr>"
+                for row in unmatched_records
+            ]
+        )
+        + "</tbody></table>"
+    ) if unmatched_records else "<p>없음</p>"
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>event_definition_review</title>
+  <style>
+    body {{ margin: 0; background: #f3efe8; color: #18212f; font-family: Arial, sans-serif; }}
+    main {{ max-width: 1500px; margin: 0 auto; padding: 24px; }}
+    .layout {{ display: grid; grid-template-columns: minmax(560px,1fr) minmax(420px,0.9fr); gap: 20px; align-items: stretch; }}
+    .panel {{ background: #fffdf8; border: 1px solid #d8d1c3; border-radius: 18px; padding: 18px; display: flex; flex-direction: column; min-height: min(82vh, 960px); }}
+    .annotation-stage {{ flex: 1; min-height: 0; overflow: auto; padding-right: 4px; }}
+    .annotation-stage img {{ width: 100%; max-height: 100%; object-fit: contain; border-radius: 12px; border: 1px solid #d8d1c3; }}
+    .annotation-chip {{ margin-right: 8px; margin-bottom: 8px; border-radius: 999px; border: 1px solid #d8d1c3; background: #fff; padding: 8px 12px; cursor: pointer; }}
+    .annotation-chip.active {{ border-color: #0f766e; color: #0f766e; }}
+    .event-card {{ border: 1px solid #d8d1c3; border-radius: 14px; margin-bottom: 12px; background: #fff; }}
+    .event-card.active {{ border-color: #0f766e; box-shadow: 0 10px 24px rgba(15,118,110,0.12); }}
+    .card-button {{ width: 100%; text-align: left; border: 0; background: transparent; padding: 16px; color: inherit; cursor: pointer; }}
+    .card-head {{ display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: start; }}
+    .event-number {{ width: 40px; height: 40px; border-radius: 999px; background: #ecfeff; color: #0f766e; display:flex; align-items:center; justify-content:center; font-weight:700; }}
+    .card-section {{ margin-top: 14px; }}
+    .card-section h3 {{ margin: 0 0 8px; font-size: 13px; color:#6b7280; }}
+    .meta-grid {{ display:grid; grid-template-columns: 110px 1fr; gap: 6px 10px; }}
+    .key-param-block, .detail-text {{ margin:0; line-height:1.5; word-break: break-word; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    .issue-summary {{ display:flex; flex-wrap: wrap; gap: 8px; }}
+    .issue-chip {{ display:inline-flex; align-items:center; border-radius:999px; padding:6px 10px; font-size:12px; border:1px solid #d8d1c3; background:#fff; }}
+    .issue-chip.ok {{ background:#ecfeff; color:#0f766e; border-color:#99f6e4; }}
+    .issue-chip.warn {{ background:#fff7ed; color:#b45309; border-color:#fdba74; }}
+    .issue-chip.subtle {{ background:#f8f4eb; color:#475569; }}
+    .detail-stack {{ padding: 0 16px 16px; }}
+    dl {{ display:grid; grid-template-columns: 130px 1fr; gap: 8px 12px; }}
+    dt {{ color:#6b7280; }}
+    dd {{ margin:0; word-break: break-word; }}
+    .param-table {{ width:100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }}
+    .param-table th, .param-table td {{ border: 1px solid #d8d1c3; padding: 8px; vertical-align: top; text-align: left; }}
+    .param-table th {{ background: #f8f4eb; }}
+    pre {{ overflow:auto; background:#0f172a; color:#e2e8f0; padding:12px; border-radius:12px; }}
+    #cards {{ flex: 1; min-height: 0; overflow: auto; padding-right: 4px; }}
+    @media (max-width: 1100px) {{ .layout {{ grid-template-columns: 1fr; }} .panel {{ min-height: auto; }} #cards, .annotation-stage {{ overflow: visible; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="layout">
+      <section class="panel">
+        <h1>Annotations</h1>
+        <div id="annotation-nav">{nav_html}</div>
+        <div class="annotation-stage">
+          {'<img id="annotation-image" src="' + html.escape(str(records[0].get('screenshot_file', ''))) + '" alt="annotation">' if records else '<p>매칭 성공한 annotation이 없습니다.</p>'}
+        </div>
+      </section>
+      <section class="panel">
+        <h1>Event Definition Cards</h1>
+        <div id="cards">{card_html or '<p>매칭 성공한 definition row가 없습니다.</p>'}</div>
+      </section>
+    </section>
+    <section class="panel" style="margin-top:20px; min-height:auto;">
+      <h1>Unmatched Definition Rows</h1>
+      {unmatched_html}
+    </section>
+  </main>
+  <script>
+    const RECORDS = {event_payload};
+    const image = document.getElementById("annotation-image");
+    const cards = Array.from(document.querySelectorAll(".event-card"));
+    const buttons = Array.from(document.querySelectorAll("[data-select-no]"));
+    function setActive(no) {{
+      const record = RECORDS.find((item) => String(item.no) === String(no));
+      if (!record || !image) return;
+      image.src = record.screenshot_file;
+      cards.forEach((card) => card.classList.toggle("active", card.dataset.no === String(no)));
+      buttons.forEach((button) => button.classList.toggle("active", button.dataset.selectNo === String(no)));
+      const card = document.getElementById(`card-${{no}}`);
+      if (card) card.scrollIntoView({{ behavior: "smooth", block: "nearest" }});
+    }}
+    buttons.forEach((button) => button.addEventListener("click", () => setActive(button.dataset.selectNo)));
+    if (RECORDS.length > 0) setActive("{html.escape(first_no)}");
+  </script>
+</body>
+</html>
+"""
+
+
+def build_log_definition_export_zip_bytes(
+    event_definition_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]] | None = None,
+    definition_matches_df: pd.DataFrame | None = None,
+) -> bytes:
+    review_df, support_df, html_records, unmatched_records = build_log_definition_export_tables(
+        event_definition_df,
+        event_detail_df,
+        schemas=schemas,
+        definition_matches_df=definition_matches_df,
+    )
+    review_records_for_html: List[Dict[str, object]] = []
+    annotation_file_map: Dict[str, bytes] = {}
+    for row in html_records:
+        no = str(row.get("no", "")).strip() or "0"
+        ident = str(row.get("identification", "")).strip() or str(row.get("target_id", "")).strip() or "event"
+        src_rel = str(row.get("screenshot_file", "")).strip()
+        export_name = f"{no}_{_sanitize_export_filename_part(ident, default='event')}.png"
+        export_rel = f"annotations/{export_name}"
+        src_abs = BASE_DIR / src_rel if src_rel and src_rel != "-" else None
+        if src_abs and src_abs.exists() and src_abs.is_file():
+            annotation_file_map[export_rel] = src_abs.read_bytes()
+        row_copy = dict(row)
+        row_copy["screenshot_file"] = export_rel
+        review_records_for_html.append(row_copy)
+        if not review_df.empty:
+            review_df.loc[review_df["no"].astype(str) == no, "screenshot_file"] = export_rel
+        if not support_df.empty:
+            support_df.loc[support_df["no"].astype(str) == no, "screenshot_path"] = export_rel
+    html_bytes = build_log_definition_review_html(review_records_for_html, unmatched_records=unmatched_records).encode("utf-8")
+    file_map = {
+        "event_definition_review.html": html_bytes,
+        "event_definition.csv": dataframe_to_csv_bytes(review_df),
+        "event_support.csv": dataframe_to_csv_bytes(support_df),
+    }
+    file_map.update(annotation_file_map)
+    return build_zip_bytes(file_map)
+
+
+def build_qa_result_export_df(
+    base_df: pd.DataFrame,
+    event_detail_df: pd.DataFrame,
+    schemas: Dict[str, Dict[str, object]] | None = None,
+    definition_matches_df: pd.DataFrame | None = None,
+    review_html_filename: str = "event_definition_review.html",
+) -> pd.DataFrame:
+    cols = [
+        "no",
+        "이벤트 설명",
+        "이벤트 이름",
+        "매개변수명",
+        "매개변수 값(예시)",
+        "PASS/FAIL 체크",
+        "테스트 시각",
+        "데이터 수집값",
+        "오류 원인",
+        "트리거 시점",
+        "QA 내용",
+        "matched_identification",
+        "screenshot_file",
+        "screenshot_link",
+        "review_html_anchor",
+    ]
+    if base_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    detail_records = event_detail_df.to_dict("records") if isinstance(event_detail_df, pd.DataFrame) and not event_detail_df.empty else []
+    detail_by_event_no: Dict[str, Dict[str, object]] = {}
+    detail_by_event: Dict[str, Dict[str, object]] = {}
+    for row in detail_records:
+        event_no = str(row.get("event no", "")).strip()
+        event_name = str(row.get("custom_event", row.get("event_name", ""))).strip()
+        if event_no and event_no not in detail_by_event_no:
+            detail_by_event_no[event_no] = row
+        if event_name and event_name not in detail_by_event:
+            detail_by_event[event_name] = row
+
+    schema_store = schemas if isinstance(schemas, dict) else {}
+    case_lookup = _build_definition_case_lookup(schema_store)
+    out = base_df.copy()
+    best_match_by_definition_row: Dict[str, Dict[str, object]] = {}
+    if isinstance(definition_matches_df, pd.DataFrame) and not definition_matches_df.empty and "definition_row_id" in out.columns:
+        ranked = definition_matches_df.copy()
+        rank_map = {"PASS": 3, "WARN": 2, "FAIL": 1}
+        ranked["rank"] = ranked["result"].astype(str).map(rank_map).fillna(0)
+        ranked["match_score"] = pd.to_numeric(ranked.get("match_score", 0), errors="coerce").fillna(0)
+        ranked = ranked.sort_values(by=["rank", "match_score"], ascending=[False, False])
+        best = ranked.groupby("definition_row_id", as_index=False).first()
+        best["review_html_anchor"] = best["captured_event_no"].astype(str).apply(lambda v: f"{review_html_filename}#card-{v}" if str(v).strip() and str(v).strip() != "-" else review_html_filename)
+        best["screenshot_link"] = best.apply(
+            lambda row: build_annotation_export_relpath(row.get("captured_event_no", "0"), row.get("matched_identification", ""))
+            if str(row.get("screenshot_file", "")).strip() and str(row.get("screenshot_file", "")).strip() != "-"
+            else "-",
+            axis=1,
+        )
+        out = out.merge(
+            best[["definition_row_id", "matched_identification", "screenshot_file", "screenshot_link", "review_html_anchor"]],
+            on="definition_row_id",
+            how="left",
+        )
+        best_match_by_definition_row = {
+            str(row.get("definition_row_id", "")).strip(): row
+            for row in best.to_dict("records")
+            if str(row.get("definition_row_id", "")).strip()
+        }
+    else:
+        matched_identifications = []
+        screenshot_files = []
+        screenshot_links = []
+        review_anchors = []
+        for _, row in out.iterrows():
+            detail = detail_by_event.get(str(row.get("event_name", "")).strip(), {})
+            event_no = str(detail.get("event no", "")).strip() or "0"
+            identification = str(detail.get("identification", "-")).strip() or "-"
+            matched_identifications.append(identification)
+            screenshot_file = str(detail.get("screenshot_file", "-")).strip() or "-"
+            screenshot_files.append(screenshot_file)
+            screenshot_links.append(build_annotation_export_relpath(event_no, identification) if screenshot_file != "-" else "-")
+            review_anchors.append(f"{review_html_filename}#card-{event_no}" if event_no != "0" else review_html_filename)
+        out["matched_identification"] = matched_identifications
+        out["screenshot_file"] = screenshot_files
+        out["screenshot_link"] = screenshot_links
+        out["review_html_anchor"] = review_anchors
+
+    for col in ["description", "failure_reason", "missing_parameters", "extra_parameters", "matched_identification", "screenshot_file", "screenshot_link", "review_html_anchor"]:
+        if col not in out.columns:
+            out[col] = "-"
+        out[col] = out[col].fillna("-").astype(str)
+    if "no" not in out.columns:
+        out["no"] = "-"
+    vertical_rows: List[Dict[str, object]] = []
+    for row in out.to_dict("records"):
+        definition_row_id = str(row.get("definition_row_id", "")).strip()
+        event_name = str(row.get("event_name", "")).strip() or "-"
+        description = str(row.get("description", "-")).strip() or "-"
+        result = str(row.get("result", row.get("schema_status", "-"))).strip().upper() or "-"
+        failure_reason = str(row.get("failure_reason", "-")).strip() or "-"
+        missing_parameters = str(row.get("missing_parameters", "-")).strip() or "-"
+        extra_parameters = str(row.get("extra_parameters", "-")).strip() or "-"
+        matched_identification = str(row.get("matched_identification", "-")).strip() or "-"
+        screenshot_file = str(row.get("screenshot_file", "-")).strip() or "-"
+        screenshot_link = str(row.get("screenshot_link", "-")).strip() or "-"
+        review_html_anchor = str(row.get("review_html_anchor", review_html_filename)).strip() or review_html_filename
+        best_match = best_match_by_definition_row.get(definition_row_id, {})
+        trigger_at = str(best_match.get("matched_at", row.get("matched_at", "-"))).strip() or "-"
+        test_at = trigger_at
+        matched_event_no = str(best_match.get("captured_event_no", "")).strip()
+        detail = detail_by_event_no.get(matched_event_no, {}) if matched_event_no else detail_by_event.get(event_name, {})
+        actual_param_map = _build_detail_param_map(detail) if detail else {}
+        qa_note = "정상" if result == "PASS" else failure_reason
+
+        vertical_rows.append(
+            {
+                "no": str(row.get("no", "-")).strip() or "-",
+                "이벤트 설명": description,
+                "이벤트 이름": event_name,
+                "매개변수명": "",
+                "매개변수 값(예시)": "",
+                "PASS/FAIL 체크": result,
+                "테스트 시각": test_at,
+                "데이터 수집값": matched_identification,
+                "오류 원인": failure_reason if failure_reason != "-" else "",
+                "트리거 시점": trigger_at,
+                "QA 내용": qa_note,
+                "matched_identification": matched_identification,
+                "screenshot_file": screenshot_file,
+                "screenshot_link": screenshot_link,
+                "review_html_anchor": review_html_anchor,
+            }
+        )
+
+        parameter_rows: List[Dict[str, object]] = []
+        if definition_row_id and definition_row_id in case_lookup:
+            case = case_lookup[definition_row_id]
+            expected_map = case.get("param_values", {}) if isinstance(case.get("param_values", {}), dict) else {}
+            parameter_keys = list(
+                dict.fromkeys(
+                    [str(v).strip() for v in case.get("required", []) if str(v).strip()]
+                    + [str(v).strip() for v in case.get("optional", []) if str(v).strip()]
+                    + [str(v).strip() for v in case.get("parameter_columns", []) if str(v).strip()]
+                    + [str(v).strip() for v in expected_map.keys() if str(v).strip()]
+                )
+            )
+            required_keys = {str(v).strip() for v in case.get("required", []) if str(v).strip()}
+            for key in parameter_keys:
+                expected_raw = str(expected_map.get(key, "")).strip()
+                expected_norm = normalize_expected_param_value(expected_raw)
+                actual_value = str(actual_param_map.get(key, "")).strip()
+                if key in required_keys and _is_missing_like_value(actual_value):
+                    param_result = "FAIL"
+                    param_reason = "missing_parameter"
+                    param_note = "필수 파라미터 누락"
+                elif expected_norm and not _is_definition_placeholder_value(expected_norm) and actual_value and actual_value != expected_norm:
+                    param_result = "FAIL"
+                    param_reason = "value_mismatch"
+                    param_note = "기대값과 실제값 불일치"
+                elif _is_missing_like_value(actual_value):
+                    param_result = "WARN"
+                    param_reason = ""
+                    param_note = "수집값 없음"
+                else:
+                    param_result = "PASS"
+                    param_reason = ""
+                    param_note = "정상"
+                parameter_rows.append(
+                    {
+                        "no": "",
+                        "이벤트 설명": "",
+                        "이벤트 이름": "",
+                        "매개변수명": key,
+                        "매개변수 값(예시)": expected_raw or expected_norm or "-",
+                        "PASS/FAIL 체크": param_result,
+                        "테스트 시각": test_at,
+                        "데이터 수집값": actual_value or "-",
+                        "오류 원인": param_reason,
+                        "트리거 시점": trigger_at,
+                        "QA 내용": param_note,
+                        "matched_identification": "",
+                        "screenshot_file": "",
+                        "screenshot_link": "",
+                        "review_html_anchor": "",
+                    }
+                )
+            extra_keys = [key.strip() for key in extra_parameters.split(",") if key.strip() and key.strip() != "-"]
+            for key in extra_keys:
+                parameter_rows.append(
+                    {
+                        "no": "",
+                        "이벤트 설명": "",
+                        "이벤트 이름": "",
+                        "매개변수명": key,
+                        "매개변수 값(예시)": "-",
+                        "PASS/FAIL 체크": "WARN",
+                        "테스트 시각": test_at,
+                        "데이터 수집값": str(actual_param_map.get(key, "-")).strip() or "-",
+                        "오류 원인": "extra_parameter",
+                        "트리거 시점": trigger_at,
+                        "QA 내용": "정의서 외 추가 파라미터",
+                        "matched_identification": "",
+                        "screenshot_file": "",
+                        "screenshot_link": "",
+                        "review_html_anchor": "",
+                    }
+                )
+        else:
+            schema_obj = schema_store.get(event_name, {})
+            schema_param_keys = list(
+                dict.fromkeys(
+                    [str(v).strip() for v in schema_obj.get("required", []) if str(v).strip()]
+                    + [str(v).strip() for v in schema_obj.get("optional", []) if str(v).strip()]
+                    + [str(v).strip() for v in actual_param_map.keys() if str(v).strip()]
+                )
+            )
+            required_keys = {str(v).strip() for v in schema_obj.get("required", []) if str(v).strip()}
+            for key in schema_param_keys:
+                actual_value = str(actual_param_map.get(key, "")).strip()
+                if key in required_keys and _is_missing_like_value(actual_value):
+                    param_result = "FAIL"
+                    param_reason = "missing_parameter"
+                    param_note = "필수 파라미터 누락"
+                elif _is_missing_like_value(actual_value):
+                    param_result = "WARN"
+                    param_reason = ""
+                    param_note = "수집값 없음"
+                else:
+                    param_result = "PASS"
+                    param_reason = ""
+                    param_note = "정상"
+                parameter_rows.append(
+                    {
+                        "no": "",
+                        "이벤트 설명": "",
+                        "이벤트 이름": "",
+                        "매개변수명": key,
+                        "매개변수 값(예시)": actual_value or "-",
+                        "PASS/FAIL 체크": param_result,
+                        "테스트 시각": test_at,
+                        "데이터 수집값": actual_value or "-",
+                        "오류 원인": param_reason,
+                        "트리거 시점": trigger_at,
+                        "QA 내용": param_note,
+                        "matched_identification": "",
+                        "screenshot_file": "",
+                        "screenshot_link": "",
+                        "review_html_anchor": "",
+                    }
+                )
+        vertical_rows.extend(parameter_rows)
+    return pd.DataFrame(vertical_rows, columns=cols)
 
 
 def build_qa_summary_export_df(
@@ -3802,6 +4793,8 @@ def save_event_definition_bundle(
     log_definition_xlsx = build_log_definition_excel_bytes(
         event_definition_df=event_definition_df,
         event_detail_df=event_detail_df,
+        schemas=schemas,
+        definition_matches_df=definition_validation_matches_df,
     )
     qa_summary_df = build_qa_summary_export_df(
         event_detail_df=event_detail_df,
@@ -4256,6 +5249,52 @@ def build_debug_run_settings() -> Dict[str, object]:
         "definition_event_names": sorted(list(uploaded_schemas.keys())),
         "definition_runtime_hints": build_definition_runtime_hints(uploaded_schemas if isinstance(uploaded_schemas, dict) else {}),
     }
+
+
+def save_test_setup_snapshot() -> None:
+    st.session_state["qa_test_setup_snapshot"] = {
+        "qa_project_slug": st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG),
+        "qa_project_slug_selectbox": st.session_state.get(
+            "qa_project_slug_selectbox",
+            st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG),
+        ),
+        "qa_project_domain": st.session_state.get("qa_project_domain", ""),
+        "qa_environment": st.session_state.get("qa_environment", "prod"),
+        "qa_debug_target_url": st.session_state.get("qa_debug_target_url", ""),
+        "qa_browser_name": st.session_state.get("qa_browser_name", "Chrome"),
+        "qa_viewport_preset": st.session_state.get("qa_viewport_preset", "Desktop 1440 x 900"),
+        "qa_tester_name": st.session_state.get("qa_tester_name", ""),
+        "qa_tester_note": st.session_state.get("qa_tester_note", ""),
+    }
+
+
+def restore_test_setup_snapshot_if_needed(force: bool = False) -> None:
+    snapshot = st.session_state.get("qa_test_setup_snapshot", {})
+    if not isinstance(snapshot, dict) or not snapshot:
+        return
+    text_keys = [
+        "qa_project_domain",
+        "qa_debug_target_url",
+        "qa_tester_name",
+        "qa_tester_note",
+    ]
+    select_keys = {
+        "qa_project_slug": DEFAULT_PROJECT_SLUG,
+        "qa_project_slug_selectbox": DEFAULT_PROJECT_SLUG,
+        "qa_environment": "prod",
+        "qa_browser_name": "Chrome",
+        "qa_viewport_preset": "Desktop 1440 x 900",
+    }
+    for key in text_keys:
+        current = str(st.session_state.get(key, "")).strip()
+        saved = str(snapshot.get(key, "")).strip()
+        if saved and (force or (not current)):
+            st.session_state[key] = saved
+    for key, default in select_keys.items():
+        current = str(st.session_state.get(key, default)).strip()
+        saved = str(snapshot.get(key, "")).strip()
+        if saved and (force or current == str(default).strip()):
+            st.session_state[key] = saved
 
 
 def _get_request_headers() -> Dict[str, str]:
@@ -6506,9 +7545,14 @@ if "qa_single_page_only" not in st.session_state:
     st.session_state["qa_single_page_only"] = is_truthy(get_config_value("QA_SINGLE_PAGE_ONLY", "1"))
 if "qa_template_seed" not in st.session_state:
     st.session_state["qa_template_seed"] = ""
+if "qa_test_setup_snapshot" not in st.session_state:
+    st.session_state["qa_test_setup_snapshot"] = {}
+if "qa_preserve_test_setup_during_run" not in st.session_state:
+    st.session_state["qa_preserve_test_setup_during_run"] = False
 
 ensure_project_structure(st.session_state.get("qa_project_slug", DEFAULT_PROJECT_SLUG))
 restore_definition_validation_cache_if_needed()
+restore_test_setup_snapshot_if_needed(force=bool(st.session_state.get("qa_preserve_test_setup_during_run", False)))
 
 enforce_access_gate()
 
@@ -6884,12 +7928,24 @@ with st.sidebar:
             if tester_name_view:
                 st.caption(f"테스터: {tester_name_view}")
             if debug_snapshot and debug_snapshot.get("last_error", "").strip():
-                st.error(f"디버깅 런타임 오류: {debug_snapshot.get('last_error')}")
+                last_runtime_error = str(debug_snapshot.get("last_error", "")).strip()
+                if "접근 제한/봇 확인 페이지" in last_runtime_error:
+                    st.warning(f"디버깅 런타임 알림: {last_runtime_error}")
+                else:
+                    st.error(f"디버깅 런타임 오류: {last_runtime_error}")
             run_settings = debug_snapshot.get("run_settings", {}) if isinstance(debug_snapshot, dict) else {}
             mode_label = str(run_settings.get("qa_mode", st.session_state.get("qa_mode", ""))).strip()
             viewport_label = str(st.session_state.get("qa_viewport_preset", "")).strip()
             if mode_label:
                 st.caption(f"모드: {mode_label} | Viewport: {viewport_label or '-'}")
+            setup_snapshot = st.session_state.get("qa_test_setup_snapshot", {})
+            initial_target_url = (
+                str(debug_snapshot.get("target_url", "")).strip()
+                if debug_snapshot
+                else str(setup_snapshot.get("qa_debug_target_url", "")).strip()
+            )
+            if initial_target_url:
+                st.caption(f"초기 테스트 URL: {initial_target_url}")
             st.caption("결과는 오른쪽 패널의 QA Overview / Export에서 확인합니다.")
         else:
             st.caption("실행 후 자동수집이 끝나면 결과 패널에서 바로 확인할 수 있습니다.")
@@ -7028,6 +8084,7 @@ if resume_notice:
 
 if realtime_debug_start_clicked:
     try:
+        save_test_setup_snapshot()
         normalized_target_url = normalize_debug_target_url(st.session_state.get("qa_debug_target_url", ""))
         if not normalized_target_url:
             st.error("Target URL 형식이 올바르지 않습니다. 예: https://datanugget.io/")
@@ -7062,6 +8119,7 @@ if realtime_debug_start_clicked:
         st.session_state["qa_debug_session_id"] = debug_session_id
         st.session_state["qa_debug_output_file"] = str(debug_file)
         st.session_state["qa_debug_started_at"] = str(snapshot.get("started_at", "")).strip()
+        st.session_state["qa_preserve_test_setup_during_run"] = True
         st.session_state["realtime_panel_auto_refresh"] = True
         definition_target_names = run_settings.get("definition_event_names", [])
         if (
@@ -7091,11 +8149,13 @@ if realtime_debug_start_clicked:
         if isinstance(definition_target_names, list) and definition_target_names:
             success_message += f" | 정의서 이벤트 {len(definition_target_names)}개 감지 시 조기 종료"
         st.success(success_message)
+        novnc_public_url = get_config_value("QA_NOVNC_PUBLIC_URL", "").strip()
         if (
             st.session_state.get("qa_access_role", "guest") == "admin"
-            and is_truthy(get_config_value("QA_OPEN_NOVNC_ON_START", "1"))
+            and novnc_public_url
+            and is_truthy(get_config_value("QA_OPEN_NOVNC_ON_START", "0"))
         ):
-            auto_open_popup_window(get_novnc_popup_url(), popup_name=f"qa_debug_popup_{debug_session_id}")
+            auto_open_popup_window(novnc_public_url, popup_name=f"qa_debug_popup_{debug_session_id}")
             st.caption("원격 디버그 팝업(noVNC) 자동 열기를 시도했습니다. 차단되면 링크를 직접 열어주세요.")
     except Exception as exc:
         log_ui_action("debug_start_error", {"error": str(exc)})
@@ -7106,6 +8166,7 @@ if realtime_debug_stop_clicked:
     sid = st.session_state.get("qa_debug_session_id", "").strip()
     if sid:
         stop_debug_session(sid)
+        st.session_state["qa_preserve_test_setup_during_run"] = False
         log_ui_action("debug_stop_success", {"session_id": sid})
         st.success("테스트 종료 요청을 보냈습니다.")
     else:
@@ -7617,14 +8678,6 @@ with realtime_tab:
             parameter_validation_df = build_parameter_validation_export_df(rt_events, schema_store)
             order_validation_df = build_event_order_validation_df(rt_events, parse_csv_list(funnel_text))
             event_qa_result_df = event_schema_qa_all.copy()
-            qa_report_xlsx = dataframes_to_excel_bytes(
-                {
-                    "Event QA Result": event_qa_result_df,
-                    "Parameter Validation": parameter_validation_df,
-                    "Browser Errors": browser_errors_df,
-                    "Event Order Validation": order_validation_df,
-                }
-            )
             event_logs_csv = dataframe_to_csv_bytes(event_logs_df)
             event_definition_preview_df, event_support_preview_df, _ = build_event_definition_exports(
                 timeline_df_active_for_validation,
@@ -7634,10 +8687,31 @@ with realtime_tab:
                 columns=["raw_payload_json"],
                 errors="ignore",
             )
-            definition_validation_summary_preview_df, _, _ = (
+            definition_validation_summary_preview_df, definition_validation_matches_preview_df, _ = (
                 build_definition_validation_frames(rt_events, schema_store)
                 if definition_mode_ready
                 else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+            )
+            qa_result_export_df = build_qa_result_export_df(
+                base_df=event_qa_result_df,
+                event_detail_df=build_event_review_detail_df(timeline_df_active_for_validation, schema_store),
+                schemas=schema_store,
+                definition_matches_df=definition_validation_matches_preview_df if definition_mode_ready else None,
+            )
+            qa_export_running = str(status_for_view).strip() in {"running", "stopping", "recovered(file)"}
+            qa_export_label = "QA 결과 파일 (진행 중)" if qa_export_running else "QA 결과 파일 (완료)"
+            qa_export_caption = (
+                "테스트 진행 중: 현재까지의 QA 결과를 바로 다운로드할 수 있습니다."
+                if qa_export_running
+                else "테스트 완료: 최종 QA 결과 파일을 다운로드할 수 있습니다."
+            )
+            qa_report_xlsx = dataframes_to_excel_bytes(
+                {
+                    "QA Result": qa_result_export_df,
+                    "Parameter Validation": parameter_validation_df,
+                    "Browser Errors": browser_errors_df,
+                    "Event Order Validation": order_validation_df,
+                }
             )
             qa_review_xlsx = build_qa_review_excel_bytes(
                 event_definition_df=event_definition_preview_df,
@@ -7645,9 +8719,11 @@ with realtime_tab:
                 definition_validation_summary_df=definition_validation_summary_preview_df,
                 bundle_scope="definition_validation" if definition_mode_ready else "custom_event_review",
             )
-            log_definition_xlsx = build_log_definition_excel_bytes(
+            log_definition_export_zip = build_log_definition_export_zip_bytes(
                 event_definition_df=event_definition_preview_df,
                 event_detail_df=build_event_review_detail_df(timeline_df_active_for_validation, schema_store),
+                schemas=schema_store,
+                definition_matches_df=definition_validation_matches_preview_df if definition_mode_ready else None,
             )
             target_url_for_bundle = (
                 str(st.session_state.get("qa_debug_target_url", "")).strip()
@@ -7689,24 +8765,24 @@ with realtime_tab:
             b1, b2 = st.columns(2)
             with b1:
                 st.download_button(
-                    "QA 결과 파일",
+                    qa_export_label,
                     data=qa_report_xlsx,
                     file_name="qa_result.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     disabled=not bool(qa_report_xlsx),
                     help="사람이 QA 상태만 확인하는 결과 엑셀",
                 )
-                st.caption("QA 상태 확인용 결과 엑셀")
+                st.caption(qa_export_caption)
             with b2:
                 st.download_button(
                     "로그정의서 생성",
-                    data=log_definition_xlsx,
-                    file_name="log_definition_review.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    disabled=not bool(log_definition_xlsx),
-                    help="캡처 이미지와 이벤트 정의/매개변수 표가 함께 들어간 리뷰용 엑셀",
+                    data=log_definition_export_zip,
+                    file_name="event_definition_export.zip",
+                    mime="application/zip",
+                    disabled=not bool(log_definition_export_zip),
+                    help="annotations/ + event_definition_review.html + event_definition.csv + event_support.csv 구조의 검수용 로그정의서 폴더",
                 )
-                st.caption("캡처 이미지 + 이벤트 정의 표가 들어간 리뷰 엑셀")
+                st.caption("검수 가능한 로그정의서 폴더 구조 ZIP")
 
             with st.expander("고급 Export", expanded=False):
                 st.caption("디버그 로그와 번들은 필요할 때만 사용하세요.")
